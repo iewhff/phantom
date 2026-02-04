@@ -523,6 +523,8 @@ class APILogicProfiler(ScanModule):
         info_items: list[dict] = []
         reports: list[str] = []
 
+        base_url = f"https://{host}" if not host.startswith("http") else host
+
         # Get roles from asset_data if not configured
         if not self.roles:
             roles_config = asset_data.get("roles", [])
@@ -536,30 +538,38 @@ class APILogicProfiler(ScanModule):
             ]
 
         if len(self.roles) < 2:
-            logger.debug("[APILogicProfiler] No roles configured, using default unauthenticated vs authenticated comparison")
-            info_items.append({
-                "type": "info",
-                "message": "Using default roles for comparison testing (unauthenticated vs authenticated)",
-            })
-            # Create default roles: authenticated vs unauthenticated
+            logger.debug("[APILogicProfiler] No roles configured, using unauthenticated testing")
             self.roles = [
                 RoleConfig(name="unauthenticated", headers={}, cookies={}),
-                RoleConfig(name="authenticated", headers=asset_data.get("auth_headers", {})),
             ]
 
         # Get endpoints to test
         endpoints = asset_data.get("endpoints", [])
         api_endpoints = asset_data.get("api_endpoints", [])
-
-        # Focus on API endpoints
         all_endpoints = list(set(endpoints + api_endpoints))
+
+        # ====================================================================
+        # PHASE 1: API Discovery (probe common API paths)
+        # ====================================================================
+        logger.info("[APILogicProfiler] Phase 1: API Discovery")
+        discovered_apis = await self._discover_api_endpoints(base_url, rate_limiter)
+        all_endpoints.extend(discovered_apis)
+        all_endpoints = list(set(all_endpoints))
+        
+        info_items.append({
+            "type": "api_discovery",
+            "discovered": len(discovered_apis),
+            "total_endpoints": len(all_endpoints),
+        })
 
         # Filter for interesting endpoints
         interesting_patterns = [
-            r"/api/", r"/v\d+/", r"/user", r"/account", r"/profile",
+            r"/api/", r"/rest/", r"/v\d+/", r"/graphql",
+            r"/user", r"/account", r"/profile", r"/me",
             r"/admin", r"/manage", r"/internal", r"/private",
             r"/order", r"/payment", r"/billing", r"/transaction",
             r"/document", r"/file", r"/export", r"/report",
+            r"/feedback", r"/comment", r"/message", r"/notification",
         ]
 
         priority_endpoints = []
@@ -571,62 +581,82 @@ class APILogicProfiler(ScanModule):
             else:
                 other_endpoints.append(ep)
 
-        # Test priority endpoints first
-        test_endpoints = priority_endpoints[:20] + other_endpoints[:10]
-
-        if not test_endpoints:
-            test_endpoints = [f"https://{host}/api/user", f"https://{host}/api/me"]
+        test_endpoints = priority_endpoints[:30] + other_endpoints[:10]
 
         stats = {
             "endpoints_tested": 0,
+            "apis_discovered": len(discovered_apis),
             "roles_tested": len(self.roles),
             "vulnerabilities_found": 0,
-            "comparisons_made": 0,
+            "data_exposures": 0,
         }
 
-        for endpoint in test_endpoints:
-            await rate_limiter.acquire(host)
-            stats["endpoints_tested"] += 1
+        # ====================================================================
+        # PHASE 2: Unauthenticated Data Exposure Detection
+        # ====================================================================
+        logger.info("[APILogicProfiler] Phase 2: Unauthenticated Data Exposure")
+        exposure_findings = await self._test_unauthenticated_exposure(
+            base_url, test_endpoints, rate_limiter
+        )
+        for finding in exposure_findings:
+            findings.append(self._create_finding(finding).to_dict())
+            stats["vulnerabilities_found"] += 1
+            stats["data_exposures"] += 1
 
-            try:
-                # Profile endpoint for each role
-                profiles = []
-                for role in self.roles:
-                    await rate_limiter.acquire(host)
-                    profile = await self._profile_endpoint(endpoint, role)
-                    if profile:
-                        profiles.append(profile)
-
-                if len(profiles) < 2:
-                    continue
-
-                # Compare all role pairs
-                all_diffs = []
-                for i, profile_a in enumerate(profiles):
-                    for profile_b in profiles[i+1:]:
-                        stats["comparisons_made"] += 1
-                        diffs = self.analyzer.compare_profiles(profile_a, profile_b)
-                        all_diffs.extend(diffs)
-
-                # Generate report
-                report = self.visualizer.generate_markdown_report(endpoint, profiles, all_diffs)
-                reports.append(report)
-
-                # Analyze diffs for vulnerabilities
-                endpoint_findings = self._analyze_for_vulnerabilities(endpoint, profiles, all_diffs)
-
-                for finding in endpoint_findings:
-                    findings.append(self._create_finding(finding).to_dict())
-                    stats["vulnerabilities_found"] += 1
-
-            except Exception as e:
-                logger.debug(f"[APILogicProfiler] Error testing {endpoint}: {e}")
-
-        # Test for IDOR by modifying IDs
+        # ====================================================================
+        # PHASE 3: IDOR via URL Path ID Manipulation
+        # ====================================================================
+        logger.info("[APILogicProfiler] Phase 3: IDOR Path Testing")
         idor_findings = await self._test_idor(host, test_endpoints, rate_limiter)
         for finding in idor_findings:
             findings.append(self._create_finding(finding).to_dict())
             stats["vulnerabilities_found"] += 1
+
+        # ====================================================================
+        # PHASE 4: IDOR via Query Parameter Manipulation
+        # ====================================================================
+        logger.info("[APILogicProfiler] Phase 4: IDOR Parameter Testing")
+        param_findings = await self._test_idor_parameters(
+            base_url, test_endpoints, rate_limiter
+        )
+        for finding in param_findings:
+            findings.append(self._create_finding(finding).to_dict())
+            stats["vulnerabilities_found"] += 1
+
+        # ====================================================================
+        # PHASE 5: Role-based comparison (if roles available)
+        # ====================================================================
+        if len(self.roles) >= 2:
+            logger.info("[APILogicProfiler] Phase 5: Role Comparison")
+            for endpoint in test_endpoints[:15]:
+                await rate_limiter.acquire(host)
+                stats["endpoints_tested"] += 1
+
+                try:
+                    profiles = []
+                    for role in self.roles:
+                        await rate_limiter.acquire(host)
+                        profile = await self._profile_endpoint(endpoint, role)
+                        if profile:
+                            profiles.append(profile)
+
+                    if len(profiles) >= 2:
+                        all_diffs = []
+                        for i, profile_a in enumerate(profiles):
+                            for profile_b in profiles[i+1:]:
+                                diffs = self.analyzer.compare_profiles(profile_a, profile_b)
+                                all_diffs.extend(diffs)
+
+                        report = self.visualizer.generate_markdown_report(endpoint, profiles, all_diffs)
+                        reports.append(report)
+
+                        endpoint_findings = self._analyze_for_vulnerabilities(endpoint, profiles, all_diffs)
+                        for finding in endpoint_findings:
+                            findings.append(self._create_finding(finding).to_dict())
+                            stats["vulnerabilities_found"] += 1
+
+                except Exception as e:
+                    logger.debug(f"[APILogicProfiler] Error testing {endpoint}: {e}")
 
         logger.info(f"[APILogicProfiler v{self.version}] Scan complete: {len(findings)} findings")
 
@@ -638,6 +668,293 @@ class APILogicProfiler(ScanModule):
             "reports": reports,
             "stats": stats,
         }
+
+    async def _discover_api_endpoints(
+        self,
+        base_url: str,
+        rate_limiter: "RateLimiter",
+    ) -> list[str]:
+        """Discover API endpoints by probing common paths."""
+        discovered = []
+        
+        # Common API paths to probe
+        api_paths = [
+            # REST API patterns
+            "/api", "/api/v1", "/api/v2", "/api/v3",
+            "/rest", "/rest/v1", "/rest/v2",
+            "/v1", "/v2", "/v3",
+            
+            # User/Account endpoints
+            "/api/users", "/api/user", "/api/Users",
+            "/api/accounts", "/api/account",
+            "/api/profiles", "/api/profile",
+            "/api/me", "/api/self", "/api/whoami",
+            "/rest/user/whoami", "/rest/user/login-status",
+            
+            # Data endpoints
+            "/api/products", "/api/Products",
+            "/api/orders", "/api/Orders",
+            "/api/items", "/api/data",
+            "/api/feedbacks", "/api/Feedbacks",
+            "/api/comments", "/api/reviews",
+            "/api/messages", "/api/notifications",
+            
+            # Admin endpoints
+            "/api/admin", "/admin/api",
+            "/api/config", "/api/settings",
+            "/api/configuration",
+            "/rest/admin/application-configuration",
+            "/administration",
+            
+            # Security endpoints
+            "/api/SecurityQuestions",
+            "/api/Complaints", "/api/Recycles",
+            "/api/Quantitys", "/api/BasketItems",
+            
+            # Search/Query
+            "/api/search", "/rest/products/search",
+            "/api/query",
+            
+            # File/Document
+            "/api/files", "/api/documents",
+            "/api/uploads", "/api/attachments",
+            
+            # GraphQL
+            "/graphql", "/api/graphql",
+        ]
+        
+        parsed = urlparse(base_url)
+        host = parsed.netloc
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            for path in api_paths:
+                await rate_limiter.acquire(host)
+                
+                try:
+                    url = f"{base_url}{path}"
+                    response = await client.get(url)
+                    
+                    # Consider endpoint discovered if:
+                    # - 200 OK with JSON response
+                    # - 401/403 (endpoint exists but needs auth)
+                    if response.status_code in [200, 401, 403]:
+                        discovered.append(url)
+                        
+                        # If 200 with JSON, also try with /1 suffix for IDOR
+                        if response.status_code == 200:
+                            content_type = response.headers.get("content-type", "")
+                            if "json" in content_type:
+                                discovered.append(f"{url}/1")
+                                discovered.append(f"{url}/2")
+                                
+                except Exception:
+                    continue
+        
+        logger.info(f"[APILogicProfiler] Discovered {len(discovered)} API endpoints")
+        return discovered
+
+    async def _test_unauthenticated_exposure(
+        self,
+        base_url: str,
+        endpoints: list[str],
+        rate_limiter: "RateLimiter",
+    ) -> list[AuthzFinding]:
+        """Test for sensitive data exposure without authentication."""
+        findings = []
+        
+        parsed = urlparse(base_url)
+        host = parsed.netloc
+        
+        # Sensitive field patterns
+        sensitive_patterns = [
+            (r'"email"\s*:\s*"[^"]+@[^"]+"', "email", "HIGH"),
+            (r'"password"\s*:', "password_field", "CRITICAL"),
+            (r'"api[_-]?key"\s*:', "api_key", "CRITICAL"),
+            (r'"token"\s*:', "token", "HIGH"),
+            (r'"secret"\s*:', "secret", "CRITICAL"),
+            (r'"ssn"\s*:', "ssn", "CRITICAL"),
+            (r'"credit[_-]?card"\s*:', "credit_card", "CRITICAL"),
+            (r'"phone"\s*:\s*"[^"]+"', "phone", "MEDIUM"),
+            (r'"address"\s*:', "address", "MEDIUM"),
+            (r'"username"\s*:\s*"[^"]+"', "username", "MEDIUM"),
+            (r'"role"\s*:\s*"admin"', "admin_role", "HIGH"),
+            (r'"is[_-]?admin"\s*:\s*true', "admin_flag", "HIGH"),
+        ]
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            for endpoint in endpoints:
+                await rate_limiter.acquire(host)
+                
+                try:
+                    # Test without any auth
+                    response = await client.get(endpoint)
+                    
+                    if response.status_code != 200:
+                        continue
+                    
+                    content = response.text
+                    content_type = response.headers.get("content-type", "")
+                    
+                    # Check for JSON response with sensitive data
+                    if "json" in content_type.lower():
+                        found_sensitive = []
+                        max_severity = "LOW"
+                        
+                        for pattern, field_name, severity in sensitive_patterns:
+                            if re.search(pattern, content, re.IGNORECASE):
+                                found_sensitive.append(field_name)
+                                if severity == "CRITICAL":
+                                    max_severity = "CRITICAL"
+                                elif severity == "HIGH" and max_severity != "CRITICAL":
+                                    max_severity = "HIGH"
+                                elif severity == "MEDIUM" and max_severity not in ["CRITICAL", "HIGH"]:
+                                    max_severity = "MEDIUM"
+                        
+                        # Also check for arrays with multiple records (data enumeration)
+                        try:
+                            data = response.json()
+                            record_count = 0
+                            
+                            if isinstance(data, list):
+                                record_count = len(data)
+                            elif isinstance(data, dict):
+                                if "data" in data and isinstance(data["data"], list):
+                                    record_count = len(data["data"])
+                                elif "results" in data and isinstance(data["results"], list):
+                                    record_count = len(data["results"])
+                                elif "items" in data and isinstance(data["items"], list):
+                                    record_count = len(data["items"])
+                            
+                            if record_count > 1:
+                                found_sensitive.append(f"array_data({record_count}_records)")
+                                if max_severity == "LOW":
+                                    max_severity = "MEDIUM"
+                                    
+                        except Exception:
+                            pass
+                        
+                        if found_sensitive:
+                            confidence = 0.95 if max_severity == "CRITICAL" else 0.90 if max_severity == "HIGH" else 0.80
+                            
+                            findings.append(AuthzFinding(
+                                vuln_type=VulnerabilityType.DATA_LEAKAGE,
+                                endpoint=endpoint,
+                                method="GET",
+                                roles_affected=["unauthenticated"],
+                                diffs=[],
+                                confidence=confidence,
+                                impact=f"Sensitive data exposed without authentication: {', '.join(found_sensitive)}",
+                                evidence=[
+                                    f"Endpoint: {endpoint}",
+                                    f"Status: 200 OK (no auth required)",
+                                    f"Sensitive fields: {', '.join(found_sensitive)}",
+                                    f"Response size: {len(content)} bytes",
+                                ],
+                                remediation="Implement proper authentication and authorization checks",
+                            ))
+                            
+                except Exception as e:
+                    logger.debug(f"[APILogicProfiler] Exposure test error for {endpoint}: {e}")
+        
+        return findings
+
+    async def _test_idor_parameters(
+        self,
+        base_url: str,
+        endpoints: list[str],
+        rate_limiter: "RateLimiter",
+    ) -> list[AuthzFinding]:
+        """Test for IDOR via query parameter manipulation."""
+        findings = []
+        
+        parsed = urlparse(base_url)
+        host = parsed.netloc
+        
+        # Common ID parameter names
+        id_params = [
+            "id", "userId", "user_id", "uid", "accountId", "account_id",
+            "profileId", "profile_id", "orderId", "order_id",
+            "documentId", "doc_id", "fileId", "file_id",
+            "customerId", "customer_id", "memberId", "member_id",
+        ]
+        
+        # Base endpoints to test (without existing query params)
+        base_endpoints = []
+        for ep in endpoints:
+            parsed_ep = urlparse(ep)
+            base_ep = f"{parsed_ep.scheme}://{parsed_ep.netloc}{parsed_ep.path}"
+            if base_ep not in base_endpoints:
+                base_endpoints.append(base_ep)
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            for endpoint in base_endpoints[:20]:
+                for param in id_params[:5]:  # Test top 5 params per endpoint
+                    await rate_limiter.acquire(host)
+                    
+                    try:
+                        # Test with id=1
+                        url1 = f"{endpoint}?{param}=1"
+                        response1 = await client.get(url1)
+                        
+                        if response1.status_code != 200:
+                            continue
+                        
+                        await rate_limiter.acquire(host)
+                        
+                        # Test with id=2
+                        url2 = f"{endpoint}?{param}=2"
+                        response2 = await client.get(url2)
+                        
+                        if response2.status_code != 200:
+                            continue
+                        
+                        # Compare responses - if different content, potential IDOR
+                        content1 = response1.text
+                        content2 = response2.text
+                        
+                        # Check if responses are different (indicating different data)
+                        if content1 != content2 and len(content1) > 50 and len(content2) > 50:
+                            # Verify it's not just timestamp differences
+                            # by checking if the core data structure differs
+                            try:
+                                json1 = response1.json()
+                                json2 = response2.json()
+                                
+                                # Check for different IDs in response
+                                str1 = str(json1)
+                                str2 = str(json2)
+                                
+                                # If one contains "1" and other contains "2" in ID fields
+                                # it's likely IDOR
+                                if ('"id": 1' in str1 or '"id":"1"' in str1) and \
+                                   ('"id": 2' in str2 or '"id":"2"' in str2):
+                                    
+                                    findings.append(AuthzFinding(
+                                        vuln_type=VulnerabilityType.IDOR,
+                                        endpoint=endpoint,
+                                        method="GET",
+                                        roles_affected=["unauthenticated"],
+                                        diffs=[],
+                                        confidence=0.90,
+                                        impact=f"Can access different objects by manipulating '{param}' parameter",
+                                        evidence=[
+                                            f"Endpoint: {endpoint}",
+                                            f"Parameter: {param}",
+                                            f"Request 1: {url1} → {len(content1)} bytes",
+                                            f"Request 2: {url2} → {len(content2)} bytes",
+                                            f"Different data returned for different IDs",
+                                        ],
+                                        remediation="Verify user has access to the requested resource",
+                                    ))
+                                    break  # Found IDOR for this endpoint
+                                    
+                            except Exception:
+                                pass
+                                
+                    except Exception as e:
+                        logger.debug(f"[APILogicProfiler] Param IDOR test error: {e}")
+        
+        return findings
 
     async def _profile_endpoint(
         self,
