@@ -818,6 +818,12 @@ async def _run_phantom_scan(
                         if isinstance(evidence, list):
                             evidence = "\n".join(str(e) for e in evidence)
 
+                        # Normalize confidence to 0-1 scale (some modules use 0-100)
+                        confidence = finding.get("confidence", 0.5)
+                        if confidence is not None and confidence > 1.0:
+                            confidence = confidence / 100.0  # Convert percentage to decimal
+                        confidence = max(0.0, min(1.0, confidence or 0.5))  # Clamp to 0-1
+
                         raw = create_raw_finding(
                             title=title,
                             vuln_type=vuln_type,
@@ -829,6 +835,7 @@ async def _run_phantom_scan(
                             module_name=finding.get("module", "unknown"),
                             response=finding.get("raw_response", ""),  # RawFinding uses 'response'
                             metadata=finding,  # RawFinding uses 'metadata' for extra data
+                            confidence=confidence,  # Pass normalized confidence
                         )
                         raw_findings.append(raw)
 

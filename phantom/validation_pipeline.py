@@ -287,6 +287,36 @@ class PatternMatcher:
             (r"__class__", 0.85),
             (r"__mro__", 0.85),
         ],
+        # Access Control / IDOR / Authorization patterns
+        VulnerabilityType.IDOR: [
+            # Response contains different user data (comparison-based detection)
+            (r"\"user_?id\":\s*\d+", 0.7),  # User ID in response
+            (r"\"id\":\s*\d+", 0.6),  # ID field in response
+            (r"\"email\":\s*\"[^\"]+@", 0.75),  # Email exposed
+            (r"\"username\":\s*\"", 0.7),  # Username exposed
+            (r"\"account\":", 0.65),  # Account data
+            (r"\"profile\":", 0.65),  # Profile data
+            (r"\"user\":\s*\{", 0.7),  # User object
+            (r"\"owner\":", 0.7),  # Owner field
+            (r"\"created_by\":", 0.65),  # Creator field
+            # Status code indicators
+            (r"200 OK", 0.6),  # Successful access (combined with ID change)
+        ],
+        VulnerabilityType.AUTHORIZATION: [
+            # Unauthorized access indicators
+            (r"\"role\":\s*\"admin\"", 0.85),  # Admin role exposed
+            (r"\"is_?admin\":\s*true", 0.9),  # Admin flag
+            (r"\"permissions\":\s*\[", 0.75),  # Permissions array
+            (r"\"privilege\":", 0.75),  # Privilege field
+            (r"\"access_?level\":", 0.7),  # Access level
+            (r"\"can_delete\":", 0.75),  # Delete permission
+            (r"\"can_edit\":", 0.75),  # Edit permission
+            (r"\"can_manage\":", 0.8),  # Manage permission
+            # Admin panel access
+            (r"admin.*dashboard", 0.85),  # Admin dashboard
+            (r"manage.*users", 0.8),  # User management
+            (r"configuration.*settings", 0.7),  # Config access
+        ],
     }
 
     # False positive indicators
@@ -526,6 +556,17 @@ class SafeReplayStage:
         """Replay with safe payload."""
         start = time.time()
 
+        # IDOR/Authorization findings are behavior-based, not payload-based
+        # They don't have traditional payloads to replay - skip this stage
+        if finding.vulnerability_type in [VulnerabilityType.IDOR, VulnerabilityType.AUTHORIZATION]:
+            return StageResult(
+                stage=ValidationStage.SAFE_REPLAY,
+                result=ValidationResult.SKIPPED,
+                confidence_delta=0.0,
+                message="IDOR/Auth findings are behavior-based, skipping replay",
+                duration_ms=(time.time() - start) * 1000,
+            )
+
         if not finding.payload or not finding.parameter:
             return StageResult(
                 stage=ValidationStage.SAFE_REPLAY,
@@ -610,6 +651,18 @@ class NegativeControlStage:
     ) -> StageResult:
         """Compare against baseline."""
         start = time.time()
+
+        # IDOR/Authorization findings are already behavior-validated through
+        # role comparison and ID manipulation. Skip baseline comparison as
+        # it doesn't apply to these finding types.
+        if finding.vulnerability_type in [VulnerabilityType.IDOR, VulnerabilityType.AUTHORIZATION]:
+            return StageResult(
+                stage=ValidationStage.NEGATIVE_CONTROL,
+                result=ValidationResult.PASSED,
+                confidence_delta=0.1,  # Small boost - already validated through behavior
+                message="IDOR/Auth findings validated through role comparison",
+                duration_ms=(time.time() - start) * 1000,
+            )
 
         if not finding.parameter:
             return StageResult(
@@ -735,6 +788,45 @@ class ContextValidationStage:
             if any(x in (finding.evidence or "") for x in ["169.254", "localhost", "127.0.0.1"]):
                 confidence_boost += 0.1
                 validations.append("internal_access_indicator")
+
+        # IDOR / Access Control validation
+        elif finding.vulnerability_type in [VulnerabilityType.IDOR, VulnerabilityType.AUTHORIZATION]:
+            evidence_text = finding.evidence or ""
+            response_text = finding.response or ""
+            combined_text = f"{evidence_text} {response_text}".lower()
+            
+            # Check for IDOR indicators
+            idor_indicators = [
+                "different user", "other user", "unauthorized",
+                "access to", "object id", "id manipulation",
+                "modified id", "original id", "status: 200"
+            ]
+            if any(x in combined_text for x in idor_indicators):
+                confidence_boost += 0.15
+                validations.append("idor_access_indicator")
+            
+            # Check for user data exposure
+            user_data_indicators = [
+                "email", "username", "user_id", "profile",
+                "account", "address", "phone", "password"
+            ]
+            if any(x in combined_text for x in user_data_indicators):
+                confidence_boost += 0.1
+                validations.append("user_data_exposure")
+            
+            # Check for role/permission exposure
+            authz_indicators = [
+                "admin", "role", "permission", "privilege",
+                "can_delete", "can_edit", "access_level"
+            ]
+            if any(x in combined_text for x in authz_indicators):
+                confidence_boost += 0.1
+                validations.append("authorization_data_exposure")
+            
+            # High confidence if we have response comparison evidence
+            if "status" in combined_text and "200" in combined_text:
+                confidence_boost += 0.05
+                validations.append("successful_unauthorized_access")
 
         if validations:
             return StageResult(

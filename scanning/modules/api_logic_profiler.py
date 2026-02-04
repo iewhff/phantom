@@ -684,7 +684,7 @@ class APILogicProfiler(ScanModule):
                 method="GET",
                 roles_affected=[d.role_a for d in critical_diffs] + [d.role_b for d in critical_diffs],
                 diffs=critical_diffs,
-                confidence=90.0,
+                confidence=0.90,  # Scale 0-1, not percentage
                 impact="Access to unauthorized data/objects",
                 evidence=[d.description for d in critical_diffs],
                 remediation="Implement proper object-level authorization checks",
@@ -699,7 +699,7 @@ class APILogicProfiler(ScanModule):
                 method="GET",
                 roles_affected=list(set([d.role_a for d in field_presence_diffs])),
                 diffs=field_presence_diffs,
-                confidence=85.0,
+                confidence=0.85,  # Scale 0-1, not percentage
                 impact="Sensitive data exposed to unauthorized roles",
                 evidence=[d.description for d in field_presence_diffs],
                 remediation="Filter response fields based on user permissions",
@@ -716,7 +716,7 @@ class APILogicProfiler(ScanModule):
                     method="GET",
                     roles_affected=[diff.role_a, diff.role_b],
                     diffs=[diff],
-                    confidence=95.0,
+                    confidence=0.95,  # Scale 0-1, not percentage
                     impact=f"Role '{diff.role_a}' can access endpoint that '{diff.role_b}' cannot",
                     evidence=[diff.description],
                     remediation="Implement proper function-level authorization",
@@ -787,7 +787,7 @@ class APILogicProfiler(ScanModule):
                                 method="GET",
                                 roles_affected=[role.name],
                                 diffs=[],
-                                confidence=85.0,
+                                confidence=0.85,  # Scale 0-1, not percentage
                                 impact=f"Can access object {test_id} instead of {original_id}",
                                 evidence=[
                                     f"Original ID: {original_id}",
