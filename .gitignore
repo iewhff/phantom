@@ -191,6 +191,30 @@ retest/results/
 retest/data/
 
 # ============================================================================
+# TOOLS BINARIES (Download via scripts/install_pentest_tools.sh)
+# ============================================================================
+tools/nuclei
+tools/httpx
+tools/ffuf
+tools/subfinder
+tools/amass
+tools/nmap
+tools/sqlmap
+tools/nikto
+tools/wfuzz
+tools/gobuster
+tools/dirsearch
+tools/feroxbuster
+tools/katana
+tools/gau
+tools/waybackurls
+tools/arjun
+tools/dalfox
+tools/kxss
+tools/*.exe
+tools/*.bin
+
+# ============================================================================
 # LARGE FILES
 # ============================================================================
 *.zip
