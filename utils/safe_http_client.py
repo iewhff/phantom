@@ -32,7 +32,7 @@ import unicodedata
 from datetime import datetime
 from typing import Any, Optional, List
 from functools import wraps
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import unquote_plus
 
 import httpx
 
@@ -59,6 +59,7 @@ def _normalize_payload(payload: str) -> str:
     - Null byte removal
     - SQL comment removal (DR/**/OP → DROP)
     - Whitespace normalization
+    - Keyword reconstruction after comment removal
     """
     if not payload:
         return ""
@@ -73,7 +74,11 @@ def _normalize_payload(payload: str) -> str:
         normalized = decoded
 
     # 2. Remove null bytes (bypass attempt: DROP%00TABLE)
-    normalized = normalized.replace('\x00', '').replace('%00', '')
+    # Handle both raw null bytes and encoded versions
+    normalized = normalized.replace('\x00', '')
+    normalized = normalized.replace('%00', '')
+    normalized = re.sub(r'\\x00', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\\0', '', normalized)
 
     # 3. Unicode normalization (NFKC - compatibility decomposition)
     # This handles lookalike characters: ᴅROP → DROP
@@ -84,11 +89,36 @@ def _normalize_payload(payload: str) -> str:
 
     # 4. Remove SQL comments (bypass attempt: DR/**/OP TABLE)
     # Handle: /* ... */, --, #
-    normalized = re.sub(r'/\*.*?\*/', ' ', normalized, flags=re.DOTALL)
-    normalized = re.sub(r'--[^\n]*', ' ', normalized)
-    normalized = re.sub(r'#[^\n]*', ' ', normalized)
+    # IMPORTANT: Replace with empty string (not space) to reconstruct split keywords
+    # DR/**/OP → DROP (not DR OP)
+    normalized = re.sub(r'/\*.*?\*/', '', normalized, flags=re.DOTALL)
+
+    # For line comments (-- and #), be more careful:
+    # In web contexts, payloads are often single-line, so -- might be used to
+    # hide the rest of the query, not to split keywords.
+    # But we still need to detect if someone is trying to inject malicious SQL
+    # before the comment. So we remove the comment but keep checking the rest.
+    # Also handle the case where -- is used mid-keyword (unlikely but possible)
+    # Example: "DROP--x\nTABLE" should become "DROP TABLE" after normalization
+    normalized = re.sub(r'--[^\n]*\n?', ' ', normalized)
+    normalized = re.sub(r'#[^\n]*\n?', ' ', normalized)
 
     # 5. Normalize whitespace (tabs, newlines, multiple spaces → single space)
+    normalized = re.sub(r'\s+', ' ', normalized)
+
+    # 6. Add spaces between concatenated SQL keywords (DROPTABLE → DROP TABLE)
+    # This defeats null-byte concatenation: DROP%00TABLE → DROPTABLE → DROP TABLE
+    sql_keywords = ['DROP', 'TABLE', 'DATABASE', 'TRUNCATE', 'DELETE', 'UPDATE', 'INSERT', 'SELECT', 'FROM', 'WHERE', 'SCHEMA', 'INDEX', 'VIEW', 'PROCEDURE', 'FUNCTION']
+    for keyword in sql_keywords:
+        # Insert space before keyword if preceded by another letter (case insensitive)
+        normalized = re.sub(
+            rf'([a-zA-Z])({keyword})',
+            r'\1 \2',
+            normalized,
+            flags=re.IGNORECASE
+        )
+
+    # 7. Clean up any double spaces created
     normalized = re.sub(r'\s+', ' ', normalized)
 
     return normalized
@@ -103,15 +133,22 @@ def _decode_base64_payloads(payload: str) -> str:
     """
     decoded_parts = [payload]
 
-    # Pattern for base64 strings (at least 20 chars, valid base64 alphabet)
-    base64_pattern = re.compile(r'[A-Za-z0-9+/=]{20,}')
+    # Pattern for base64 strings (at least 8 chars for short commands like "rm -rf /")
+    # Valid base64 alphabet plus padding
+    base64_pattern = re.compile(r'[A-Za-z0-9+/]{8,}={0,2}')
 
     for match in base64_pattern.finditer(payload):
         b64_str = match.group()
         try:
+            # Ensure proper padding
+            padding_needed = 4 - (len(b64_str.rstrip('=')) % 4)
+            if padding_needed != 4:
+                b64_str = b64_str.rstrip('=') + '=' * padding_needed
+
             # Try to decode
-            decoded = base64.b64decode(b64_str + '==').decode('utf-8', errors='ignore')
-            if decoded and len(decoded) > 5:  # Only if meaningful content
+            decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
+            # Only add if it looks like meaningful content (has some printable chars)
+            if decoded and len(decoded) >= 4 and any(c.isalpha() for c in decoded):
                 decoded_parts.append(decoded)
         except Exception:
             continue
@@ -238,7 +275,8 @@ ABSOLUTELY_BLOCKED_PATTERNS = [
     r"OPENDATASOURCE",  # MSSQL remote data source
     r"pg_read_file",  # PostgreSQL file read
     r"pg_ls_dir",  # PostgreSQL directory listing
-    r"COPY\s+.*\s+TO\s+PROGRAM",  # PostgreSQL command execution
+    r"COPY\s+.*?\s*TO\s+PROGRAM",  # PostgreSQL command execution
+    r"TO\s+PROGRAM",  # PostgreSQL command execution (partial match)
     
     # File system destruction - CRITICAL
     r"rm\s+-rf\s+/",
