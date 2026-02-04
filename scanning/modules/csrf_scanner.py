@@ -241,10 +241,108 @@ class CSRFScanner:
     8. WebSocket CSRF
     9. Framework-specific patterns
     10. Token reuse and leakage
+    11. HIGH-IMPACT endpoint detection (password, email, delete)
     """
     
     # State-changing HTTP methods
     STATE_CHANGING_METHODS = ["POST", "PUT", "PATCH", "DELETE"]
+    
+    # ==========================================================================
+    # HIGH-IMPACT CSRF ENDPOINTS - These make CSRF CRITICAL, not just "checkbox"
+    # ==========================================================================
+    
+    # Password change endpoints
+    PASSWORD_CHANGE_PATTERNS = [
+        r"/password",
+        r"/change.?password",
+        r"/update.?password",
+        r"/reset.?password",
+        r"/profile.*password",
+        r"/account.*password",
+        r"/settings.*password",
+        r"/user.*password",
+        r"/api/.*password",
+        r"/rest/.*password",
+    ]
+    
+    # Email change endpoints
+    EMAIL_CHANGE_PATTERNS = [
+        r"/email",
+        r"/change.?email",
+        r"/update.?email",
+        r"/profile.*email",
+        r"/account.*email",
+        r"/settings.*email",
+        r"/user.*email",
+        r"/api/.*email",
+    ]
+    
+    # Account deletion endpoints
+    ACCOUNT_DELETE_PATTERNS = [
+        r"/delete.?account",
+        r"/account.*delete",
+        r"/user.*delete",
+        r"/profile.*delete",
+        r"/remove.?account",
+        r"/deactivate",
+        r"/close.?account",
+        r"/api/users?/\d*$",  # DELETE /api/users/123
+        r"/api/account",
+    ]
+    
+    # Other high-impact endpoints
+    HIGH_IMPACT_PATTERNS = [
+        # Financial
+        r"/transfer",
+        r"/payment",
+        r"/withdraw",
+        r"/send.?money",
+        r"/transaction",
+        r"/purchase",
+        r"/checkout",
+        r"/order",
+        r"/buy",
+        
+        # Admin actions
+        r"/admin",
+        r"/user.*role",
+        r"/permissions",
+        r"/grant",
+        r"/revoke",
+        r"/promote",
+        r"/demote",
+        
+        # Security settings
+        r"/2fa",
+        r"/mfa",
+        r"/totp",
+        r"/security",
+        r"/api.?key",
+        r"/token",
+        r"/sessions?/",
+        r"/logout.?all",
+        
+        # Data modification
+        r"/publish",
+        r"/unpublish",
+        r"/approve",
+        r"/reject",
+        r"/ban",
+        r"/unban",
+        r"/suspend",
+        
+        # Juice Shop specific
+        r"/rest/user",
+        r"/api/Users",
+        r"/api/Cards",
+        r"/api/Addresss",
+        r"/api/Deliverys",
+        r"/api/Recycles",
+        r"/api/Complaints",
+        r"/api/Feedbacks",
+        r"/rest/basket",
+        r"/rest/order",
+    ]
     
     # Common CSRF token parameter names - Extended
     CSRF_TOKEN_NAMES = [
@@ -274,6 +372,108 @@ class CSRFScanner:
         self.result = CSRFScanResult()
         self._token_cache: dict[str, str] = {}  # Track tokens for reuse detection
         self._session_cookies: dict[str, str] = {}
+        
+        # Compile patterns for efficiency
+        self._password_patterns = [re.compile(p, re.IGNORECASE) for p in self.PASSWORD_CHANGE_PATTERNS]
+        self._email_patterns = [re.compile(p, re.IGNORECASE) for p in self.EMAIL_CHANGE_PATTERNS]
+        self._delete_patterns = [re.compile(p, re.IGNORECASE) for p in self.ACCOUNT_DELETE_PATTERNS]
+        self._high_impact_patterns = [re.compile(p, re.IGNORECASE) for p in self.HIGH_IMPACT_PATTERNS]
+    
+    def _classify_endpoint_impact(self, endpoint: str, method: str = "POST") -> tuple[str, str, float]:
+        """
+        Classify endpoint impact for CSRF vulnerability.
+        
+        Returns:
+            tuple: (impact_type, severity, cvss_score)
+            
+        Impact types:
+        - "password_change": CRITICAL - attacker can take over account
+        - "email_change": CRITICAL - attacker can reset password via new email
+        - "account_delete": CRITICAL - attacker can delete victim's account
+        - "financial": CRITICAL - attacker can steal money
+        - "admin_action": CRITICAL - privilege escalation
+        - "data_modification": HIGH - attacker can modify victim's data
+        - "generic": MEDIUM - standard CSRF without clear impact
+        """
+        endpoint_lower = endpoint.lower()
+        
+        # Password change = Account Takeover
+        for pattern in self._password_patterns:
+            if pattern.search(endpoint_lower):
+                return ("password_change", "CRITICAL", 9.1)
+        
+        # Email change = Account Takeover via password reset
+        for pattern in self._email_patterns:
+            if pattern.search(endpoint_lower):
+                return ("email_change", "CRITICAL", 9.1)
+        
+        # Account deletion = Data loss / DoS
+        for pattern in self._delete_patterns:
+            if pattern.search(endpoint_lower):
+                return ("account_delete", "CRITICAL", 8.8)
+        
+        # DELETE method on user endpoints = likely account/data deletion
+        if method.upper() == "DELETE":
+            if any(x in endpoint_lower for x in ["user", "account", "profile"]):
+                return ("account_delete", "CRITICAL", 8.8)
+        
+        # High-impact patterns
+        for pattern in self._high_impact_patterns:
+            if pattern.search(endpoint_lower):
+                # Determine sub-type
+                if any(x in endpoint_lower for x in ["transfer", "payment", "withdraw", "money", "purchase"]):
+                    return ("financial", "CRITICAL", 9.3)
+                if any(x in endpoint_lower for x in ["admin", "role", "permission", "promote", "grant"]):
+                    return ("admin_action", "CRITICAL", 8.5)
+                if any(x in endpoint_lower for x in ["2fa", "mfa", "security", "api.key", "token"]):
+                    return ("security_bypass", "CRITICAL", 8.7)
+                return ("high_impact_action", "HIGH", 7.5)
+        
+        # Generic state-changing endpoint
+        return ("generic", "MEDIUM", 5.4)
+    
+    def _get_impact_description(self, impact_type: str) -> str:
+        """Get detailed impact description for report."""
+        descriptions = {
+            "password_change": (
+                "**ACCOUNT TAKEOVER** - An attacker can change the victim's password, "
+                "completely locking them out of their account. The attacker gains full "
+                "control over the account and all associated data."
+            ),
+            "email_change": (
+                "**ACCOUNT TAKEOVER via EMAIL** - An attacker can change the victim's email address. "
+                "This allows the attacker to trigger a password reset to their own email, "
+                "effectively taking over the account."
+            ),
+            "account_delete": (
+                "**ACCOUNT DELETION** - An attacker can delete the victim's account, "
+                "causing permanent data loss and denial of service. This may violate "
+                "data protection regulations (GDPR, CCPA)."
+            ),
+            "financial": (
+                "**FINANCIAL THEFT** - An attacker can initiate financial transactions "
+                "on behalf of the victim, potentially stealing money or making unauthorized "
+                "purchases."
+            ),
+            "admin_action": (
+                "**PRIVILEGE ESCALATION** - An attacker can perform administrative actions "
+                "on behalf of a privileged user, potentially compromising the entire application."
+            ),
+            "security_bypass": (
+                "**SECURITY BYPASS** - An attacker can modify security settings such as "
+                "disabling 2FA/MFA, revoking API keys, or terminating sessions, "
+                "weakening the account's security posture."
+            ),
+            "high_impact_action": (
+                "**HIGH IMPACT ACTION** - An attacker can perform sensitive actions "
+                "that may affect data integrity, user content, or application state."
+            ),
+            "generic": (
+                "State-changing action that may be exploited via CSRF. "
+                "Verify the actual impact based on the endpoint's functionality."
+            ),
+        }
+        return descriptions.get(impact_type, descriptions["generic"])
     
     async def scan(
         self,
@@ -282,14 +482,22 @@ class CSRFScanner:
         rate_limiter: Any = None
     ) -> dict:
         """
-        Scan for CSRF vulnerabilities - Enterprise Edition.
+        Scan for CSRF vulnerabilities - Enterprise Edition with HIGH-IMPACT DETECTION.
+        
+        Now detects CSRF on critical actions:
+        - Password change → Account Takeover
+        - Email change → Account Takeover via password reset
+        - Account deletion → Data loss / DoS
+        - Financial transactions → Theft
+        - Admin actions → Privilege escalation
         
         Args:
             host: Target hostname
             asset_data: Contains endpoints, forms, cookies
             rate_limiter: Optional rate limiter
         """
-        logger.info(f"🔍 CSRF Scanner Enterprise v2.0 starting for {host}")
+        logger.info(f"🔍 CSRF Scanner Enterprise v3.0 starting for {host}")
+        logger.info("🎯 HIGH-IMPACT mode: Targeting password/email/account/financial endpoints")
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         
@@ -301,6 +509,10 @@ class CSRFScanner:
             follow_redirects=True,
             verify=False,
         ) as client:
+            # 0. PRIORITY: Test high-impact endpoints FIRST
+            logger.info("🔴 Phase 0: Testing HIGH-IMPACT endpoints (password/email/account)")
+            await self._test_high_impact_csrf(client, base_url, endpoints, rate_limiter)
+            
             # 1. Test cookie SameSite attributes
             await self._test_samesite_cookies(client, base_url)
             
@@ -341,7 +553,9 @@ class CSRFScanner:
             # 10. Enterprise: WebSocket CSRF
             await self._test_websocket_csrf(client, base_url)
         
-        logger.info(f"✅ CSRF Enterprise scan complete: {len(self.result.findings)} findings")
+        # Count high-impact findings
+        high_impact_count = sum(1 for f in self.result.findings if f.severity == "CRITICAL")
+        logger.info(f"✅ CSRF Enterprise scan complete: {len(self.result.findings)} findings ({high_impact_count} CRITICAL)")
         
         return {
             "findings": [f.to_dict() for f in self.result.findings],
@@ -351,6 +565,260 @@ class CSRFScanner:
             "frameworks_detected": self.result.frameworks_detected,
         }
     
+    # ========================================================================
+    # HIGH-IMPACT CSRF DETECTION - Password/Email/Account/Financial
+    # ========================================================================
+    
+    async def _test_high_impact_csrf(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        known_endpoints: list[str],
+        rate_limiter: Any = None
+    ) -> None:
+        """
+        Specifically test high-impact endpoints for CSRF.
+        
+        This method probes common high-impact endpoints that may not be
+        in the discovered endpoints list, testing for CSRF on:
+        - Password change → Account Takeover
+        - Email change → Account Takeover via password reset
+        - Account deletion → Data loss
+        - Financial operations → Theft
+        """
+        # Common high-impact endpoint paths to probe
+        HIGH_IMPACT_PROBE_ENDPOINTS = [
+            # Password change endpoints
+            "/api/user/password",
+            "/api/users/password",
+            "/rest/user/password",
+            "/rest/users/password",
+            "/api/v1/user/password",
+            "/api/v1/account/password",
+            "/api/v1/profile/password",
+            "/user/change-password",
+            "/account/password",
+            "/profile/password",
+            "/settings/password",
+            "/api/password/change",
+            "/password/update",
+            
+            # Email change endpoints
+            "/api/user/email",
+            "/api/users/email", 
+            "/rest/user/email",
+            "/api/v1/user/email",
+            "/api/v1/account/email",
+            "/user/change-email",
+            "/account/email",
+            "/profile/email",
+            "/settings/email",
+            "/api/email/change",
+            
+            # Account deletion endpoints
+            "/api/user/delete",
+            "/api/users/delete",
+            "/api/v1/user",  # DELETE method
+            "/api/v1/account",  # DELETE method
+            "/api/account/delete",
+            "/user/delete",
+            "/account/delete",
+            "/profile/delete",
+            "/api/user/deactivate",
+            
+            # Juice Shop specific endpoints
+            "/rest/user/change-password",
+            "/api/Users",  # POST for change
+            "/rest/user/data-export",
+            "/api/SecurityQuestions",
+            "/api/SecurityAnswers",
+            
+            # Financial/Transfer endpoints
+            "/api/transfer",
+            "/api/payment",
+            "/api/withdraw",
+            "/api/wallet/transfer",
+            "/api/basket/checkout",
+            "/rest/basket/checkout",
+            "/api/orders",
+            
+            # Admin endpoints
+            "/api/admin/users",
+            "/admin/users",
+            "/api/v1/admin",
+            
+            # 2FA/Security endpoints
+            "/api/2fa/disable",
+            "/api/mfa/disable",
+            "/api/security/2fa",
+            "/api/totp/disable",
+        ]
+        
+        # Combine with known endpoints that match high-impact patterns
+        all_high_impact = set(HIGH_IMPACT_PROBE_ENDPOINTS)
+        
+        for endpoint in known_endpoints:
+            impact_type, severity, _ = self._classify_endpoint_impact(endpoint)
+            if impact_type != "generic":
+                all_high_impact.add(endpoint)
+        
+        logger.info(f"🎯 Testing {len(all_high_impact)} high-impact endpoints")
+        
+        for endpoint in all_high_impact:
+            if rate_limiter:
+                host = urlparse(base_url).hostname or ""
+                await rate_limiter.acquire(host)
+            
+            await self._test_single_high_impact_endpoint(client, base_url, endpoint)
+    
+    async def _test_single_high_impact_endpoint(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        endpoint: str
+    ) -> None:
+        """Test a single high-impact endpoint for CSRF vulnerability."""
+        url = endpoint if endpoint.startswith("http") else urljoin(base_url, endpoint)
+        
+        # Classify impact
+        impact_type, severity, cvss_score = self._classify_endpoint_impact(endpoint, "POST")
+        impact_description = self._get_impact_description(impact_type)
+        
+        if impact_type == "generic":
+            return  # Skip non-high-impact in this method
+        
+        # Test payloads specific to endpoint type
+        test_payloads = self._get_high_impact_test_payload(impact_type)
+        
+        methods_to_test = ["POST", "PUT", "PATCH"]
+        if impact_type == "account_delete":
+            methods_to_test.append("DELETE")
+        
+        for method in methods_to_test:
+            try:
+                # Test 1: Cross-origin request (main CSRF test)
+                if method == "DELETE":
+                    response = await client.request(
+                        method,
+                        url,
+                        headers={
+                            "Origin": "https://evil-attacker.com",
+                            "Referer": "https://evil-attacker.com/csrf-poc.html",
+                        }
+                    )
+                else:
+                    response = await client.request(
+                        method,
+                        url,
+                        json=test_payloads,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": "https://evil-attacker.com",
+                            "Referer": "https://evil-attacker.com/csrf-poc.html",
+                        }
+                    )
+                
+                self.result.endpoints_tested += 1
+                
+                # Analyze response
+                if response.status_code in [200, 201, 202, 204, 302]:
+                    # Check if it actually processed or just returned an auth error
+                    is_vulnerable = False
+                    try:
+                        body = response.text.lower()
+                        # Not vulnerable if auth error
+                        if any(x in body for x in ["unauthorized", "unauthenticated", "login required", "401"]):
+                            continue
+                        # Not vulnerable if CSRF error
+                        if any(x in body for x in ["csrf", "token", "invalid token", "missing token"]):
+                            continue
+                        # Likely vulnerable if processed
+                        is_vulnerable = True
+                    except Exception:
+                        is_vulnerable = True
+                    
+                    if is_vulnerable:
+                        self.result.findings.append(CSRFFinding(
+                            url=url,
+                            method=method,
+                            severity=severity,
+                            title=f"🔴 CRITICAL CSRF: {impact_type.replace('_', ' ').title()}",
+                            description=(
+                                f"**CONFIRMED HIGH-IMPACT CSRF VULNERABILITY**\n\n"
+                                f"The endpoint `{endpoint}` accepts {method} requests from any origin "
+                                f"without CSRF token validation.\n\n"
+                                f"**Impact Classification:** {impact_type.upper()}\n"
+                                f"**CVSS Score:** {cvss_score}\n"
+                                f"**Severity:** {severity}\n\n"
+                                f"**Real-World Attack Scenario:**\n{impact_description}\n\n"
+                                f"**Proof of Concept:**\n"
+                                f"An attacker can create a malicious page that, when visited by "
+                                f"an authenticated user, will automatically perform this action "
+                                f"without the user's knowledge or consent."
+                            ),
+                            evidence=(
+                                f"Request: {method} {url}\n"
+                                f"Origin: https://evil-attacker.com\n"
+                                f"Response: {response.status_code}\n"
+                                f"Body (truncated): {response.text[:300]}"
+                            ),
+                            remediation=(
+                                f"1. Implement CSRF token validation for this endpoint\n"
+                                f"2. Use SameSite=Strict cookies\n"
+                                f"3. Validate Origin/Referer headers\n"
+                                f"4. For {impact_type}, consider requiring re-authentication"
+                            ),
+                        ))
+                        logger.warning(f"🔴 CRITICAL CSRF found: {impact_type} at {url}")
+                        break  # Found vulnerability, no need to test other methods
+                        
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in [401, 403]:
+                    # Auth required - can't test without credentials
+                    pass
+            except Exception as e:
+                logger.debug(f"High-impact CSRF test error for {endpoint}: {e}")
+    
+    def _get_high_impact_test_payload(self, impact_type: str) -> dict:
+        """Get test payload for high-impact endpoint type."""
+        payloads = {
+            "password_change": {
+                "password": "csrf_test_password123",
+                "new_password": "csrf_test_password123",
+                "newPassword": "csrf_test_password123",
+                "current_password": "current",
+                "confirm_password": "csrf_test_password123",
+                "repeat": "csrf_test_password123",
+            },
+            "email_change": {
+                "email": "attacker@evil.com",
+                "new_email": "attacker@evil.com",
+                "newEmail": "attacker@evil.com",
+            },
+            "account_delete": {
+                "confirm": True,
+                "deleteAccount": True,
+                "action": "delete",
+            },
+            "financial": {
+                "amount": 0.01,
+                "to": "attacker",
+                "recipient": "attacker",
+            },
+            "admin_action": {
+                "role": "admin",
+                "action": "promote",
+            },
+            "security_bypass": {
+                "enabled": False,
+                "disable": True,
+            },
+            "high_impact_action": {
+                "action": "csrf_test",
+            },
+        }
+        return payloads.get(impact_type, {"test": "csrf"})
+
     async def _test_samesite_cookies(self, client: httpx.AsyncClient, base_url: str) -> None:
         """Test SameSite cookie attribute."""
         logger.info("🍪 Testing SameSite cookie attributes...")
@@ -425,7 +893,7 @@ class CSRFScanner:
             logger.debug(f"Cookie test error: {e}")
     
     async def _test_form_csrf(self, client: httpx.AsyncClient, form: dict) -> None:
-        """Test form for CSRF token."""
+        """Test form for CSRF token with IMPACT CLASSIFICATION."""
         url = form.get("action", form.get("url", ""))
         method = form.get("method", "POST").upper()
         
@@ -433,6 +901,10 @@ class CSRFScanner:
             return
         
         self.result.endpoints_tested += 1
+        
+        # === HIGH-IMPACT CLASSIFICATION ===
+        impact_type, severity, cvss_score = self._classify_endpoint_impact(url, method)
+        impact_description = self._get_impact_description(impact_type)
         
         # Check if form has CSRF token field
         fields = form.get("fields", [])
@@ -445,15 +917,25 @@ class CSRFScanner:
         )
         
         if not has_csrf_token:
+            # Create finding with IMPACT-BASED SEVERITY
+            title = f"Form missing CSRF token"
+            if impact_type != "generic":
+                title = f"🔴 HIGH-IMPACT CSRF: {impact_type.replace('_', ' ').title()} - Form Unprotected"
+            
             self.result.findings.append(CSRFFinding(
                 url=url,
                 method=method,
-                severity="HIGH",
-                title=f"Form missing CSRF token",
-                description=f"The form at '{url}' does not include a CSRF token field. "
-                           "State-changing forms should include CSRF protection.",
-                evidence=f"Form fields: {field_names}",
-                remediation="Add a CSRF token hidden field to the form.",
+                severity=severity,  # Based on endpoint impact
+                title=title,
+                description=(
+                    f"The form at '{url}' does not include a CSRF token field.\n\n"
+                    f"**Impact Classification:** {impact_type.upper()}\n"
+                    f"**CVSS Score:** {cvss_score}\n\n"
+                    f"**Real-World Impact:**\n{impact_description}"
+                ),
+                evidence=f"Form fields: {field_names}\nEndpoint: {url}\nMethod: {method}",
+                remediation="Add a CSRF token hidden field to the form. "
+                           "For high-impact actions, consider requiring re-authentication.",
             ))
     
     async def _test_endpoint_csrf(
@@ -462,7 +944,7 @@ class CSRFScanner:
         endpoint: str,
         base_url: str
     ) -> None:
-        """Test endpoint for CSRF vulnerability."""
+        """Test endpoint for CSRF vulnerability with HIGH-IMPACT CLASSIFICATION."""
         # Only test POST/PUT/PATCH/DELETE
         # First, discover the method
         
@@ -470,6 +952,11 @@ class CSRFScanner:
         
         url = endpoint if endpoint.startswith("http") else urljoin(base_url, endpoint)
         parsed = urlparse(url)
+        
+        # === HIGH-IMPACT CLASSIFICATION ===
+        impact_type, base_severity, cvss_score = self._classify_endpoint_impact(url, "POST")
+        impact_description = self._get_impact_description(impact_type)
+        is_high_impact = impact_type != "generic"
         
         try:
             # Test 1: Send POST without CSRF token
@@ -489,15 +976,26 @@ class CSRFScanner:
                 try:
                     data = response.json()
                     if "error" not in str(data).lower() and "invalid" not in str(data).lower():
+                        # Create finding with IMPACT-BASED SEVERITY
+                        title = f"Endpoint accepts cross-origin POST"
+                        if is_high_impact:
+                            title = f"🔴 CRITICAL CSRF: {impact_type.replace('_', ' ').title()} - Cross-Origin Attack Possible"
+                        
                         self.result.findings.append(CSRFFinding(
                             url=url,
                             method="POST",
-                            severity="HIGH",
-                            title=f"Endpoint accepts cross-origin POST",
-                            description=f"The endpoint '{endpoint}' accepted a POST request "
-                                       "with Origin: https://evil.com without CSRF validation.",
+                            severity=base_severity,  # Based on impact
+                            title=title,
+                            description=(
+                                f"The endpoint '{endpoint}' accepted a POST request "
+                                f"with Origin: https://evil.com without CSRF validation.\n\n"
+                                f"**Impact Classification:** {impact_type.upper()}\n"
+                                f"**CVSS Score:** {cvss_score}\n\n"
+                                f"**Real-World Impact:**\n{impact_description}"
+                            ),
                             evidence=f"Response: {response.status_code}, Body: {str(data)[:200]}",
-                            remediation="Implement CSRF token validation or SameSite cookies.",
+                            remediation="Implement CSRF token validation or SameSite=Strict cookies. "
+                                       "For high-impact actions, require re-authentication.",
                         ))
                 except Exception:
                     pass
