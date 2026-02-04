@@ -507,6 +507,7 @@ class HTTPSmugglingScanner(ScanModule):
                         type="http_smuggling",
                         name=f"HTTP Request Smuggling - CL.TE ({payload_info['name']})",
                         severity="CRITICAL",
+                        confidence=result.confidence * 100,  # Convert 0-1 to 0-100
                         description=f"CL.TE smuggling vulnerability detected. "
                                    f"{payload_info['description']}. "
                                    f"Frontend uses Content-Length, backend uses Transfer-Encoding.",
@@ -593,6 +594,7 @@ class HTTPSmugglingScanner(ScanModule):
                         type="http_smuggling",
                         name=f"HTTP Request Smuggling - TE.CL ({payload_info['name']})",
                         severity="CRITICAL",
+                        confidence=result.confidence * 100,  # Convert 0-1 to 0-100
                         description=f"TE.CL smuggling vulnerability detected. "
                                    f"{payload_info['description']}. "
                                    f"Frontend uses Transfer-Encoding, backend uses Content-Length.",
@@ -718,6 +720,7 @@ class HTTPSmugglingScanner(ScanModule):
                             type="http_smuggling",
                             name=f"HTTP Smuggling - TE.TE ({te_obfuscation.name})",
                             severity="CRITICAL",
+                            confidence=90,
                             description=f"TE.TE smuggling via obfuscated Transfer-Encoding. "
                                        f"Technique: {te_obfuscation.description}",
                             host=hostname,
@@ -808,6 +811,7 @@ class HTTPSmugglingScanner(ScanModule):
                         type="http_smuggling",
                         name="Response Queue Poisoning",
                         severity="CRITICAL",
+                        confidence=95,
                         description="Response queue poisoning detected. "
                                    "Smuggled request responses are returned to victim requests.",
                         host=hostname,
@@ -854,6 +858,7 @@ class HTTPSmugglingScanner(ScanModule):
                         type="http_smuggling",
                         name="HTTP/2 Detected - Downgrade Smuggling Risk",
                         severity="MEDIUM",
+                        confidence=70,
                         description="HTTP/2 is in use. If backend uses HTTP/1.1, "
                                    "H2.CL and H2.TE smuggling attacks may be possible. "
                                    "Manual testing with h2c (HTTP/2 over cleartext) recommended.",
@@ -888,6 +893,7 @@ class HTTPSmugglingScanner(ScanModule):
                                 type="http_smuggling",
                                 name="HTTP/2 Header Injection",
                                 severity="HIGH",
+                                confidence=90,
                                 description="CRLF injection possible in HTTP/2 headers. "
                                            "This may lead to request smuggling.",
                                 host=hostname,
@@ -955,6 +961,7 @@ class HTTPSmugglingScanner(ScanModule):
                     type="http_smuggling",
                     name="HTTP Request Tunneling/Splitting",
                     severity="HIGH",
+                    confidence=85,
                     description="Request splitting via header injection detected. "
                                "Attacker can inject additional requests.",
                     host=hostname,

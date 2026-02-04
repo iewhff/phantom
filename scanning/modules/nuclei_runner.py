@@ -353,6 +353,7 @@ class NucleiRunner(ScanModule):
             matched_at=result.get("matched-at", ""),
             evidence=result.get("extracted-results", []),
             cvss_score=float(cvss),
+            confidence=90,  # Nuclei templates are well-tested
             cwe=info.get("classification", {}).get("cwe-id", ""),
             remediation=info.get("remediation", ""),
             references=info.get("reference", []),

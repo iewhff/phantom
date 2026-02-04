@@ -1111,7 +1111,7 @@ class CRLFScanner(ScanModule):
     ) -> list[Finding]:
         """Enterprise redirect endpoint CRLF testing."""
         findings = []
-        
+
         redirect_payloads = [
             # Location header injection
             CRLFPayload(
@@ -1137,21 +1137,54 @@ class CRLFScanner(ScanModule):
                 detection_pattern="<html>Injected</html>"
             ),
         ] + self.HEADER_INJECTION_PAYLOADS[:5]
-        
+
+        # Track tested endpoints to avoid redundant tests
+        tested_endpoints = set()
+
         for endpoint in self.VULNERABLE_ENDPOINTS:
+            # Skip if already tested this endpoint
+            if endpoint in tested_endpoints:
+                continue
+
+            # First verify the endpoint exists and is a redirect endpoint
+            await rate_limiter.acquire()
+            try:
+                check_url = urljoin(base_url, f"{endpoint}?url=http://example.com")
+                check_response = await client.get(check_url, follow_redirects=False)
+
+                # Skip non-existent endpoints
+                if check_response.status_code == 404:
+                    tested_endpoints.add(endpoint)
+                    continue
+
+                # Only test if it's actually a redirect (3xx) or processes the URL param
+                is_redirect = 300 <= check_response.status_code < 400
+                has_location = "location" in str(check_response.headers).lower()
+
+                if not is_redirect and not has_location:
+                    # Not a redirect endpoint, skip
+                    tested_endpoints.add(endpoint)
+                    continue
+
+            except Exception:
+                continue
+
+            tested_endpoints.add(endpoint)
+
             for payload in redirect_payloads:
                 await rate_limiter.acquire()
-                
+
                 try:
                     url = urljoin(base_url, f"{endpoint}?url=http://example.com{payload.payload}")
                     response = await client.get(url, follow_redirects=False)
-                    
+
                     # Check Location header
                     location = response.headers.get("location", "")
-                    
+
                     # Check for injection in Location
                     if payload.detection_pattern and payload.detection_pattern in location:
                         findings.append(Finding(
+                            type="crlf_injection",
                             name="CRLF Injection in Redirect",
                             severity="HIGH",
                             confidence="HIGH",
@@ -1172,7 +1205,7 @@ class CRLFScanner(ScanModule):
                             ),
                         ))
                         break
-                    
+
                     # Check for injected headers in response
                     vuln = self._analyze_response(
                         response,
@@ -1181,14 +1214,14 @@ class CRLFScanner(ScanModule):
                         "url",
                         InjectionContext.REDIRECT_LOCATION
                     )
-                    
+
                     if vuln:
                         findings.append(self._vuln_to_finding(vuln))
                         break
-                        
+
                 except Exception as e:
                     logger.debug(f"[CRLF] Redirect test error: {e}")
-        
+
         return findings
     
     async def _test_cookie_injection_enterprise(
@@ -1225,7 +1258,8 @@ class CRLFScanner(ScanModule):
                             for pattern in injection_patterns:
                                 if pattern in cookie_lower:
                                     findings.append(Finding(
-                                        name="CRLF Set-Cookie Injection",
+                                        type="crlf_injection",
+                            name="CRLF Set-Cookie Injection",
                                         severity="HIGH",
                                         confidence="HIGH",
                                         description=f"Session hijacking via Set-Cookie injection: {payload.description}",
@@ -1288,7 +1322,8 @@ class CRLFScanner(ScanModule):
                 # Check for injected header in response
                 if self._check_injection_success(response, payload):
                     findings.append(Finding(
-                        name="CRLF Header Injection via Request Headers",
+                        type="crlf_injection",
+                            name="CRLF Header Injection via Request Headers",
                         severity="MEDIUM",
                         confidence="MEDIUM",
                         description=f"Request header reflection allows CRLF injection: {payload.description}",
@@ -1321,52 +1356,67 @@ class CRLFScanner(ScanModule):
     ) -> list[Finding]:
         """Enterprise XSS via HTTP Response Splitting testing."""
         findings = []
-        
+
+        # Use unique marker to avoid false positives from SPA/generic patterns
+        unique_marker = f"CRLFXSS{hashlib.md5(base_url.encode()).hexdigest()[:8]}"
+
         for endpoint in self.VULNERABLE_ENDPOINTS[:10]:
+            # First check if endpoint exists
+            await rate_limiter.acquire()
+            try:
+                check_url = urljoin(base_url, endpoint)
+                check_response = await client.get(check_url, follow_redirects=False)
+
+                # Skip non-existent endpoints (404, or SPA returning same content for all paths)
+                if check_response.status_code == 404:
+                    continue
+                # Check if this is an SPA that returns same HTML for all routes
+                if check_response.status_code == 200 and "<!doctype html" in check_response.text.lower()[:500]:
+                    # SPA detected - this endpoint might just be serving the SPA shell
+                    # Only continue if the endpoint has actual redirect functionality
+                    if "redirect" not in endpoint.lower() or "location" not in str(check_response.headers).lower():
+                        continue
+            except Exception:
+                continue
+
             for param in self.VULNERABLE_PARAMS[:10]:
-                for payload in self.XSS_CRLF_PAYLOADS:
-                    await rate_limiter.acquire()
-                    
-                    try:
-                        url = urljoin(base_url, f"{endpoint}?{param}=test{payload.payload}")
-                        response = await client.get(url, follow_redirects=False)
-                        
-                        # Check if XSS payload appears in response body
-                        body_lower = response.text.lower()
-                        
-                        xss_patterns = [
-                            "<script>", "alert(", "onerror=", "onload=",
-                            "<svg", "<img", "<body", "javascript:",
-                            "+adw-script", "crlf-xss"
-                        ]
-                        
-                        for pattern in xss_patterns:
-                            if pattern in body_lower:
-                                findings.append(Finding(
-                                    name="XSS via HTTP Response Splitting",
-                                    severity="HIGH",
-                                    confidence="HIGH",
-                                    description=f"Cross-site scripting via CRLF response body injection: {payload.description}",
-                                    matched_at=url,
-                                    evidence=[
-                                        f"Payload: {payload.payload}",
-                                        f"XSS pattern found: {pattern}",
-                                        f"Parameter: {param}",
-                                    ],
-                                    cwe="CWE-79",
-                                    cvss_score=7.4,
-                                    remediation=(
-                                        "1. Strip CRLF characters from all input\n"
-                                        "2. Set Content-Type headers server-side\n"
-                                        "3. Implement Content-Security-Policy\n"
-                                        "4. Use X-Content-Type-Options: nosniff"
-                                    ),
-                                ))
-                                break
-                                
-                    except Exception as e:
-                        logger.debug(f"[CRLF] XSS test error: {e}")
-        
+                await rate_limiter.acquire()
+
+                try:
+                    # Use unique marker in payload to detect actual reflection
+                    test_payload = f"%0d%0a%0d%0a<script>alert('{unique_marker}')</script>"
+                    url = urljoin(base_url, f"{endpoint}?{param}=test{test_payload}")
+                    response = await client.get(url, follow_redirects=False)
+
+                    # Only report if our UNIQUE marker is reflected, not generic patterns
+                    # This prevents false positives from SPAs that have <script> in base HTML
+                    if unique_marker in response.text:
+                        findings.append(Finding(
+                            type="crlf_injection",
+                            name="XSS via HTTP Response Splitting",
+                            severity="HIGH",
+                            confidence="HIGH",
+                            description="Cross-site scripting via CRLF response body injection",
+                            matched_at=url,
+                            evidence=[
+                                f"Unique marker '{unique_marker}' reflected in response",
+                                f"Payload injected via CRLF in {param} parameter",
+                                f"Response body contains injected script",
+                            ],
+                            cwe="CWE-79",
+                            cvss_score=7.4,
+                            remediation=(
+                                "1. Strip CRLF characters from all input\n"
+                                "2. Set Content-Type headers server-side\n"
+                                "3. Implement Content-Security-Policy\n"
+                                "4. Use X-Content-Type-Options: nosniff"
+                            ),
+                        ))
+                        break
+
+                except Exception as e:
+                    logger.debug(f"[CRLF] XSS test error: {e}")
+
         return findings
     
     async def _test_cache_poisoning_crlf(
@@ -1396,6 +1446,7 @@ class CRLFScanner(ScanModule):
                     
                     if self._check_injection_success(response2, payload):
                         findings.append(Finding(
+                            type="cache_poisoning",
                             name="Cache Poisoning via CRLF",
                             severity="HIGH",
                             confidence="MEDIUM",
@@ -1454,7 +1505,8 @@ class CRLFScanner(ScanModule):
                 if response.status_code in [200, 400, 404]:
                     # Log injection is harder to detect - flag as potential
                     findings.append(Finding(
-                        name="Potential Log Injection via CRLF",
+                        type="crlf_injection",
+                            name="Potential Log Injection via CRLF",
                         severity="MEDIUM",
                         confidence="LOW",
                         description=f"Log forging may be possible: {payload.description}",
@@ -1531,7 +1583,8 @@ class CRLFScanner(ScanModule):
                     for indicator in success_indicators:
                         if indicator in response_lower:
                             findings.append(Finding(
-                                name="Potential Email Header Injection",
+                                type="crlf_injection",
+                            name="Potential Email Header Injection",
                                 severity="MEDIUM",
                                 confidence="LOW",
                                 description=f"Email header injection may be possible: {payload.description}",
@@ -1575,7 +1628,8 @@ class CRLFScanner(ScanModule):
                 
                 if self._check_injection_success(response, payload):
                     findings.append(Finding(
-                        name="CRLF Injection via WAF Bypass",
+                        type="crlf_injection",
+                            name="CRLF Injection via WAF Bypass",
                         severity="HIGH",
                         confidence="HIGH",
                         description=f"WAF bypass achieved using {payload.encoding} encoding: {payload.description}",
@@ -1619,7 +1673,8 @@ class CRLFScanner(ScanModule):
                 
                 if self._check_injection_success(response, payload):
                     findings.append(Finding(
-                        name="HTTP/2 CRLF Pseudo-Header Injection",
+                        type="crlf_injection",
+                            name="HTTP/2 CRLF Pseudo-Header Injection",
                         severity="HIGH",
                         confidence="MEDIUM",
                         description=f"HTTP/2 pseudo-header injection: {payload.description}",
@@ -1677,7 +1732,8 @@ class CRLFScanner(ScanModule):
                 # Check for CVE-specific success indicators
                 if self._check_injection_success_simple(response):
                     findings.append(Finding(
-                        name=f"Known CVE: {cve_id}",
+                        type="crlf_injection",
+                            name=f"Known CVE: {cve_id}",
                         severity="HIGH",
                         confidence="MEDIUM",
                         description=f"{cve_data['name']}: {cve_data['description']}",
@@ -1735,6 +1791,7 @@ class CRLFScanner(ScanModule):
                     
                     if self._check_injection_success(response, payload):
                         findings.append(Finding(
+                            type="crlf_injection",
                             name="CRLF Injection via POST Data",
                             severity="HIGH",
                             confidence="HIGH",
@@ -1781,7 +1838,8 @@ class CRLFScanner(ScanModule):
                 if "X-Injected" in response.headers or \
                    "x-injected" in str(response.headers).lower():
                     findings.append(Finding(
-                        name="CRLF Injection in URL Path",
+                        type="crlf_injection",
+                            name="CRLF Injection in URL Path",
                         severity="HIGH",
                         confidence="HIGH",
                         description=f"Path segment CRLF injection ({encoding}): {desc}",
@@ -1945,6 +2003,7 @@ class CRLFScanner(ScanModule):
         }
         
         return Finding(
+            type="crlf_injection",  # Ensure type is always set
             name=attack_names.get(vuln.attack_type, "CRLF Injection"),
             severity=vuln.severity,
             confidence="HIGH",

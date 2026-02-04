@@ -457,6 +457,17 @@ class PentestLogger:
         module: str | None = None,
     ) -> None:
         """Log discovered finding."""
+        # Convert confidence to float if it's a string
+        try:
+            if isinstance(confidence, str):
+                # Handle percentage strings like "90%"
+                confidence = float(confidence.rstrip('%'))
+                if confidence > 1:
+                    confidence = confidence / 100.0
+            confidence = float(confidence)
+        except (ValueError, TypeError):
+            confidence = 0.0
+
         # Normalize confidence: if > 1, it's already a percentage; if <= 1, convert to percentage
         confidence_pct = confidence if confidence > 1 else confidence * 100
         # Cap at 100%

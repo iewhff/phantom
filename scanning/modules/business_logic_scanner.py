@@ -2,6 +2,11 @@
 Business Logic Vulnerability Scanner - ENTERPRISE EDITION v2.0
 Tests for logic flaws that automated scanners typically miss.
 
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - Analysis without state changes
+- standard: Safe tests with non-existent resources only
+- aggressive: Full testing including state-changing operations
+
 Enterprise Features:
 - State Machine Analysis with transition validation
 - Multi-step Transaction Testing with context tracking
@@ -21,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import time
 import random
 import string
@@ -43,6 +49,11 @@ if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 
 
 # ============================================================================
@@ -180,14 +191,69 @@ FINANCIAL_TEST_CASES = [
 # ============================================================================
 
 RACE_CONDITION_SCENARIOS = [
-    {"name": "coupon_apply", "endpoints": ["coupon", "discount", "promo"], "method": "POST"},
-    {"name": "checkout_complete", "endpoints": ["checkout", "order"], "method": "POST"},
-    {"name": "balance_transfer", "endpoints": ["transfer", "send"], "method": "POST"},
-    {"name": "points_redeem", "endpoints": ["redeem", "points"], "method": "POST"},
-    {"name": "inventory_reserve", "endpoints": ["reserve", "cart"], "method": "POST"},
-    {"name": "vote_submit", "endpoints": ["vote", "poll"], "method": "POST"},
-    {"name": "like_action", "endpoints": ["like", "favorite"], "method": "POST"},
+    # =========================================================================
+    # HIGH-VALUE FINANCIAL RACE CONDITIONS ($5k-$50k bounties)
+    # =========================================================================
+
+    # Double-spend / Payment duplication
+    {"name": "coupon_apply", "endpoints": ["coupon", "discount", "promo", "voucher", "code"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Free products/services via double coupon use"},
+    {"name": "checkout_complete", "endpoints": ["checkout", "order", "purchase", "buy"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Double order creation, inventory depletion"},
+
+    # Balance manipulation (CRITICAL)
+    {"name": "balance_transfer", "endpoints": ["transfer", "send", "payment", "pay", "withdraw"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Double-spend, balance manipulation"},
+    {"name": "wallet_topup", "endpoints": ["topup", "deposit", "credit", "add-funds", "fund"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Credit balance without payment"},
+
+    # Points/Rewards abuse
+    {"name": "points_redeem", "endpoints": ["redeem", "points", "rewards", "claim", "cashback"],
+     "method": "POST", "severity": "HIGH", "impact": "Double-redeem loyalty points"},
+    {"name": "referral_claim", "endpoints": ["referral", "invite", "bonus", "signup-bonus"],
+     "method": "POST", "severity": "HIGH", "impact": "Multiple referral bonus claims"},
+
+    # Inventory manipulation
+    {"name": "inventory_reserve", "endpoints": ["reserve", "cart", "hold", "book", "lock"],
+     "method": "POST", "severity": "HIGH", "impact": "Inventory overselling, stock depletion"},
+    {"name": "limited_item_purchase", "endpoints": ["limited", "exclusive", "flash-sale", "deal"],
+     "method": "POST", "severity": "HIGH", "impact": "Bypass purchase limits"},
+
+    # Subscription/Credit abuse
+    {"name": "trial_activation", "endpoints": ["trial", "free-trial", "demo", "start-trial"],
+     "method": "POST", "severity": "MEDIUM", "impact": "Multiple trial activations"},
+    {"name": "subscription_upgrade", "endpoints": ["upgrade", "subscription", "plan"],
+     "method": "POST", "severity": "HIGH", "impact": "Free upgrades via race condition"},
+
+    # Limit bypass
+    {"name": "rate_limit_bypass", "endpoints": ["api", "request", "action"],
+     "method": "POST", "severity": "MEDIUM", "impact": "Bypass rate limiting controls"},
+    {"name": "quota_exceed", "endpoints": ["usage", "quota", "limit", "allocation"],
+     "method": "POST", "severity": "MEDIUM", "impact": "Exceed usage quotas"},
+
+    # Social/Gaming abuse
+    {"name": "vote_submit", "endpoints": ["vote", "poll", "rate", "review"],
+     "method": "POST", "severity": "LOW", "impact": "Vote manipulation"},
+    {"name": "like_action", "endpoints": ["like", "favorite", "follow", "upvote"],
+     "method": "POST", "severity": "LOW", "impact": "Engagement manipulation"},
+
+    # Withdrawal/Payout
+    {"name": "withdrawal_request", "endpoints": ["withdraw", "payout", "cashout", "cash-out"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Double withdrawal, fund theft"},
+    {"name": "refund_process", "endpoints": ["refund", "return", "chargeback", "reversal"],
+     "method": "POST", "severity": "CRITICAL", "impact": "Double refund, financial loss"},
 ]
+
+
+# Financial-specific race condition payloads for better detection
+FINANCIAL_RACE_PAYLOADS = {
+    "balance_transfer": {"amount": 100, "to_account": "attacker_account", "currency": "USD"},
+    "wallet_topup": {"amount": 50, "method": "test_card"},
+    "coupon_apply": {"code": "TESTCODE50", "apply": True},
+    "withdrawal_request": {"amount": 100, "method": "bank_transfer"},
+    "refund_process": {"order_id": "test_order", "reason": "test_refund"},
+    "points_redeem": {"points": 1000, "reward_id": "test_reward"},
+}
 
 
 @dataclass
@@ -977,6 +1043,11 @@ class BusinessLogicScanner(ScanModule):
             },
         ]
         
+        # ⚠️ SAFE MODE: Skip PUT tests in non-write modes
+        if not ALLOW_WRITES:
+            logger.info("⚠️ SAFE MODE: Skipping state transition tests that use PUT/POST")
+            return findings
+        
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             for test in invalid_transitions:
                 for endpoint in test["endpoints"][:3]:
@@ -1063,50 +1134,92 @@ class BusinessLogicScanner(ScanModule):
             target_endpoints = []
             for ep_type in scenario["endpoints"]:
                 target_endpoints.extend(endpoints.get(ep_type, []))
-            
+
             if not target_endpoints:
                 continue
-            
-            for endpoint in target_endpoints[:2]:
+
+            # Get scenario-specific payload if available
+            scenario_name = scenario["name"]
+            payload = FINANCIAL_RACE_PAYLOADS.get(
+                scenario_name,
+                {"action": scenario_name, "id": f"race_{int(time.time())}"}
+            )
+
+            # Use higher concurrency for financial endpoints
+            is_financial = scenario.get("severity") == "CRITICAL"
+            concurrency_levels = [10, 25, 50, 100] if is_financial else [5, 10, 20, 50]
+
+            for endpoint in target_endpoints[:3]:  # Test more endpoints for critical scenarios
                 result = await self._execute_race_test(
                     endpoint=endpoint,
                     method=scenario["method"],
-                    concurrency_levels=[5, 10, 20, 50],
-                    payload={"action": scenario["name"], "id": f"race_{int(time.time())}"},
+                    concurrency_levels=concurrency_levels,
+                    payload=payload,
                 )
-                
-                if result and result.vulnerability_confidence > 0.6:
+
+                if result and result.vulnerability_confidence > 0.5:  # Lower threshold for financial
+                    # Determine severity from scenario or result
+                    base_severity = scenario.get("severity", "HIGH")
+                    if result.duplicate_effects:
+                        severity = "CRITICAL"
+                    elif base_severity == "CRITICAL":
+                        severity = "CRITICAL" if result.vulnerability_confidence > 0.7 else "HIGH"
+                    else:
+                        severity = base_severity
+
+                    # Calculate CVSS based on impact
+                    impact = scenario.get("impact", "Unknown impact")
+                    if "financial" in impact.lower() or "theft" in impact.lower() or "double" in impact.lower():
+                        cvss = 9.8
+                    elif result.duplicate_effects:
+                        cvss = 9.1
+                    elif severity == "CRITICAL":
+                        cvss = 8.5
+                    else:
+                        cvss = 7.5
+
                     findings.append(Finding(
                         type="business_logic",
-                        name=f"Advanced Race Condition: {scenario['name']}",
-                        severity="CRITICAL" if result.duplicate_effects else "HIGH",
+                        name=f"Race Condition: {scenario_name.replace('_', ' ').title()}",
+                        severity=severity,
                         description=(
                             f"Race condition vulnerability detected with {result.vulnerability_confidence:.0%} confidence. "
-                            f"Endpoint allows duplicate actions under concurrent requests."
+                            f"Endpoint allows duplicate actions under concurrent requests. "
+                            f"Impact: {impact}"
                         ),
                         host=base_url,
                         matched_at=endpoint,
                         evidence=[
-                            f"Scenario: {scenario['name']}",
+                            f"Scenario: {scenario_name}",
                             f"Concurrent requests: {result.concurrent_requests}",
                             f"Successful duplicates: {result.successful_requests}",
                             f"Timing variance: {result.timing_variance_ms:.2f}ms",
-                            f"Duplicate effects: {result.duplicate_effects}",
+                            f"Duplicate effects detected: {result.duplicate_effects}",
                             f"Confidence: {result.vulnerability_confidence:.0%}",
+                            f"Potential impact: {impact}",
                         ],
-                        cvss_score=9.8 if result.duplicate_effects else 7.5,
+                        cvss_score=cvss,
                         cwe="CWE-362",
                         remediation=(
-                            "Implement distributed locks (Redis/DB locks). "
-                            "Use idempotency keys for all state-changing operations. "
-                            "Apply optimistic locking with version numbers. "
-                            "Use database transactions with proper isolation levels. "
-                            "Implement request deduplication with time windows."
+                            "CRITICAL: Implement distributed locks (Redis/DB locks) for financial operations. "
+                            "Use idempotency keys with unique request IDs. "
+                            "Apply optimistic locking with version numbers on all balance operations. "
+                            "Use database transactions with SERIALIZABLE isolation level. "
+                            "Implement request deduplication with time windows (30-60 seconds). "
+                            "Add mutex locks on user-specific resources during transactions."
                         ),
                         references=[
                             "https://portswigger.net/web-security/race-conditions",
                             "https://cheatsheetseries.owasp.org/cheatsheets/Race_Condition_Cheat_Sheet.html",
                         ],
+                        metadata={
+                            "race_condition_details": {
+                                "concurrency_tested": result.concurrent_requests,
+                                "timing_variance_ms": result.timing_variance_ms,
+                                "response_patterns": result.response_patterns,
+                                "financial_impact": is_financial,
+                            }
+                        },
                     ).to_dict())
         
         return findings

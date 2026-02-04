@@ -939,7 +939,102 @@ compliance:
     - "PCI DSS"
     - "NIST"
     - "CWE Top 25"
-    
+    - "GDPR"
+
   # Report mapping
   map_findings_to_standards: true
   include_compliance_gaps: true
+
+# =============================================================================
+# GDPR COMPLIANCE CONFIGURATION
+# =============================================================================
+# Data protection settings for GDPR compliance
+# Reference: Regulation (EU) 2016/679
+# =============================================================================
+gdpr:
+  # Master switch for GDPR compliance features
+  enabled: true
+
+  # Data Retention (Art. 5(1)(e) - Storage limitation)
+  retention:
+    # Scan data (findings, responses, requests)
+    scan_data_days: 30
+    # Log files
+    log_retention_days: 90
+    # Reports
+    report_retention_days: 365
+    # GDPR records (processing records, subject requests)
+    gdpr_records_days: 1095  # 3 years (legal requirement)
+
+  # Automatic Cleanup
+  cleanup:
+    enabled: true
+    run_on_startup: true
+    # Schedule: daily, weekly, monthly
+    schedule: "weekly"
+
+  # PII Protection (Art. 32 - Security of processing)
+  pii_protection:
+    # Anonymize PII in logs
+    anonymize_in_logs: true
+    # Anonymize PII in reports (set false to keep evidence)
+    anonymize_in_reports: false
+    # Redact sensitive fields (passwords, tokens, etc.)
+    redact_sensitive_fields: true
+    # PII types to detect and anonymize
+    detect_types:
+      - email
+      - phone
+      - credit_card
+      - ip_address
+      - jwt
+      - password_field
+      # Uncomment to enable more aggressive detection
+      # - name
+      # - address
+      # - ssn
+
+  # Data Minimization (Art. 5(1)(c))
+  data_minimization:
+    # Don't store full HTTP responses (only relevant excerpts)
+    store_full_responses: false
+    # Maximum evidence length to store
+    max_evidence_length: 1000
+    # Don't store request/response bodies for non-findings
+    store_non_findings: false
+
+  # Subject Rights (Art. 15, 17, 20)
+  subject_rights:
+    # Enable data subject request handling
+    enabled: true
+    # Require confirmation for erasure
+    erasure_requires_confirmation: true
+    # Log all subject requests
+    log_requests: true
+
+  # Processing Records (Art. 30)
+  processing_records:
+    # Record all processing activities
+    enabled: true
+    # Location for records
+    file: "data/gdpr/processing_records.jsonl"
+
+  # Paths
+  paths:
+    data_root: "data"
+    gdpr_records: "data/gdpr"
+    exports: "data/gdpr/exports"
+
+  # Legal Basis for Processing
+  legal_basis:
+    default: "Legitimate interest / Authorized security testing"
+    alternatives:
+      - "Contractual obligation"
+      - "Legal obligation"
+      - "Consent"
+
+  # Controller Information (customize for your organization)
+  controller:
+    name: "PHANTOM AI User"
+    contact: "security@example.com"
+    dpo_contact: ""  # Data Protection Officer (if applicable)

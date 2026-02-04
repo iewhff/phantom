@@ -6,12 +6,18 @@ Covers SecureDev checklist phases:
 - F2: Firestore Rules Testing
 - F3: Realtime Database Rules
 - F4: Firebase Storage Rules
+
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - NO writes, NO deletes
+- standard: Write test + immediate cleanup (test data only)
+- aggressive: Full testing
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -27,6 +33,11 @@ if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 
 
 class Severity(Enum):
@@ -49,6 +60,7 @@ class FirebaseFinding:
     remediation: str = ""
     resource: str = ""
     cwe: str = ""
+    confidence: float = 85.0  # Default confidence for Firebase findings
     
     def to_dict(self) -> dict:
         return {
@@ -60,6 +72,7 @@ class FirebaseFinding:
             "remediation": self.remediation,
             "resource": self.resource,
             "cwe": self.cwe,
+            "confidence": self.confidence,
         }
 
 
@@ -349,40 +362,55 @@ class FirebaseScanner:
                             cwe="CWE-284"
                         ))
                 
-                # Test 2: Try to create a document
-                test_doc = {
-                    "fields": {
-                        "test_field": {"stringValue": "security_test"},
-                        "timestamp": {"timestampValue": "2024-01-01T00:00:00Z"}
-                    }
-                }
-                
-                response = await client.post(
-                    f"{firestore_url}/{collection}",
-                    params={"key": self.config.api_key},
-                    json=test_doc
-                )
-                
-                if response.status_code in [200, 201]:
+                # Test 2: Try to create a document (ONLY in write-allowed modes)
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping write test for collection '{collection}'")
+                    # Still report that we COULD test writes (for manual verification)
                     self.result.findings.append(FirebaseFinding(
                         phase="F2",
-                        title=f"Collection '{collection}' allows public writes",
-                        severity=Severity.CRITICAL,
-                        description=f"Collection '{collection}' allows unauthenticated document creation. "
-                                   "Attackers can inject malicious data.",
-                        evidence=f"Document created with status {response.status_code}",
+                        title=f"Collection '{collection}' - Write test skipped (safe mode)",
+                        severity=Severity.INFO,
+                        description=f"Write test skipped due to safe mode. Manual verification recommended.",
+                        evidence="Safe mode active - no writes performed",
                         resource=collection,
-                        remediation="Add write rules: allow write: if request.auth != null;",
-                        cwe="CWE-284"
+                        remediation="Run with --safe-mode=standard to test write permissions",
+                        cwe="CWE-284",
+                        confidence=0.0,  # Mark as unverified
                     ))
+                else:
+                    test_doc = {
+                        "fields": {
+                            "test_field": {"stringValue": "security_test"},
+                            "timestamp": {"timestampValue": "2024-01-01T00:00:00Z"}
+                        }
+                    }
                     
-                    # Try to delete the test document
-                    doc_name = response.json().get("name", "")
-                    if doc_name:
-                        await client.delete(
-                            f"https://firestore.googleapis.com/v1/{doc_name}",
-                            params={"key": self.config.api_key}
-                        )
+                    response = await client.post(
+                        f"{firestore_url}/{collection}",
+                        params={"key": self.config.api_key},
+                        json=test_doc
+                    )
+                    
+                    if response.status_code in [200, 201]:
+                        self.result.findings.append(FirebaseFinding(
+                            phase="F2",
+                            title=f"Collection '{collection}' allows public writes",
+                            severity=Severity.CRITICAL,
+                            description=f"Collection '{collection}' allows unauthenticated document creation. "
+                                       "Attackers can inject malicious data.",
+                            evidence=f"Document created with status {response.status_code}",
+                            resource=collection,
+                            remediation="Add write rules: allow write: if request.auth != null;",
+                            cwe="CWE-284"
+                        ))
+                        
+                        # Try to delete the test document (cleanup)
+                        doc_name = response.json().get("name", "")
+                        if doc_name:
+                            await client.delete(
+                                f"https://firestore.googleapis.com/v1/{doc_name}",
+                                params={"key": self.config.api_key}
+                            )
                         
             except Exception as e:
                 logger.debug(f"Firestore test error for {collection}: {e}")
@@ -436,29 +464,32 @@ class FirebaseScanner:
                             cwe="CWE-284"
                         ))
                 
-                # Test 2: Write access
-                test_data = {"security_test": True, "timestamp": 1234567890}
-                response = await client.put(
-                    f"{rtdb_url}/security_test_node.json",
-                    json=test_data
-                )
-                
-                if response.status_code == 200:
-                    self.result.findings.append(FirebaseFinding(
-                        phase="F3",
-                        title="RTDB allows public writes",
-                        severity=Severity.CRITICAL,
-                        description="Realtime Database allows unauthenticated writes. "
-                                   "Attackers can modify or inject data.",
-                        evidence="Write to /security_test_node successful",
-                        resource="/",
-                        remediation="Set write rules: {\".write\": \"auth != null\"}",
-                        cwe="CWE-284"
-                    ))
+                # Test 2: Write access (ONLY in write-allowed modes)
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping RTDB write test")
+                else:
+                    test_data = {"security_test": True, "timestamp": 1234567890}
+                    response = await client.put(
+                        f"{rtdb_url}/security_test_node.json",
+                        json=test_data
+                    )
                     
-                    # Clean up
-                    await client.delete(f"{rtdb_url}/security_test_node.json")
-                    break  # Found vulnerability, no need to test more paths
+                    if response.status_code == 200:
+                        self.result.findings.append(FirebaseFinding(
+                            phase="F3",
+                            title="RTDB allows public writes",
+                            severity=Severity.CRITICAL,
+                            description="Realtime Database allows unauthenticated writes. "
+                                       "Attackers can modify or inject data.",
+                            evidence="Write to /security_test_node successful",
+                            resource="/",
+                            remediation="Set write rules: {\".write\": \"auth != null\"}",
+                            cwe="CWE-284"
+                        ))
+                        
+                        # Clean up
+                        await client.delete(f"{rtdb_url}/security_test_node.json")
+                        break  # Found vulnerability, no need to test more paths
                     
             except Exception as e:
                 logger.debug(f"RTDB test error for path '{path}': {e}")
@@ -501,32 +532,35 @@ class FirebaseScanner:
                         cwe="CWE-548"
                     ))
             
-            # Test 2: Try to upload a file
-            test_content = b"security test file content"
-            upload_url = f"{storage_url}/security_test.txt"
-            
-            response = await client.post(
-                upload_url,
-                params={"uploadType": "media"},
-                headers={"Content-Type": "text/plain"},
-                content=test_content
-            )
-            
-            if response.status_code in [200, 201]:
-                self.result.findings.append(FirebaseFinding(
-                    phase="F4",
-                    title="Storage allows unauthenticated uploads",
-                    severity=Severity.HIGH,
-                    description="Firebase Storage accepts file uploads without authentication. "
-                               "This may allow malicious file injection.",
-                    evidence="File upload successful",
-                    resource=self.config.storage_bucket,
-                    remediation="Set storage rules: allow write: if request.auth != null;",
-                    cwe="CWE-434"
-                ))
+            # Test 2: Try to upload a file - ONLY in write-allowed modes
+            if not ALLOW_WRITES:
+                logger.debug(f"⚠️ SAFE MODE: Skipping Storage upload test")
+            else:
+                test_content = b"security test file content"
+                upload_url = f"{storage_url}/security_test.txt"
                 
-                # Try to delete
-                await client.delete(upload_url)
+                response = await client.post(
+                    upload_url,
+                    params={"uploadType": "media"},
+                    headers={"Content-Type": "text/plain"},
+                    content=test_content
+                )
+                
+                if response.status_code in [200, 201]:
+                    self.result.findings.append(FirebaseFinding(
+                        phase="F4",
+                        title="Storage allows unauthenticated uploads",
+                        severity=Severity.HIGH,
+                        description="Firebase Storage accepts file uploads without authentication. "
+                                   "This may allow malicious file injection.",
+                        evidence="File upload successful",
+                        resource=self.config.storage_bucket,
+                        remediation="Set storage rules: allow write: if request.auth != null;",
+                        cwe="CWE-434"
+                    ))
+                    
+                    # Try to delete (cleanup)
+                    await client.delete(upload_url)
             
             # Test 3: Check common file paths
             common_paths = ["uploads/", "images/", "documents/", "backups/"]

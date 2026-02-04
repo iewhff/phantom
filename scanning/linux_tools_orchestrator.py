@@ -650,6 +650,7 @@ class LinuxToolsOrchestrator:
                         "type": "open_port",
                         "name": f"Open Port: {port_id}/{protocol} ({service_name})",
                         "severity": self._get_port_severity(int(port_id), service_name),
+                        "confidence": 95,
                         "matched_at": f"{host_addr}:{port_id}",
                         "description": f"Open {protocol} port {port_id} running {service_name}",
                         "metadata": {
@@ -677,6 +678,7 @@ class LinuxToolsOrchestrator:
                                 "type": "nmap_script_vuln",
                                 "name": f"Nmap Script: {script_id}",
                                 "severity": "HIGH" if "cve" in script_output.lower() else "MEDIUM",
+                                "confidence": 85,
                                 "matched_at": f"{host_addr}:{port_id}",
                                 "description": script_output[:500],
                                 "metadata": {
@@ -726,6 +728,7 @@ class LinuxToolsOrchestrator:
                             "type": "nuclei_finding",
                             "name": result.get("info", {}).get("name", template_id),
                             "severity": mapped_severity,
+                            "confidence": 90,
                             "matched_at": matched_at,
                             "description": result.get("info", {}).get("description", ""),
                             "metadata": {
@@ -800,6 +803,7 @@ class LinuxToolsOrchestrator:
                         "type": "nikto_finding",
                         "name": f"Nikto: {description[:80]}",
                         "severity": severity,
+                        "confidence": 80,
                         "matched_at": url,
                         "description": description,
                         "metadata": {
@@ -833,6 +837,7 @@ class LinuxToolsOrchestrator:
                             "type": "nikto_finding",
                             "name": f"Nikto: {line[2:60]}...",
                             "severity": "MEDIUM",
+                            "confidence": 75,
                             "matched_at": target,
                             "description": line[2:].strip(),
                             "metadata": {"tool": "nikto"},
@@ -887,6 +892,7 @@ class LinuxToolsOrchestrator:
                             "type": "directory_found",
                             "name": f"Directory: {path}",
                             "severity": severity,
+                            "confidence": 85,
                             "matched_at": f"{target.rstrip('/')}{path}",
                             "description": f"Directory/file found with status {status}",
                             "metadata": {
@@ -935,6 +941,7 @@ class LinuxToolsOrchestrator:
                     "type": "ffuf_finding",
                     "name": f"Found: /{input_val}",
                     "severity": severity,
+                    "confidence": 80,
                     "matched_at": url,
                     "metadata": {
                         "status_code": status,
@@ -972,6 +979,7 @@ class LinuxToolsOrchestrator:
                         "type": "parameter_discovery",
                         "name": f"Parameters found: {', '.join(params[:5])}",
                         "severity": "INFO",
+                        "confidence": 75,
                         "matched_at": url,
                         "description": f"Discovered {len(params)} parameters",
                         "metadata": {
@@ -1015,6 +1023,7 @@ class LinuxToolsOrchestrator:
                             "type": "sql_injection",
                             "name": "SQLmap: SQL Injection Confirmed",
                             "severity": "CRITICAL",
+                            "confidence": 95,
                             "matched_at": target,
                             "description": "SQLmap confirmed SQL injection vulnerability",
                             "metadata": {
@@ -1060,6 +1069,7 @@ class LinuxToolsOrchestrator:
                         "type": "wfuzz_finding",
                         "name": f"Found: {payload}",
                         "severity": "LOW",
+                        "confidence": 75,
                         "matched_at": url,
                         "metadata": {
                             "status_code": code,
@@ -1100,6 +1110,7 @@ class LinuxToolsOrchestrator:
                         "type": "technology_detected",
                         "name": f"Technology: {plugin_name}",
                         "severity": "INFO",
+                        "confidence": 85,
                         "matched_at": target,
                         "metadata": {
                             "technology": plugin_name,
@@ -1142,6 +1153,7 @@ class LinuxToolsOrchestrator:
                             "type": "weak_ssl_cipher",
                             "name": f"Weak SSL Cipher: {cipher_name}",
                             "severity": "MEDIUM",
+                            "confidence": 90,
                             "matched_at": target,
                             "metadata": {
                                 "cipher": cipher_name,
@@ -1159,6 +1171,7 @@ class LinuxToolsOrchestrator:
                             "type": "deprecated_ssl",
                             "name": f"Deprecated Protocol: {version}",
                             "severity": "MEDIUM",
+                            "confidence": 90,
                             "matched_at": target,
                             "metadata": {
                                 "protocol": version,
@@ -1195,6 +1208,7 @@ class LinuxToolsOrchestrator:
                         "type": "ssl_vulnerability",
                         "name": finding.get("id", "SSL Issue"),
                         "severity": severity,
+                        "confidence": 85,
                         "matched_at": target,
                         "description": finding.get("finding", ""),
                         "metadata": {
@@ -1237,6 +1251,7 @@ class LinuxToolsOrchestrator:
                         "type": "http_probe",
                         "name": f"HTTP Probe: {url}",
                         "severity": "INFO",
+                        "confidence": 70,
                         "matched_at": url,
                         "metadata": {
                             "status_code": status_code,
@@ -1291,6 +1306,7 @@ class LinuxToolsOrchestrator:
                             "type": "open_port",
                             "name": f"Open Port: {port}/{proto}",
                             "severity": severity,
+                            "confidence": 95,
                             "matched_at": f"{ip}:{port}",
                             "metadata": {
                                 "ip": ip,
@@ -1362,6 +1378,7 @@ class LinuxToolsOrchestrator:
                     "type": "exploit_available",
                     "name": f"Public Exploit: {title[:80]}",
                     "severity": severity,
+                    "confidence": 90,
                     "matched_at": target,
                     "description": (
                         f"A public exploit (EDB-ID: {exploit_id}) exists for this vulnerability. "
@@ -1395,6 +1412,7 @@ class LinuxToolsOrchestrator:
                                     "type": "exploit_available",
                                     "name": f"Public Exploit Found",
                                     "severity": "HIGH",
+                                    "confidence": 85,
                                     "matched_at": target,
                                     "description": line.strip(),
                                     "metadata": {"tool": "exploit_verifier", "source": "ExploitDB"},
@@ -1428,6 +1446,7 @@ class LinuxToolsOrchestrator:
                     "type": f"{config.name}_output",
                     "name": f"{config.name.capitalize()} Output",
                     "severity": "INFO",
+                    "confidence": 50,
                     "matched_at": target,
                     "description": f"Raw output from {config.name}",
                     "metadata": {
@@ -1632,9 +1651,16 @@ class LinuxToolsOrchestrator:
 
     def cleanup(self) -> None:
         """Clean up temporary files."""
-        import shutil
         try:
+            import shutil
+            import sys
+            # Don't cleanup during Python shutdown
+            if sys.meta_path is None:
+                return
             shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except (ImportError, AttributeError, TypeError):
+            # Python is shutting down, skip cleanup
+            pass
         except Exception:
             pass
 
@@ -1652,4 +1678,11 @@ class LinuxToolsOrchestrator:
 
     def __del__(self):
         """Cleanup on deletion."""
-        self.cleanup()
+        try:
+            import sys
+            # Skip cleanup during Python shutdown to avoid ImportError
+            if sys.meta_path is not None:
+                self.cleanup()
+        except (ImportError, AttributeError, TypeError):
+            # Python is shutting down
+            pass

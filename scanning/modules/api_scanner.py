@@ -38,6 +38,7 @@ import io
 import json
 import re
 import struct
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
@@ -427,6 +428,7 @@ class APIScanner(ScanModule):
                                         "payload": payload,
                                         "discovered_by": "arjun",
                                     },
+                                    "confidence": 90,
                                 })
                                 break  # Found, move to next param
 
@@ -452,6 +454,7 @@ class APIScanner(ScanModule):
                                         "payload": payload,
                                         "discovered_by": "arjun",
                                     },
+                                    "confidence": 85,
                                 })
                                 break
 
@@ -724,6 +727,7 @@ class APIScanner(ScanModule):
                                 references=[
                                     "https://owasp.org/API-Security/editions/2023/en/0xa9-improper-inventory-management/"
                                 ],
+                                confidence=85 if severity == "MEDIUM" else 90,
                             ).to_dict())
                             break
                             
@@ -737,17 +741,28 @@ class APIScanner(ScanModule):
         base_url: str,
         rate_limiter: RateLimiter,
     ) -> list[dict[str, Any]]:
-        """Check GraphQL endpoints for vulnerabilities."""
+        """
+        Check GraphQL endpoints for vulnerabilities.
+
+        Enhanced with HIGH-VALUE DoS attacks:
+        - Alias abuse (100x query multiplication)
+        - Batch query attacks
+        - Fragment bombing
+        - Query complexity exploitation
+        - Circular query detection
+        """
         findings = []
-        
-        graphql_paths = ["/graphql", "/graphiql", "/api/graphql", "/v1/graphql"]
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+
+        graphql_paths = ["/graphql", "/graphiql", "/api/graphql", "/v1/graphql",
+                        "/query", "/api/query", "/v2/graphql"]
+
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
             for path in graphql_paths:
                 await rate_limiter.acquire()
-                
+
                 url = urljoin(base_url, path)
-                
+                found_graphql = False
+
                 try:
                     # Test introspection
                     response = await client.post(
@@ -755,16 +770,17 @@ class APIScanner(ScanModule):
                         json={"query": self.GRAPHQL_INTROSPECTION},
                         headers={"Content-Type": "application/json"},
                     )
-                    
+
                     if response.status_code == 200:
                         try:
                             data = response.json()
-                            
+
                             if "data" in data and "__schema" in data.get("data", {}):
+                                found_graphql = True
                                 # Introspection enabled
                                 schema = data["data"]["__schema"]
                                 types_count = len(schema.get("types", []))
-                                
+
                                 findings.append(Finding(
                                     type="api",
                                     name="GraphQL Introspection Enabled",
@@ -784,26 +800,35 @@ class APIScanner(ScanModule):
                                     references=[
                                         "https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html"
                                     ],
+                                    confidence=85,
                                 ).to_dict())
-                                
+
                                 # Check for dangerous mutations
                                 mutation_findings = self._analyze_graphql_schema(
                                     schema, url, base_url
                                 )
                                 findings.extend(mutation_findings)
-                                
+
                         except json.JSONDecodeError:
                             pass
-                    
-                    # Test for query complexity attacks
+
+                    # ================================================================
+                    # HIGH VALUE: GraphQL DoS Attack Testing
+                    # These can cause significant server load and are bounty-worthy
+                    # ================================================================
+
+                    # Test 1: Query Depth Attack
+                    await rate_limiter.acquire()
                     depth_query = self._generate_deep_query()
                     depth_response = await client.post(
                         url,
                         json={"query": depth_query},
                         headers={"Content-Type": "application/json"},
+                        timeout=10.0,  # Short timeout to detect if server struggles
                     )
-                    
+
                     if depth_response.status_code == 200:
+                        found_graphql = True
                         findings.append(Finding(
                             type="api",
                             name="GraphQL Missing Depth Limiting",
@@ -817,12 +842,180 @@ class APIScanner(ScanModule):
                             cwe="CWE-400",
                             remediation="Implement query depth limiting. Set maximum query complexity. "
                                        "Use query cost analysis.",
+                            confidence=85,
                         ).to_dict())
-                        
+
+                    # Test 2: Alias Abuse Attack (Query Multiplication)
+                    # This is a HIGH-VALUE DoS vector - $2k-$5k bounties
+                    await rate_limiter.acquire()
+                    alias_query = self._generate_alias_attack_query(50)  # 50 aliases
+                    try:
+                        start_time = time.time()
+                        alias_response = await client.post(
+                            url,
+                            json={"query": alias_query},
+                            headers={"Content-Type": "application/json"},
+                            timeout=15.0,
+                        )
+                        response_time = time.time() - start_time
+
+                        if alias_response.status_code == 200:
+                            found_graphql = True
+                            # Check if response time indicates server strain
+                            severity = "HIGH" if response_time > 3.0 else "MEDIUM"
+
+                            findings.append(Finding(
+                                type="api",
+                                name="GraphQL Alias Abuse - Query Multiplication DoS",
+                                severity=severity,
+                                description=f"GraphQL endpoint accepts queries with many aliases, "
+                                           f"allowing attackers to multiply query execution. "
+                                           f"Response time: {response_time:.2f}s for 50 aliases. "
+                                           f"An attacker could use 1000+ aliases to cause severe DoS.",
+                                host=base_url,
+                                matched_at=url,
+                                evidence=[
+                                    "50 alias query accepted",
+                                    f"Response time: {response_time:.2f}s",
+                                    "Query multiplication attack possible",
+                                ],
+                                cvss_score=7.5 if severity == "HIGH" else 5.3,
+                                cwe="CWE-400",
+                                remediation="Implement alias limiting (max 10-20 per query). "
+                                           "Add query cost analysis that counts aliases. "
+                                           "Set per-query time limits.",
+                                confidence=90,
+                            ).to_dict())
+                    except httpx.TimeoutException:
+                        # Timeout indicates DoS potential!
+                        findings.append(Finding(
+                            type="api",
+                            name="GraphQL Alias Abuse DoS - Server Timeout",
+                            severity="HIGH",
+                            description="GraphQL server timed out processing alias abuse query. "
+                                       "This confirms DoS vulnerability via query multiplication.",
+                            host=base_url,
+                            matched_at=url,
+                            evidence=["Server timed out on 50-alias query"],
+                            cvss_score=7.5,
+                            cwe="CWE-400",
+                            remediation="Implement query cost analysis and alias limiting.",
+                            confidence=95,
+                        ).to_dict())
+
+                    # Test 3: Batch Query Attack
+                    # Send multiple operations in single request
+                    await rate_limiter.acquire()
+                    batch_query = self._generate_batch_query(20)  # 20 queries
+                    try:
+                        start_time = time.time()
+                        batch_response = await client.post(
+                            url,
+                            json=batch_query,  # Array of queries
+                            headers={"Content-Type": "application/json"},
+                            timeout=15.0,
+                        )
+                        response_time = time.time() - start_time
+
+                        if batch_response.status_code == 200:
+                            try:
+                                batch_data = batch_response.json()
+                                # If response is array, batching is supported
+                                if isinstance(batch_data, list) and len(batch_data) > 1:
+                                    findings.append(Finding(
+                                        type="api",
+                                        name="GraphQL Batch Query Attack",
+                                        severity="MEDIUM",
+                                        description=f"GraphQL endpoint accepts batch queries, "
+                                                   f"allowing multiple operations per request. "
+                                                   f"Attacker can bypass rate limiting and cause DoS. "
+                                                   f"Executed {len(batch_data)} queries in {response_time:.2f}s.",
+                                        host=base_url,
+                                        matched_at=url,
+                                        evidence=[
+                                            f"Batch of {len(batch_data)} queries accepted",
+                                            f"Response time: {response_time:.2f}s",
+                                        ],
+                                        cvss_score=5.3,
+                                        cwe="CWE-400",
+                                        remediation="Limit batch query count (max 5-10). "
+                                                   "Apply rate limiting per operation, not per request.",
+                                        confidence=90,
+                                    ).to_dict())
+                            except:
+                                pass
+                    except Exception as e:
+                        logger.debug(f"Batch query test error: {e}")
+
+                    # Test 4: Field Duplication Attack
+                    await rate_limiter.acquire()
+                    field_dup_query = self._generate_field_duplication_query(100)
+                    try:
+                        start_time = time.time()
+                        dup_response = await client.post(
+                            url,
+                            json={"query": field_dup_query},
+                            headers={"Content-Type": "application/json"},
+                            timeout=10.0,
+                        )
+                        response_time = time.time() - start_time
+
+                        if dup_response.status_code == 200 and response_time > 2.0:
+                            findings.append(Finding(
+                                type="api",
+                                name="GraphQL Field Duplication DoS",
+                                severity="MEDIUM",
+                                description=f"GraphQL accepts queries with duplicated fields. "
+                                           f"Response time: {response_time:.2f}s indicates processing overhead.",
+                                host=base_url,
+                                matched_at=url,
+                                evidence=[
+                                    "100 duplicate fields accepted",
+                                    f"Response time: {response_time:.2f}s",
+                                ],
+                                cvss_score=5.3,
+                                cwe="CWE-400",
+                                remediation="Deduplicate fields in query validation. "
+                                           "Implement query complexity limits.",
+                                confidence=85,
+                            ).to_dict())
+                    except:
+                        pass
+
                 except Exception as e:
                     logger.debug(f"GraphQL check failed for {url}: {e}")
-        
+
         return findings
+
+    def _generate_alias_attack_query(self, count: int = 50) -> str:
+        """
+        Generate GraphQL query with many aliases for DoS testing.
+
+        Each alias executes the same query, multiplying server load.
+        Example: {a0: __typename, a1: __typename, ..., a49: __typename}
+        """
+        aliases = [f"a{i}: __typename" for i in range(count)]
+        return "query { " + " ".join(aliases) + " }"
+
+    def _generate_batch_query(self, count: int = 20) -> list[dict]:
+        """
+        Generate batch GraphQL query (array of operations).
+
+        Tests if server accepts multiple operations per request.
+        """
+        return [
+            {"query": "query { __typename }", "operationName": None}
+            for _ in range(count)
+        ]
+
+    def _generate_field_duplication_query(self, count: int = 100) -> str:
+        """
+        Generate query with many duplicate fields.
+
+        Tests if server processes each duplicate separately.
+        """
+        fields = " ".join(["__typename"] * count)
+        return f"query {{ {fields} }}"
     
     def _analyze_graphql_schema(
         self,
@@ -856,6 +1049,7 @@ class APIScanner(ScanModule):
                         cvss_score=3.7,
                         cwe="CWE-200",
                         remediation="Review exposed types and restrict access to sensitive operations.",
+                        confidence=80,
                     ).to_dict())
                     break
         
@@ -1073,6 +1267,7 @@ class APIScanner(ScanModule):
                                     "data_type": data_type,
                                     "response_lengths": lengths,
                                 },
+                                confidence=90,
                             ).to_dict())
 
                             # Found IDOR on this endpoint, no need to test more IDs
@@ -1127,6 +1322,7 @@ class APIScanner(ScanModule):
                                         references=[
                                             "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
                                         ],
+                                        confidence=85,
                                     ).to_dict())
                             except json.JSONDecodeError:
                                 pass
@@ -1210,6 +1406,7 @@ class APIScanner(ScanModule):
                         references=[
                             "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
                         ],
+                        confidence=85,
                     ).to_dict())
                     
         except Exception as e:
@@ -1294,6 +1491,7 @@ class APIScanner(ScanModule):
                                 references=[
                                     "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
                                 ],
+                                confidence=85,
                             ).to_dict())
                             break
 
@@ -1351,6 +1549,7 @@ class APIScanner(ScanModule):
                             remediation="Remove API keys from client-side code. "
                                        "Use environment variables and server-side proxies. "
                                        "Rotate exposed keys immediately.",
+                            confidence=90,
                         ).to_dict())
                         
         except Exception as e:
@@ -1380,6 +1579,7 @@ class APIScanner(ScanModule):
                                 cvss_score=7.5,
                                 cwe="CWE-312",
                                 remediation="Remove API keys from JavaScript files.",
+                                confidence=90,
                             ).to_dict())
                             break
                             
@@ -1549,6 +1749,7 @@ class APIScanner(ScanModule):
                                            "Strip/sanitize filenames. "
                                            "Store files outside web root. "
                                            "Use random filenames.",
+                                confidence=95,
                             ).to_dict())
                             break  # Found vulnerability, stop testing
                             
@@ -1600,6 +1801,7 @@ class APIScanner(ScanModule):
                                 remediation="Validate Content-Type server-side. "
                                            "Check file magic bytes. "
                                            "Don't trust client headers.",
+                                confidence=90,
                             ).to_dict())
                             break
                             
@@ -1652,6 +1854,7 @@ class APIScanner(ScanModule):
                                 cwe="CWE-434",
                                 remediation="Validate both magic bytes AND extension. "
                                            "Use file type libraries for proper detection.",
+                                confidence=90,
                             ).to_dict())
                             break
                             
@@ -1708,6 +1911,7 @@ class APIScanner(ScanModule):
                             remediation="Re-encode uploaded images. "
                                        "Strip metadata and comments. "
                                        "Use image libraries to validate and rewrite files.",
+                            confidence=90,
                         ).to_dict())
                         break
                         
@@ -1753,6 +1957,7 @@ class APIScanner(ScanModule):
                             remediation="Sanitize SVG files to remove script tags and event handlers. "
                                        "Serve SVG with Content-Type: image/svg+xml and CSP headers. "
                                        "Consider converting SVG to raster images.",
+                            confidence=85,
                         ).to_dict())
                         break
                         
@@ -1810,6 +2015,7 @@ class APIScanner(ScanModule):
                                 remediation="Sanitize filenames - remove path separators. "
                                            "Use basename only. "
                                            "Generate random filenames server-side.",
+                                confidence=95,
                             ).to_dict())
                             break
                             
@@ -1887,6 +2093,7 @@ class APIScanner(ScanModule):
                                             remediation="Whitelist allowed URLs/domains. "
                                                        "Block internal IP ranges. "
                                                        "Use URL parsers to validate.",
+                                            confidence=95,
                                         ).to_dict())
                                         return findings  # Critical found
                                         
@@ -1962,6 +2169,7 @@ class APIScanner(ScanModule):
                                     remediation="Disable external entity processing. "
                                                "Use safe XML parsers. "
                                                "Validate and sanitize XML input.",
+                                    confidence=95,
                                 ).to_dict())
                                 return findings  # Critical found
                                 

@@ -1488,8 +1488,12 @@ class SQLiScanner(ScanModule):
                                 "type": "sql_injection",
                                 "severity": "critical",
                                 "title": f"SQL Injection in JSON API - {field_name}",
+                                "name": f"SQL Injection in JSON API - {field_name}",
                                 "description": f"SQL injection vulnerability found in JSON field '{field_name}' at {url}",
                                 "evidence": evidence,
+                                "confidence": 95,  # High confidence for confirmed SQLi
+                                "url": url,
+                                "method": "POST",
                                 "metadata": {
                                     "url": url,
                                     "parameter": field_name,

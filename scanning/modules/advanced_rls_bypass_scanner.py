@@ -41,6 +41,7 @@ class RLSBypassFinding:
     evidence: str = ""
     remediation: str = ""
     cwe: str = "CWE-863"
+    confidence: float = 90.0  # Default confidence for RLS bypass findings
     
     def to_dict(self) -> dict:
         return {
@@ -54,6 +55,7 @@ class RLSBypassFinding:
             "evidence": self.evidence[:500] if self.evidence else "",
             "remediation": self.remediation,
             "cwe": self.cwe,
+            "confidence": self.confidence,
         }
 
 

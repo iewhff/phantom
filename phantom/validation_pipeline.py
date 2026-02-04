@@ -38,6 +38,82 @@ logger = logging.getLogger("phantom.validation_pipeline")
 
 
 # =============================================================================
+# STATIC ASSET FILTERING - Early rejection of false positives
+# =============================================================================
+
+# File extensions that are static assets (cannot have dynamic vulnerabilities)
+STATIC_ASSET_EXTENSIONS = {
+    # Images
+    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp', '.tiff', '.avif',
+    # Stylesheets
+    '.css', '.scss', '.sass', '.less',
+    # Client-side scripts (not server-side injectable)
+    '.js', '.mjs', '.ts', '.jsx', '.tsx',
+    # Fonts
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    # Documents
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    # Media
+    '.mp3', '.mp4', '.wav', '.ogg', '.webm', '.avi', '.mov', '.flv',
+    # Archives
+    '.zip', '.tar', '.gz', '.rar', '.7z',
+    # Data files
+    '.xml', '.json', '.yaml', '.yml', '.csv',
+    # Source maps
+    '.map',
+}
+
+# URL patterns indicating static assets
+STATIC_ASSET_PATH_PATTERNS = [
+    r'/static/', r'/assets/', r'/images/', r'/img/', r'/css/', r'/js/',
+    r'/fonts/', r'/media/', r'/dist/', r'/build/', r'/vendor/',
+    r'/node_modules/', r'/public/', r'/_next/static/', r'/__webpack/',
+]
+
+
+def is_static_asset_url(url: str) -> bool:
+    """
+    Check if a URL points to a static asset.
+
+    Static assets cannot have server-side vulnerabilities like SSTI, SQLi, etc.
+    This function helps filter out false positives early in the pipeline.
+
+    Args:
+        url: The URL to check
+
+    Returns:
+        True if the URL is a static asset (finding should be rejected)
+    """
+    if not url:
+        return False
+
+    url_lower = url.lower()
+
+    # Check file extension
+    for ext in STATIC_ASSET_EXTENSIONS:
+        if url_lower.endswith(ext):
+            return True
+        # Check with query string
+        if f"{ext}?" in url_lower or f"{ext}#" in url_lower:
+            return True
+
+    # Check path patterns
+    for pattern in STATIC_ASSET_PATH_PATTERNS:
+        if re.search(pattern, url_lower, re.IGNORECASE):
+            return True
+
+    return False
+
+
+# Vulnerability types that cannot exist on static assets
+VULN_TYPES_IMPOSSIBLE_ON_STATIC = {
+    'ssti', 'sqli', 'nosql', 'cmdi', 'lfi', 'ssrf', 'xxe',
+    'idor', 'authentication', 'authorization', 'csrf', 'rce',
+    'deserialization', 'template_injection', 'code_injection',
+}
+
+
+# =============================================================================
 # ENUMS AND CONSTANTS
 # =============================================================================
 
@@ -70,6 +146,7 @@ class FindingConfidence(Enum):
 
 class VulnerabilityType(Enum):
     """Types of vulnerabilities for validation."""
+    # Injection vulnerabilities
     SQLI = "sqli"
     XSS = "xss"
     CMDI = "cmdi"
@@ -79,13 +156,40 @@ class VulnerabilityType(Enum):
     SSTI = "ssti"
     NOSQL = "nosql"
     CRLF = "crlf"
+    CRLF_INJECTION = "crlf_injection"  # Alternative name
+
+    # Access control
     IDOR = "idor"
     OPEN_REDIRECT = "open_redirect"
     CSRF = "csrf"
+    CORS = "cors"
+
+    # Authentication/Authorization
     JWT = "jwt"
-    INFORMATION_DISCLOSURE = "info_disclosure"
     AUTHENTICATION = "authentication"
     AUTHORIZATION = "authorization"
+
+    # API Security
+    API = "api"
+    API_SECURITY = "api_security"
+    GRAPHQL = "graphql"
+
+    # File/Directory exposure
+    DIRECTORY = "directory"
+    SENSITIVE_FILE = "sensitive_file"
+    PATH_TRAVERSAL = "path_traversal"
+
+    # Code execution
+    RCE = "rce"
+    DESERIALIZATION = "deserialization"
+
+    # Information disclosure
+    INFORMATION_DISCLOSURE = "info_disclosure"
+    INFO_DISCLOSURE = "info_disclosure"  # Alias
+
+    # Other
+    MISCONFIGURATION = "misconfiguration"
+    RATE_LIMIT = "rate_limit"
     OTHER = "other"
 
 
@@ -138,9 +242,9 @@ class RawFinding:
         """Generate unique fingerprint for deduplication."""
         components = [
             self.vulnerability_type.value,
-            self.url,
+            self.url or "",
             self.parameter or "",
-            self.method,
+            self.method or "GET",
             self.payload or "",
         ]
         content = "|".join(components)
@@ -952,7 +1056,33 @@ class ValidationPipeline:
         """
         start_time = time.time()
         stage_results: List[StageResult] = []
-        confidence = finding.confidence
+
+        # Normalize confidence to float (handle string values like "90%" or "0.9")
+        raw_confidence = finding.confidence
+        try:
+            if isinstance(raw_confidence, str):
+                raw_confidence = float(raw_confidence.rstrip('%'))
+                if raw_confidence > 1:
+                    raw_confidence = raw_confidence / 100.0
+            confidence = float(raw_confidence)
+        except (ValueError, TypeError):
+            confidence = 0.0
+
+        # Clamp to valid range
+        confidence = max(0.0, min(1.0, confidence))
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STAGE 0: STATIC ASSET FILTER (Early rejection for false positives)
+        # Static assets (.jpg, .css, .js, etc.) cannot have server-side vulns
+        # ═══════════════════════════════════════════════════════════════════
+        vuln_type_str = finding.vulnerability_type.value if hasattr(finding.vulnerability_type, 'value') else str(finding.vulnerability_type)
+
+        if is_static_asset_url(finding.url) and vuln_type_str.lower() in VULN_TYPES_IMPOSSIBLE_ON_STATIC:
+            logger.debug(f"Rejecting finding on static asset: {finding.url} (type: {vuln_type_str})")
+            return self._create_result(
+                finding, False, 0.0, stage_results, start_time,
+                f"False positive: Static asset cannot have {vuln_type_str} vulnerability"
+            )
 
         # Ensure HTTP client is available
         if self._http_client is None:

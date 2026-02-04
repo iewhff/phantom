@@ -4,6 +4,11 @@ Cloud Security Scanner - Enterprise Edition v2.0
 Comprehensive cloud infrastructure security assessment and misconfiguration detection.
 Industry-leading coverage for AWS, Azure, GCP, and other cloud providers.
 
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - Only checks for exposed data/configs
+- standard: Read + safe write tests to controlled paths
+- aggressive: Full testing including writes
+
 Features:
 - 100+ cloud misconfiguration patterns
 - Multi-cloud support (AWS, Azure, GCP, DigitalOcean, Oracle, Alibaba)
@@ -32,6 +37,7 @@ Based on:
 
 from __future__ import annotations
 
+import os
 import re
 import json
 from dataclasses import dataclass, field
@@ -47,6 +53,11 @@ from utils.rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 
 logger = get_logger(__name__)
 
@@ -1132,31 +1143,34 @@ class CloudScanner(ScanModule):
                     except json.JSONDecodeError:
                         pass
                         
-                # Test for write access
-                try:
-                    test_path = f"https://{project}.firebaseio.com/test_write_check.json"
-                    write_response = await client.put(
-                        test_path,
-                        json={"test": "vulnerability_scan"},
-                    )
-                    
-                    if write_response.status_code == 200:
-                        # Clean up
-                        await client.delete(test_path)
+                # Test for write access - ONLY in write-allowed modes
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping Firebase write test for project '{project}'")
+                else:
+                    try:
+                        test_path = f"https://{project}.firebaseio.com/test_write_check.json"
+                        write_response = await client.put(
+                            test_path,
+                            json={"test": "vulnerability_scan"},
+                        )
                         
-                        findings.append(Finding(
-                            name="Firebase Realtime Database Public Write",
-                            severity="CRITICAL",
-                            confidence="HIGH",
-                            description=f"Firebase database '{project}' allows public writes",
-                            matched_at=test_path,
-                            evidence=[f"Project: {project}", "Write successful"],
-                            cwe="CWE-306",
-                            cvss_score=10.0,
-                            remediation="IMMEDIATELY configure Firebase Security Rules to require authentication",
-                        ))
-                except Exception:
-                    pass
+                        if write_response.status_code == 200:
+                            # Clean up
+                            await client.delete(test_path)
+                            
+                            findings.append(Finding(
+                                name="Firebase Realtime Database Public Write",
+                                severity="CRITICAL",
+                                confidence="HIGH",
+                                description=f"Firebase database '{project}' allows public writes",
+                                matched_at=test_path,
+                                evidence=[f"Project: {project}", "Write successful"],
+                                cwe="CWE-306",
+                                cvss_score=10.0,
+                                remediation="IMMEDIATELY configure Firebase Security Rules to require authentication",
+                            ))
+                    except Exception:
+                        pass
                     
             except Exception as e:
                 logger.debug(f"Firebase test error: {e}")

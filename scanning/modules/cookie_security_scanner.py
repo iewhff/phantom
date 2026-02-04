@@ -466,6 +466,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=6.5 if cookie.is_session_cookie else 4.0,
                 ),
                 target=target,
+                confidence=90.0 if cookie.is_session_cookie else 85.0,
             )
 
         # 2. Check HttpOnly flag
@@ -485,6 +486,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=6.0,
                 ),
                 target=target,
+                confidence=90.0 if cookie.is_session_cookie else 85.0,
             )
 
         # 3. Check SameSite attribute
@@ -503,6 +505,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=5.0,
                 ),
                 target=target,
+                confidence=85.0,
             )
         elif cookie.samesite.lower() == "none" and not cookie.secure:
             self._add_finding(
@@ -519,6 +522,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=6.0,
                 ),
                 target=target,
+                confidence=90.0,
             )
 
         # 4. Check for sensitive data in cookies
@@ -538,6 +542,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=7.0,
                 ),
                 target=target,
+                confidence=90.0,
             )
 
         # 5. Check cookie expiration
@@ -557,6 +562,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=4.0,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
         # 6. Check cookie domain scope
@@ -577,6 +583,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=4.5,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
         # 7. Check cookie path scope
@@ -601,6 +608,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=4.0,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
         if cookie.name.startswith("__Secure-"):
@@ -619,6 +627,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=4.0,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
         # 9. Check for predictable cookie values
@@ -637,6 +646,7 @@ class CookieSecurityScanner(ScanModule):
                     cvss_score=8.0,
                 ),
                 target=target,
+                confidence=90.0,
             )
 
     async def _test_session_fixation(self, target: str) -> None:
@@ -671,10 +681,10 @@ class CookieSecurityScanner(ScanModule):
                     if cookie.value == forced_cookies[cookie.name]:
                         self._add_finding(
                             title="Potential Session Fixation Vulnerability",
-                            severity="high",
+                            severity="critical",
                             vulnerability=CookieVulnerability(
                                 vuln_type=CookieVulnType.SESSION_FIXATION,
-                                severity="high",
+                                severity="critical",
                                 cookie_name=cookie.name,
                                 description="Server accepts externally set session identifiers",
                                 evidence=f"Set session '{cookie.name}' to arbitrary value, server did not regenerate",
@@ -683,6 +693,7 @@ class CookieSecurityScanner(ScanModule):
                                 cvss_score=8.0,
                             ),
                             target=target,
+                            confidence=95.0,
                         )
 
         except Exception as e:
@@ -716,6 +727,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=5.0,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
         except Exception as e:
@@ -735,6 +747,7 @@ class CookieSecurityScanner(ScanModule):
                         cvss_score=5.0,
                     ),
                     target=target,
+                    confidence=85.0,
                 )
 
     def _add_finding(
@@ -743,6 +756,7 @@ class CookieSecurityScanner(ScanModule):
         severity: str,
         vulnerability: CookieVulnerability,
         target: str,
+        confidence: float = 85.0,
     ) -> None:
         """Add a finding to the results."""
         finding = Finding(
@@ -755,6 +769,7 @@ class CookieSecurityScanner(ScanModule):
             remediation=vulnerability.remediation,
             cwe=vulnerability.cwe,
             cvss_score=vulnerability.cvss_score,
+            confidence=confidence,
             metadata={
                 "vuln_type": vulnerability.vuln_type.value,
                 "cookie_name": vulnerability.cookie_name,

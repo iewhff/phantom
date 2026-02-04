@@ -1,0 +1,151 @@
+{
+  "target": "https://tapsi.pt",
+  "domain": "tapsi.pt",
+  "timestamp": "2026-02-04T22:10:19.196024",
+  "subdomains": [
+    "tapsi.pt",
+    "tvde.tapsi.pt",
+    "frotas.tapsi.pt",
+    "www.tapsi.pt",
+    "revolut.tapsi.pt",
+    "fleet.tapsi.pt",
+    "motoristas.tapsi.pt",
+    "empresas.tapsi.pt",
+    "business.tapsi.pt"
+  ],
+  "technologies": [
+    {
+      "name": "nginx",
+      "version": null,
+      "category": 6
+    },
+    {
+      "name": "WordPress",
+      "version": "6.9.1",
+      "category": 2
+    },
+    {
+      "name": "jQuery",
+      "version": ".",
+      "category": 4
+    },
+    {
+      "name": "Magento",
+      "version": null,
+      "category": 2
+    },
+    {
+      "name": "Angular",
+      "version": null,
+      "category": 3
+    },
+    {
+      "name": "Ember.js",
+      "version": null,
+      "category": 3
+    },
+    {
+      "name": "Lodash",
+      "version": null,
+      "category": 4
+    },
+    {
+      "name": "Swiper",
+      "version": null,
+      "category": 4
+    },
+    {
+      "name": "Yup",
+      "version": null,
+      "category": 4
+    },
+    {
+      "name": "Bootstrap",
+      "version": null,
+      "category": 5
+    },
+    {
+      "name": "Tailwind CSS",
+      "version": null,
+      "category": 5
+    },
+    {
+      "name": "Bulma",
+      "version": null,
+      "category": 5
+    },
+    {
+      "name": "Foundation",
+      "version": null,
+      "category": 5
+    },
+    {
+      "name": "Ruby",
+      "version": null,
+      "category": 7
+    },
+    {
+      "name": "WooCommerce",
+      "version": null,
+      "category": 14
+    },
+    {
+      "name": "JWT",
+      "version": null,
+      "category": 17
+    },
+    {
+      "name": "Datadog",
+      "version": null,
+      "category": 20
+    },
+    {
+      "name": "Plug",
+      "version": null,
+      "category": 1
+    },
+    {
+      "name": "Marked",
+      "version": null,
+      "category": 4
+    },
+    {
+      "name": "Motion One",
+      "version": null,
+      "category": 4
+    },
+    {
+      "name": "Seq",
+      "version": null,
+      "category": 20
+    },
+    {
+      "name": "PHP",
+      "version": null,
+      "category": 7
+    },
+    {
+      "name": "MySQL",
+      "version": null,
+      "category": 8
+    },
+    {
+      "name": "Elixir",
+      "version": null,
+      "category": 7
+    },
+    {
+      "name": "Erlang",
+      "version": null,
+      "category": 7
+    }
+  ],
+  "endpoints": [],
+  "parameters": [],
+  "waf": {
+    "detected": false,
+    "name": null,
+    "confidence": 0.0,
+    "behaviour": "unknown"
+  }
+}

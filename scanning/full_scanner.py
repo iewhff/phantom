@@ -10,15 +10,30 @@ Integrates ALL 39+ scanning modules with INTELLIGENT INFRASTRUCTURE:
 - Finding Lifecycle (professional findings management)
 - OOB Engine (blind vulnerability detection)
 
+SAFETY SYSTEM:
+- Global HTTP safety enforcement via SafeAsyncClient
+- Environment-based safety mode (PHANTOM_SAFE_MODE)
+- Destructive payload blocking at HTTP layer
+- Supports: passive, safe, cautious, standard, aggressive
+
 Supports Safe Mode for non-destructive testing.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional, Dict, List
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🛡️ CRITICAL: ACTIVATE GLOBAL SAFETY AT MODULE LOAD TIME
+# This ensures ALL httpx clients created anywhere are automatically safe
+# ═══════════════════════════════════════════════════════════════════════════════
+from utils.safe_http_client import enable_global_safety
+enable_global_safety()
+# ═══════════════════════════════════════════════════════════════════════════════
 
 from utils.logger import get_logger
 from utils.shared_findings_store import SharedFindingsStore, get_shared_findings
@@ -292,6 +307,10 @@ class FullScanner:
         "cookie": "scanning.modules.cookie_security_scanner.CookieSecurityScanner",
         "subdomain_takeover": "scanning.modules.subdomain_takeover_scanner.SubdomainTakeoverScanner",
         "llm": "scanning.modules.llm_security_scanner.LLMSecurityScanner",
+
+        # Communications API Security (Twilio, SendGrid, Authy)
+        # High-value for bounty programs - SMS pumping, toll fraud, phone enumeration
+        "comms": "scanning.modules.communications_api_scanner.CommunicationsAPIScanner",
     }
 
     # Module categories for selective scanning
@@ -304,19 +323,30 @@ class FullScanner:
         "infra": ["ssl", "headers", "cors", "cloud", "k8s", "dns_rebind", "supabase", "firebase"],
         "advanced": ["smuggling", "cache", "deser", "prototype", "dns_rebind", "rls_bypass"],
 
-        # Standard scan - comprehensive web app testing (default for PHANTOM)
+        # Standard scan - FULL comprehensive testing (same as client mode)
+        # Includes ALL modules for complete security assessment
         "standard": [
-            "headers", "ssl", "cors",           # Infrastructure basics
-            "sqli", "xss", "dom_xss",           # Classic injections
-            "csrf", "idor", "authz",            # Access control
-            "api", "graphql",                   # API security
-            "jwt", "auth", "oauth",             # Authentication
-            "business",                         # Logic flaws
-            "race",                             # Race conditions
-            "ssrf", "lfi",                      # Server-side
-            "open_redirect",                    # Redirect issues
-            "info_disclosure",                  # Info leaks
-            "clickjacking",                     # UI redressing
+            # Critical Injections (MUST run)
+            "sqli", "xss", "dom_xss", "cmdi", "xxe", "ssrf", "lfi",
+            "nosql", "ssti", "ldap", "crlf",
+            # Authentication & Authorization
+            "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor",
+            # API Security
+            "api", "graphql", "grpc", "websocket", "sse",
+            # Infrastructure
+            "ssl", "headers", "cors", "cloud", "k8s", "dns_rebind",
+            # Advanced Attacks
+            "smuggling", "cache", "deser", "prototype", "cache_deception",
+            # Business Logic
+            "business", "race", "mass_assign", "ratelimit",
+            # Discovery
+            "dir", "cms", "nuclei", "backend", "third_party",
+            # BaaS
+            "supabase", "firebase", "rls_bypass",
+            # Specialized
+            "mobile", "email", "host_header", "clickjacking",
+            "info_disclosure", "open_redirect", "file_upload",
+            "cookie", "subdomain_takeover", "csrf",
         ],
 
         # Smart scan - most common high-value modules with reasonable timeout
@@ -346,6 +376,7 @@ class FullScanner:
             "firebase",       # Firebase misconfigurations
             "rls_bypass",     # Row Level Security bypass
             "mobile",         # Mobile API vulnerabilities
+            "comms",          # Communications API (Twilio/SendGrid) - SMS pumping, toll fraud
         ],
 
         # BaaS (Backend-as-a-Service) focused scan
@@ -401,6 +432,40 @@ class FullScanner:
         self.intelligent_mode = intelligent_mode
         self.oob_callback_domain = oob_callback_domain
         self.loaded_modules: dict[str, Any] = {}
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # 🛡️ CRITICAL SAFETY SYSTEM - MUST BE FIRST!
+        # ═══════════════════════════════════════════════════════════════════════
+        # Set environment variable BEFORE any modules are loaded
+        os.environ["PHANTOM_SAFE_MODE"] = safe_mode
+        
+        # Enable global HTTP safety - this replaces httpx.AsyncClient with SafeAsyncClient
+        # which enforces safety policies on ALL HTTP operations
+        from utils.safe_http_client import enable_global_safety
+        enable_global_safety()
+        
+        # Log safety status prominently
+        safety_emoji = {
+            "passive": "🔒",
+            "safe": "🔒",
+            "cautious": "⚠️",
+            "standard": "🟡",
+            "aggressive": "🔴"
+        }
+        logger.info(f"{safety_emoji.get(safe_mode, '🔒')} SAFETY MODE: {safe_mode.upper()}")
+        logger.info(f"   - Global HTTP safety: ENABLED")
+        logger.info(f"   - Destructive payload blocking: ENABLED")
+        if safe_mode in ("passive", "safe"):
+            logger.info(f"   - POST/PUT/PATCH/DELETE: BLOCKED")
+        elif safe_mode == "cautious":
+            logger.info(f"   - PUT/PATCH/DELETE: BLOCKED")
+            logger.info(f"   - POST: Allowed (payload checked)")
+        elif safe_mode == "standard":
+            logger.info(f"   - All methods: Allowed (payload checked)")
+        else:
+            logger.info(f"   - All methods: Allowed (AGGRESSIVE MODE)")
+            logger.warning(f"   ⚠️ AGGRESSIVE MODE - Use only on authorized targets!")
+        # ═══════════════════════════════════════════════════════════════════════
 
         # Initialize rate limiter for endpoint discovery
         from utils.rate_limiter import RateLimiter

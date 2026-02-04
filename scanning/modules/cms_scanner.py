@@ -255,6 +255,7 @@ class CMSScanner(ScanModule):
                                         cwe="CWE-200",
                                         remediation="Disable REST API user endpoint or require authentication. "
                                                    "Use security plugins like WordFence.",
+                                        confidence=85,
                                     ).to_dict())
                                     break
                             except Exception:
@@ -272,6 +273,7 @@ class CMSScanner(ScanModule):
                                     cvss_score=3.7,
                                     cwe="CWE-200",
                                     remediation="Block author enumeration requests.",
+                                    confidence=75,
                                 ).to_dict())
                                 break
                                 
@@ -323,6 +325,7 @@ class CMSScanner(ScanModule):
                         cwe="CWE-288",
                         remediation="Disable XML-RPC if not needed. "
                                    "Block xmlrpc.php via web server or security plugin.",
+                        confidence=90 if severity == "HIGH" else 85,
                     ).to_dict())
                     
             except Exception as e:
@@ -349,6 +352,7 @@ class CMSScanner(ScanModule):
                         cwe="CWE-532",
                         remediation="Remove debug.log from production. "
                                    "Disable WP_DEBUG in production.",
+                        confidence=95,
                     ).to_dict())
                     
             except Exception as e:
@@ -378,6 +382,7 @@ class CMSScanner(ScanModule):
                                 cwe="CWE-530",
                                 remediation="Remove backup files immediately. "
                                            "Change all credentials.",
+                                confidence=95,
                             ).to_dict())
                             break
                             
@@ -408,6 +413,7 @@ class CMSScanner(ScanModule):
                             cvss_score=3.7,
                             cwe="CWE-200",
                             remediation="Remove readme.html or restrict access.",
+                            confidence=75,
                         ).to_dict())
                         
             except Exception as e:
@@ -458,6 +464,7 @@ class CMSScanner(ScanModule):
                                     cvss_score=9.8,
                                     cwe="CWE-530",
                                     remediation="Remove backup files.",
+                                    confidence=95,
                                 ).to_dict())
                         else:
                             version_match = re.search(r'<version>([\d.]+)</version>', response.text)
@@ -473,6 +480,7 @@ class CMSScanner(ScanModule):
                                     cvss_score=3.7,
                                     cwe="CWE-200",
                                     remediation="Remove version information from public files.",
+                                    confidence=75,
                                 ).to_dict())
                                 
                 except Exception as e:
@@ -524,6 +532,7 @@ class CMSScanner(ScanModule):
                                     cvss_score=3.7,
                                     cwe="CWE-200",
                                     remediation="Remove CHANGELOG.txt from production.",
+                                    confidence=75,
                                 ).to_dict())
                         elif "settings.php" in path:
                             findings.append(Finding(
@@ -537,6 +546,7 @@ class CMSScanner(ScanModule):
                                 cvss_score=9.8,
                                 cwe="CWE-530",
                                 remediation="Remove backup files.",
+                                confidence=95,
                             ).to_dict())
                             
                 except Exception as e:
@@ -589,6 +599,7 @@ class CMSScanner(ScanModule):
                             cwe="CWE-306",
                             remediation="Require authentication for admin access. "
                                        "Implement IP restrictions.",
+                            confidence=85,
                         ).to_dict())
                         
             except Exception as e:

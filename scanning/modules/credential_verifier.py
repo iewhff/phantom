@@ -90,6 +90,7 @@ class CredentialVerificationResult:
             "type": "leaked_credential",
             "title": f"Valid Leaked {self.credential_type} Found",
             "severity": severity_map.get(self.access_level, "high"),
+            "confidence": 100,  # Verified credentials - confirmed working
             "description": (
                 f"A valid {self.credential_type} was found exposed. "
                 f"Verification confirmed authentication succeeds. "

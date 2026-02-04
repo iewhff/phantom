@@ -66,6 +66,83 @@ logger = get_logger(__name__)
 
 
 # ============================================================================
+# STATIC ASSET FILTERING - Prevent false positives on non-dynamic content
+# ============================================================================
+
+# File extensions that are ALWAYS static (never have SSTI vulnerabilities)
+STATIC_ASSET_EXTENSIONS = {
+    # Images
+    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp', '.bmp', '.tiff', '.avif',
+    # Stylesheets
+    '.css', '.scss', '.sass', '.less',
+    # Scripts (client-side only)
+    '.js', '.mjs', '.ts', '.jsx', '.tsx',
+    # Fonts
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    # Documents
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    # Media
+    '.mp3', '.mp4', '.wav', '.ogg', '.webm', '.avi', '.mov',
+    # Archives
+    '.zip', '.tar', '.gz', '.rar', '.7z',
+    # Data files
+    '.xml', '.json', '.yaml', '.yml', '.csv',
+    # Maps
+    '.map',
+}
+
+# URL path patterns that indicate static assets
+STATIC_ASSET_PATTERNS = [
+    r'/static/',
+    r'/assets/',
+    r'/images/',
+    r'/img/',
+    r'/css/',
+    r'/js/',
+    r'/fonts/',
+    r'/media/',
+    r'/uploads/',  # Usually static uploaded files
+    r'/dist/',
+    r'/build/',
+    r'/vendor/',
+    r'/node_modules/',
+    r'/public/',
+    r'/_next/static/',  # Next.js
+    r'/__webpack/',  # Webpack
+    r'/bundle\.',
+    r'/chunk\.',
+]
+
+
+def is_static_asset_url(url: str) -> bool:
+    """
+    Check if a URL points to a static asset that cannot have SSTI.
+
+    Args:
+        url: The URL to check
+
+    Returns:
+        True if the URL is a static asset (should skip testing)
+    """
+    url_lower = url.lower()
+
+    # Check file extension
+    for ext in STATIC_ASSET_EXTENSIONS:
+        if url_lower.endswith(ext):
+            return True
+        # Also check for query strings after extension
+        if f"{ext}?" in url_lower or f"{ext}#" in url_lower:
+            return True
+
+    # Check path patterns
+    for pattern in STATIC_ASSET_PATTERNS:
+        if re.search(pattern, url_lower, re.IGNORECASE):
+            return True
+
+    return False
+
+
+# ============================================================================
 # ENTERPRISE DATA STRUCTURES
 # ============================================================================
 
@@ -126,24 +203,27 @@ class EngineSignature:
 # ============================================================================
 
 # Polyglot detection payloads - work across multiple engines
+# IMPORTANT: Use unique multiplication results that WON'T naturally appear in pages
+# 1337*997 = 1333189 (very unlikely to appear naturally)
+# 7*191711 = 1341977 (backup unique value)
 POLYGLOT_DETECTION_PAYLOADS = [
-    # Universal math evaluation
-    {"payload": "{{7*7}}", "expected": "49", "engines": ["jinja2", "twig", "nunjucks", "handlebars"]},
-    {"payload": "${7*7}", "expected": "49", "engines": ["freemarker", "velocity", "mako", "thymeleaf"]},
-    {"payload": "#{7*7}", "expected": "49", "engines": ["pug", "thymeleaf", "erb"]},
-    {"payload": "<%= 7*7 %>", "expected": "49", "engines": ["erb", "ejs"]},
-    {"payload": "${{7*7}}", "expected": "49", "engines": ["thymeleaf"]},
-    {"payload": "{7*7}", "expected": "49", "engines": ["smarty"]},
-    {"payload": "{{=7*7}}", "expected": "49", "engines": ["nunjucks"]},
-    {"payload": "<%=7*7%>", "expected": "49", "engines": ["ejs", "erb"]},
-    
-    # String multiplication (engine fingerprinting)
+    # Universal math evaluation - using UNIQUE numbers to prevent false positives
+    {"payload": "{{1337*997}}", "expected": "1333189", "engines": ["jinja2", "twig", "nunjucks", "handlebars"]},
+    {"payload": "${1337*997}", "expected": "1333189", "engines": ["freemarker", "velocity", "mako", "thymeleaf"]},
+    {"payload": "#{1337*997}", "expected": "1333189", "engines": ["pug", "thymeleaf", "erb"]},
+    {"payload": "<%= 1337*997 %>", "expected": "1333189", "engines": ["erb", "ejs"]},
+    {"payload": "${{1337*997}}", "expected": "1333189", "engines": ["thymeleaf"]},
+    {"payload": "{1337*997}", "expected": "1333189", "engines": ["smarty"]},
+    {"payload": "{{=1337*997}}", "expected": "1333189", "engines": ["nunjucks"]},
+    {"payload": "<%=1337*997%>", "expected": "1333189", "engines": ["ejs", "erb"]},
+
+    # String multiplication (engine fingerprinting) - already unique
     {"payload": "{{7*'7'}}", "expected": "7777777", "engines": ["jinja2"]},
-    {"payload": "{{7*'x'}}", "expected": "xxxxxxx", "engines": ["jinja2"]},
-    
-    # Concatenation tests
-    {"payload": "{{'foo'+'bar'}}", "expected": "foobar", "engines": ["jinja2", "nunjucks"]},
-    {"payload": "${\"foo\"+\"bar\"}", "expected": "foobar", "engines": ["freemarker"]},
+    {"payload": "{{7*'phantomtest'}}", "expected": "phantomtestphantomtestphantomtestphantomtestphantomtestphantomtestphantomtest", "engines": ["jinja2"]},
+
+    # Concatenation tests - using unique strings
+    {"payload": "{{'phantom'+'ssti'}}", "expected": "phantomssti", "engines": ["jinja2", "nunjucks"]},
+    {"payload": "${\"phantom\"+\"ssti\"}", "expected": "phantomssti", "engines": ["freemarker"]},
 ]
 
 # Engine-specific detection payloads with unique signatures
@@ -197,7 +277,7 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.VELOCITY: {
         "payloads": [
-            {"payload": "#set($x=7*7)$x", "expected": "49", "unique": True},
+            {"payload": "#set($x=1337*997)$x", "expected": "1333189", "unique": True},
             {"payload": "$class", "expected": "class", "unique": True},
             {"payload": "#if(true)yes#end", "expected": "yes", "unique": True},
         ],
@@ -211,7 +291,7 @@ ENGINE_SPECIFIC_DETECTION = {
         "payloads": [
             {"payload": "{$smarty.version}", "expected": ".", "unique": True},
             {"payload": "{$smarty.now}", "expected": "", "unique": False},
-            {"payload": "{math equation=\"7*7\"}", "expected": "49", "unique": True},
+            {"payload": "{math equation=\"1337*997\"}", "expected": "1333189", "unique": True},
             {"payload": "{'test'|upper}", "expected": "TEST", "unique": False},
         ],
         "error_signatures": [
@@ -222,9 +302,9 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.THYMELEAF: {
         "payloads": [
-            {"payload": "[[${7*7}]]", "expected": "49", "unique": True},
-            {"payload": "[(${7*7})]", "expected": "49", "unique": True},
-            {"payload": "__${7*7}__", "expected": "49", "unique": True},
+            {"payload": "[[${1337*997}]]", "expected": "1333189", "unique": True},
+            {"payload": "[(${1337*997})]", "expected": "1333189", "unique": True},
+            {"payload": "__${1337*997}__", "expected": "1333189", "unique": True},
         ],
         "error_signatures": [
             "org.thymeleaf",
@@ -234,7 +314,7 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.ERB: {
         "payloads": [
-            {"payload": "<%= 7*7 %>", "expected": "49", "unique": False},
+            {"payload": "<%= 1337*997 %>", "expected": "1333189", "unique": True},
             {"payload": "<%= self.class %>", "expected": "Binding", "unique": True},
             {"payload": "<%= Rails.version %>", "expected": ".", "unique": True},
         ],
@@ -247,8 +327,8 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.MAKO: {
         "payloads": [
-            {"payload": "${7*7}", "expected": "49", "unique": False},
-            {"payload": "<%7*7%>", "expected": "49", "unique": True},
+            {"payload": "${1337*997}", "expected": "1333189", "unique": True},
+            {"payload": "<%1337*997%>", "expected": "1333189", "unique": True},
             {"payload": "${self}", "expected": "Context", "unique": True},
         ],
         "error_signatures": [
@@ -259,8 +339,8 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.EJS: {
         "payloads": [
-            {"payload": "<%= 7*7 %>", "expected": "49", "unique": False},
-            {"payload": "<%- 7*7 %>", "expected": "49", "unique": False},
+            {"payload": "<%= 1337*997 %>", "expected": "1333189", "unique": True},
+            {"payload": "<%- 1337*997 %>", "expected": "1333189", "unique": True},
             {"payload": "<%= global %>", "expected": "object", "unique": True},
             {"payload": "<%= process.version %>", "expected": "v", "unique": True},
         ],
@@ -272,8 +352,8 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.PEBBLE: {
         "payloads": [
-            {"payload": "{{7*7}}", "expected": "49", "unique": False},
-            {"payload": "{% set x = 7*7 %}{{x}}", "expected": "49", "unique": True},
+            {"payload": "{{1337*997}}", "expected": "1333189", "unique": True},
+            {"payload": "{% set x = 1337*997 %}{{x}}", "expected": "1333189", "unique": True},
         ],
         "error_signatures": [
             "PebbleException",
@@ -282,7 +362,7 @@ ENGINE_SPECIFIC_DETECTION = {
     },
     TemplateEngine.NUNJUCKS: {
         "payloads": [
-            {"payload": "{{7*7}}", "expected": "49", "unique": False},
+            {"payload": "{{1337*997}}", "expected": "1333189", "unique": True},
             {"payload": "{{range(5)}}", "expected": "[object", "unique": True},
             {"payload": "{{constructor}}", "expected": "function", "unique": False},
         ],
@@ -542,49 +622,42 @@ class SSTIScanner(ScanModule):
     version = "2.0-enterprise"
     
     # Template engine detection payloads with expected results
+    # IMPORTANT: Use unique numbers (1337*997=1333189) to prevent false positives
     DETECTION_PAYLOADS = {
-        # Universal math payload - works in most engines
-        "{{7*7}}": "49",
-        "${7*7}": "49",
-        "#{7*7}": "49",
-        "<%= 7*7 %>": "49",
-        "${{7*7}}": "49",
-        "{{= 7*7}}": "49",
-        "{7*7}": "49",
-        
-        # Jinja2/Twig specific
+        # Universal math payload - works in most engines (UNIQUE numbers)
+        "{{1337*997}}": "1333189",
+        "${1337*997}": "1333189",
+        "#{1337*997}": "1333189",
+        "<%= 1337*997 %>": "1333189",
+        "${{1337*997}}": "1333189",
+        "{{= 1337*997}}": "1333189",
+        "{1337*997}": "1333189",
+
+        # Jinja2/Twig specific - string multiplication is already unique
         "{{7*'7'}}": "7777777",
         "{{config}}": "Config",
-        
+
         # Freemarker
-        "${7*7}": "49",
-        "<#assign x=7*7>${x}": "49",
-        
+        "<#assign x=1337*997>${x}": "1333189",
+
         # Velocity
-        "#set($x=7*7)$x": "49",
+        "#set($x=1337*997)$x": "1333189",
         "$class.inspect": "class",
-        
+
         # Smarty
-        "{php}echo 7*7;{/php}": "49",
-        "{math equation=\"7*7\"}": "49",
-        
+        "{php}echo 1337*997;{/php}": "1333189",
+        "{math equation=\"1337*997\"}": "1333189",
+
         # Thymeleaf
-        "[[${7*7}]]": "49",
-        
+        "[[${1337*997}]]": "1333189",
+
         # ERB (Ruby)
-        "<%= 7*7 %>": "49",
         "<%= system('id') %>": "uid=",
-        
+
         # Mako
-        "${7*7}": "49",
-        "<%7*7%>": "49",
-        
-        # EJS
-        "<%= 7*7 %>": "49",
-        "<%- 7*7 %>": "49",
-        
-        # Pug/Jade
-        "#{7*7}": "49",
+        "<%1337*997%>": "1333189",
+
+        # Pug/Jade - already uses unique patterns
     }
     
     # Engine-specific RCE payloads (kept for backward compatibility)
@@ -649,9 +722,24 @@ class SSTIScanner(ScanModule):
         urls = asset_data.get("urls", [base_url])
         forms = asset_data.get("forms", [])
         
-        # Combine all testable URLs
-        all_urls = list(set(endpoints + urls))[:50]
-        
+        # Combine all testable URLs and FILTER OUT static assets
+        all_urls_raw = list(set(endpoints + urls))
+
+        # CRITICAL: Skip static assets to prevent false positives
+        all_urls = []
+        skipped_static = 0
+        for url in all_urls_raw:
+            if is_static_asset_url(url):
+                skipped_static += 1
+                logger.debug(f"Skipping static asset: {url}")
+            else:
+                all_urls.append(url)
+
+        if skipped_static > 0:
+            logger.info(f"🛡️ SSTI Scanner: Skipped {skipped_static} static assets (false positive prevention)")
+
+        all_urls = all_urls[:50]
+
         async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
             for url in all_urls:
                 # Phase 1: Test URL parameters
@@ -745,6 +833,7 @@ class SSTIScanner(ScanModule):
                             type="ssti",
                             name=f"Server-Side Template Injection ({engine.name if engine else 'Unknown'})",
                             severity="CRITICAL",
+                            confidence=result.confidence * 100,  # Convert 0-1 to 0-100
                             description=f"SSTI vulnerability detected in parameter '{param}'. "
                                        f"Template engine: {engine.name if engine else 'Unknown'}. "
                                        f"Template expressions are being evaluated server-side.",
@@ -1006,37 +1095,38 @@ class SSTIScanner(ScanModule):
         """
         findings = []
         
-        # Extended path patterns
+        # Extended path patterns - use UNIQUE numbers to prevent false positives
+        # 1337*997 = 1333189 (won't appear naturally in pages)
         path_patterns = [
-            "/page/{{7*7}}",
-            "/template/{{7*7}}",
-            "/render/{{7*7}}",
-            "/view/{{7*7}}",
-            "/preview/{{7*7}}",
-            "/{{7*7}}",
-            "/api/template/{{7*7}}",
-            "/content/{{7*7}}",
-            "/${7*7}",
+            "/page/{{1337*997}}",
+            "/template/{{1337*997}}",
+            "/render/{{1337*997}}",
+            "/view/{{1337*997}}",
+            "/preview/{{1337*997}}",
+            "/{{1337*997}}",
+            "/api/template/{{1337*997}}",
+            "/content/{{1337*997}}",
+            "/${1337*997}",
             "/{{config}}",
             "/{{self}}",
-            "/<%= 7*7 %>",
-            "/#{7*7}",
+            "/<%= 1337*997 %>",
+            "/#{1337*997}",
             # URL encoded variants
-            "/page/%7b%7b7*7%7d%7d",
-            "/template/%24%7b7*7%7d",
+            "/page/%7b%7b1337*997%7d%7d",
+            "/template/%24%7b1337*997%7d",
         ]
-        
+
         for path in path_patterns:
             await rate_limiter.acquire()
-            
+
             try:
                 url = urljoin(base_url, path)
                 response = await client.get(url, follow_redirects=True)
-                
-                # Check for template evaluation
-                if "49" in response.text:
+
+                # Check for template evaluation - UNIQUE number 1333189
+                if "1333189" in response.text:
                     # Verify it's not just the payload reflected
-                    if "{{7*7}}" not in response.text and "${7*7}" not in response.text:
+                    if "{{1337*997}}" not in response.text and "${1337*997}" not in response.text:
                         findings.append(Finding(
                             type="ssti",
                             name="SSTI in URL Path",
@@ -1072,32 +1162,32 @@ class SSTIScanner(ScanModule):
         """
         findings = []
         
-        # Extended header tests
+        # Extended header tests - use UNIQUE numbers (1337*997=1333189)
         test_headers = [
-            ("User-Agent", "{{7*7}}"),
-            ("Referer", "{{7*7}}"),
-            ("X-Forwarded-For", "{{7*7}}"),
-            ("X-Forwarded-Host", "{{7*7}}"),
-            ("Accept-Language", "{{7*7}}"),
-            ("X-Original-URL", "{{7*7}}"),
-            ("X-Custom-Header", "{{7*7}}"),
-            ("Cookie", "session={{7*7}}"),
-            ("Authorization", "Bearer {{7*7}}"),
-            ("Content-Type", "application/{{7*7}}"),
-            ("Accept", "text/{{7*7}}"),
+            ("User-Agent", "{{1337*997}}"),
+            ("Referer", "{{1337*997}}"),
+            ("X-Forwarded-For", "{{1337*997}}"),
+            ("X-Forwarded-Host", "{{1337*997}}"),
+            ("Accept-Language", "{{1337*997}}"),
+            ("X-Original-URL", "{{1337*997}}"),
+            ("X-Custom-Header", "{{1337*997}}"),
+            ("Cookie", "session={{1337*997}}"),
+            ("Authorization", "Bearer {{1337*997}}"),
+            ("Content-Type", "application/{{1337*997}}"),
+            ("Accept", "text/{{1337*997}}"),
             # Alternative syntaxes
-            ("User-Agent", "${7*7}"),
-            ("User-Agent", "<%= 7*7 %>"),
+            ("User-Agent", "${1337*997}"),
+            ("User-Agent", "<%= 1337*997 %>"),
         ]
-        
+
         for header_name, payload in test_headers:
             await rate_limiter.acquire()
-            
+
             try:
                 headers = {header_name: payload}
                 response = await client.get(url, headers=headers)
-                
-                if "49" in response.text:
+
+                if "1333189" in response.text:
                     # Verify not reflected as-is
                     if payload not in response.text:
                         findings.append(Finding(
@@ -1134,29 +1224,32 @@ class SSTIScanner(ScanModule):
         """
         findings = []
         
-        # First check if basic payload is blocked
+        # First check if basic payload is blocked - use UNIQUE number
         await rate_limiter.acquire()
         try:
-            test_url = f"{url}?test={{{{7*7}}}}"
+            test_url = f"{url}?test={{{{1337*997}}}}"
             baseline = await client.get(test_url)
-            
-            # If basic payload works, no need for bypass testing
-            if "49" in baseline.text and "{{7*7}}" not in baseline.text:
+
+            # If basic payload works (unique number 1333189 appears), no need for bypass testing
+            if "1333189" in baseline.text and "{{1337*997}}" not in baseline.text:
                 return findings
-                
+
         except Exception:
             return findings
-        
-        # Try bypass techniques
+
+        # Try bypass techniques (these use 7*7 for WAF testing - result would still show 49)
+        # Note: WAF bypass testing is less likely to cause false positives since it
+        # only runs AFTER the basic test fails (meaning the target actually processes templates)
         for bypass in WAF_BYPASS_PAYLOADS[:15]:
             await rate_limiter.acquire()
-            
+
             try:
-                bypass_payload = bypass["bypass"]
+                # Update bypass payload to use unique numbers
+                bypass_payload = bypass["bypass"].replace("7*7", "1337*997")
                 test_url = f"{url}?test={quote(bypass_payload)}"
                 response = await client.get(test_url)
-                
-                if "49" in response.text:
+
+                if "1333189" in response.text:
                     findings.append(Finding(
                         type="ssti",
                         name=f"SSTI WAF Bypass ({bypass['type']})",

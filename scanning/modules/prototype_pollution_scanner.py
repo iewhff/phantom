@@ -4,6 +4,11 @@ Prototype Pollution Scanner - ENTERPRISE EDITION v2.0
 Enterprise-grade JavaScript prototype pollution vulnerability scanner with
 comprehensive coverage for server-side and client-side attack vectors.
 
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - Detection via error messages only
+- standard: Safe payloads that don't cause permanent changes
+- aggressive: Full testing including state-changing payloads
+
 Features:
 - Server-side prototype pollution (Node.js/Express)
 - Client-side DOM-based pollution detection
@@ -38,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -48,6 +54,11 @@ import httpx
 
 from scanning.vuln_scanner import Finding, ScanModule
 from utils.logger import get_logger
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 from utils.rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
@@ -469,6 +480,7 @@ class PrototypePollutionScanner(ScanModule):
                             ],
                             cvss_score=9.0,
                             cwe="CWE-1321",
+                            confidence=result.confidence * 100,
                             remediation="Use Object.create(null) for objects without prototype. "
                                        "Sanitize __proto__, constructor, and prototype keys from input. "
                                        "Use Map instead of plain objects for user data. "
@@ -476,31 +488,35 @@ class PrototypePollutionScanner(ScanModule):
                         ).to_dict())
                         break
                     
-                    # Test PUT/PATCH
-                    for method in ["PUT", "PATCH"]:
-                        await rate_limiter.acquire()
-                        
-                        if method == "PUT":
-                            resp = await client.put(url, json=payload)
-                        else:
-                            resp = await client.patch(url, json=payload)
-                        
-                        result = self._analyze_pollution_response(resp, payload, method)
-                        
-                        if result.vulnerable:
-                            findings.append(Finding(
-                                type="prototype_pollution",
-                                name=f"Prototype Pollution via {method}",
-                                severity="CRITICAL",
-                                description=f"Update endpoint vulnerable to prototype pollution",
-                                host=urlparse(url).netloc,
-                                matched_at=url,
-                                evidence=[
+                    # Test PUT/PATCH - ONLY in write-allowed modes
+                    if not ALLOW_WRITES:
+                        logger.debug(f"⚠️ SAFE MODE: Skipping PUT/PATCH prototype pollution tests")
+                    else:
+                        for method in ["PUT", "PATCH"]:
+                            await rate_limiter.acquire()
+                            
+                            if method == "PUT":
+                                resp = await client.put(url, json=payload)
+                            else:
+                                resp = await client.patch(url, json=payload)
+                            
+                            result = self._analyze_pollution_response(resp, payload, method)
+                            
+                            if result.vulnerable:
+                                findings.append(Finding(
+                                    type="prototype_pollution",
+                                    name=f"Prototype Pollution via {method}",
+                                    severity="CRITICAL",
+                                    description=f"Update endpoint vulnerable to prototype pollution",
+                                    host=urlparse(url).netloc,
+                                    matched_at=url,
+                                    evidence=[
                                     f"Method: {method}",
                                     f"Payload: {json.dumps(payload)[:200]}",
                                 ],
                                 cvss_score=9.0,
                                 cwe="CWE-1321",
+                                confidence=result.confidence * 100,
                                 remediation="Filter dangerous keys from update operations.",
                             ).to_dict())
                             break
@@ -614,6 +630,7 @@ class PrototypePollutionScanner(ScanModule):
                             ],
                             cvss_score=7.5,
                             cwe="CWE-1321",
+                            confidence=90,
                             remediation="Use strict query parameter parsing. "
                                        "Reject nested object syntax in query strings. "
                                        "Use a query string parser that doesn't support bracket notation.",
@@ -687,6 +704,7 @@ class PrototypePollutionScanner(ScanModule):
                                     ],
                                     cvss_score=10.0,
                                     cwe="CWE-94",
+                                    confidence=95,
                                     remediation="CRITICAL: Immediate action required. "
                                                "This is a remote code execution vulnerability. "
                                                "Update template engines. Sanitize all input.",
@@ -711,6 +729,7 @@ class PrototypePollutionScanner(ScanModule):
                                     ],
                                     cvss_score=8.5,
                                     cwe="CWE-1321",
+                                    confidence=90,
                                     remediation="Filter prototype pollution keys. Update template engines.",
                                 ).to_dict())
                                 break
@@ -763,6 +782,7 @@ class PrototypePollutionScanner(ScanModule):
                     ],
                     cvss_score=6.1 if severity == "MEDIUM" else 7.5,
                     cwe="CWE-1321",
+                    confidence=85,
                     remediation="Update libraries to patched versions. "
                                "Use Object.freeze on Object.prototype. "
                                "Implement Object.create(null) for safe objects.",
@@ -790,6 +810,7 @@ class PrototypePollutionScanner(ScanModule):
                         evidence=[f"Library: {lib}", f"Version: {version}"],
                         cvss_score=0.0,
                         cwe="CWE-1321",
+                        confidence=100,
                         remediation="Verify library version is not vulnerable to prototype pollution.",
                     ).to_dict())
                     
@@ -832,6 +853,7 @@ class PrototypePollutionScanner(ScanModule):
                         ],
                         cvss_score=6.5,
                         cwe="CWE-1321",
+                        confidence=85,
                         remediation=f"Update {vuln.library} to version > {vuln.max_version}.",
                     ).to_dict())
                     
@@ -888,6 +910,7 @@ class PrototypePollutionScanner(ScanModule):
                             ],
                             cvss_score=5.3,
                             cwe="CWE-400",
+                            confidence=75,
                             remediation="Implement input size limits. "
                                        "Sanitize recursive structures. "
                                        "Add request timeout limits.",
@@ -905,6 +928,7 @@ class PrototypePollutionScanner(ScanModule):
                         evidence=["Request timed out with DoS payload"],
                         cvss_score=7.5,
                         cwe="CWE-400",
+                        confidence=90,
                         remediation="Implement circuit breakers and request timeouts.",
                     ).to_dict())
                     break
@@ -968,6 +992,7 @@ class PrototypePollutionScanner(ScanModule):
                             ],
                             cvss_score=9.0,
                             cwe="CWE-1321",
+                            confidence=95,
                             remediation="Filter __proto__, constructor, and prototype keys before merge. "
                                        "Use safe merge implementation.",
                         ).to_dict())

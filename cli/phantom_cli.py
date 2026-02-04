@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import uuid
 from contextlib import contextmanager
@@ -137,6 +138,85 @@ except ImportError as e:
     PHANTOM_IMPORT_ERROR = str(e)
 
 console = Console()
+
+
+def safe_asyncio_run(coro):
+    """
+    Safely run an async coroutine with proper subprocess cleanup.
+
+    This prevents 'Event loop is closed' errors that occur when
+    subprocesses are not properly cleaned up before the event loop closes.
+    """
+    import gc
+    import sys
+    import warnings
+
+    # Suppress the specific RuntimeError from subprocess cleanup
+    warnings.filterwarnings("ignore", message="Event loop is closed")
+
+    # Store original unraisable hook to suppress subprocess cleanup errors
+    original_hook = sys.unraisablehook
+
+    def suppress_event_loop_closed(args):
+        """Suppress 'Event loop is closed' errors from subprocess cleanup."""
+        if args.exc_type is RuntimeError:
+            msg = str(args.exc_value)
+            if "Event loop is closed" in msg:
+                return  # Suppress this specific error
+        # Call original hook for other errors
+        if original_hook:
+            original_hook(args)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        # Install suppression hook before cleanup
+        sys.unraisablehook = suppress_event_loop_closed
+
+        try:
+            # Cancel all pending tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+
+            # Give tasks a chance to respond to cancellation
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+            # Shutdown async generators
+            loop.run_until_complete(loop.shutdown_asyncgens())
+
+            # Shutdown default executor
+            if hasattr(loop, 'shutdown_default_executor'):
+                loop.run_until_complete(loop.shutdown_default_executor())
+
+        except Exception:
+            pass  # Ignore cleanup errors
+        finally:
+            # Force garbage collection BEFORE closing loop
+            # This cleans up subprocess transports while loop is still open
+            gc.collect()
+
+            # Now close the loop
+            loop.close()
+
+            # Force another GC to clean up any remaining transports
+            # (they'll be suppressed by our hook)
+            gc.collect()
+
+            # Restore original hook after a brief delay for cleanup
+            # Use a delayed restoration to catch any lingering cleanup
+            import threading
+            def restore_hook():
+                import time
+                time.sleep(0.1)
+                sys.unraisablehook = original_hook
+
+            restore_thread = threading.Thread(target=restore_hook, daemon=True)
+            restore_thread.start()
 
 
 @contextmanager
@@ -312,11 +392,35 @@ def format_severity(severity: str) -> str:
     return colors.get(severity.upper(), severity)
 
 
-def format_confidence(confidence: float) -> str:
+def format_confidence(confidence: float | str) -> str:
     """Format confidence percentage.
 
     Handles both decimal (0.0-1.0) and percentage (0-100) formats.
+    Also handles string values like "HIGH", "MEDIUM", "LOW", or "95%".
     """
+    # Convert string confidence to float
+    try:
+        if isinstance(confidence, str):
+            # Handle string labels
+            confidence_map = {
+                "HIGH": 0.9,
+                "MEDIUM": 0.7,
+                "LOW": 0.5,
+                "CRITICAL": 0.95,
+                "INFO": 0.3,
+            }
+            upper_conf = confidence.upper().strip()
+            if upper_conf in confidence_map:
+                confidence = confidence_map[upper_conf]
+            else:
+                # Handle percentage strings like "95%" or "0.85"
+                confidence = float(confidence.rstrip('%'))
+                if confidence > 1:
+                    confidence = confidence / 100.0
+        confidence = float(confidence)
+    except (ValueError, TypeError):
+        confidence = 0.5  # Default to medium confidence
+
     # Normalize: if confidence > 1, it's already a percentage
     if confidence > 1.0:
         pct = confidence
@@ -399,12 +503,15 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, no_banner: bool):
 @click.option("--no-ai", is_flag=True, help="Skip AI validation")
 @click.option("--no-auth", is_flag=True, help="Skip authorization check")
 @click.option("--timeout", type=int, help="Overall scan timeout in seconds")
+@click.option("--compliance", multiple=True,
+              type=click.Choice(["pci-dss", "hipaa", "gdpr", "nist", "owasp", "all"]),
+              help="Compliance frameworks to map (can be used multiple times)")
 @click.pass_context
 def scan(ctx: click.Context, target: str, output: Optional[str], output_format: str,
          modules: Optional[str], safe_mode: str, rate: float, concurrent: int,
          scope: tuple, exclude: tuple, preset: Optional[str],
          no_recon: bool, no_tools: bool, no_chain: bool, no_ai: bool, no_auth: bool,
-         timeout: Optional[int]):
+         timeout: Optional[int], compliance: tuple):
     """
     Execute PHANTOM AI security scan on TARGET.
 
@@ -423,11 +530,14 @@ def scan(ctx: click.Context, target: str, output: Optional[str], output_format: 
         phantom scan https://example.com
         phantom scan https://api.target.com -m injection -s cautious
         phantom scan target.com --no-recon --modules sqli,xss,idor
+        phantom scan target.com -s aggressive --compliance all
     """
     if not ctx.obj.get("no_banner"):
         print_banner()
 
-    asyncio.run(_run_phantom_scan(
+    compliance_list = list(compliance) if compliance else []
+
+    safe_asyncio_run(_run_phantom_scan(
         target=target,
         output_dir=output,
         output_format=output_format,
@@ -446,6 +556,7 @@ def scan(ctx: click.Context, target: str, output: Optional[str], output_format: 
         timeout=timeout,
         scan_mode=ScanMode.STANDARD if PHANTOM_AVAILABLE else "standard",
         verbose=ctx.obj.get("verbose", False),
+        compliance=compliance_list,
     ))
 
 
@@ -468,8 +579,43 @@ async def _run_phantom_scan(
     timeout: Optional[int],
     scan_mode: str,
     verbose: bool,
+    compliance: List[str] = None,
+    custom_headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Execute PHANTOM AI scan."""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DOUBLE PROTECTION: Set environment variable BEFORE any imports/operations
+    # This ensures ALL modules respect the safety mode, even if loaded lazily
+    # ═══════════════════════════════════════════════════════════════════════════
+    os.environ["PHANTOM_SAFE_MODE"] = safe_mode
+
+    # Store custom headers in environment for scanners to use
+    if custom_headers:
+        os.environ["PHANTOM_CUSTOM_HEADERS"] = json.dumps(custom_headers)
+
+    # Additional protection: Block aggressive mode unless explicitly allowed
+    if safe_mode == "aggressive":
+        if os.environ.get("PHANTOM_ALLOW_AGGRESSIVE", "").lower() not in ("1", "true", "yes", "authorized"):
+            console.print(Panel(
+                "[bold red]⛔ AGGRESSIVE MODE BLOCKED[/bold red]\n\n"
+                "Aggressive mode requires explicit authorization.\n"
+                "This is a safety feature to prevent accidental destructive operations.\n\n"
+                "To enable aggressive mode, set environment variable:\n"
+                "[yellow]export PHANTOM_ALLOW_AGGRESSIVE=authorized[/yellow]\n\n"
+                "Falling back to 'standard' mode.",
+                title="Security Protection",
+                border_style="red",
+            ))
+            safe_mode = "standard"
+            os.environ["PHANTOM_SAFE_MODE"] = safe_mode
+
+    # Log safety mode for audit
+    if verbose:
+        console.print(f"[dim]🛡️ Safety mode set: {safe_mode}[/dim]")
+
+    # Normalize compliance list
+    compliance = compliance or []
 
     # Normalize target
     target = normalize_target(target)
@@ -486,6 +632,9 @@ async def _run_phantom_scan(
         "aggressive": "⚡ AGGRESSIVE (full testing)",
     }
 
+    # Compliance display
+    compliance_str = ", ".join(compliance).upper() if compliance else "None"
+
     # Display configuration
     console.print(Panel(
         f"[bold cyan]Scan ID:[/bold cyan] {scan_id}\n"
@@ -495,7 +644,8 @@ async def _run_phantom_scan(
         f"[bold cyan]Safety:[/bold cyan] {safe_icons.get(safe_mode, safe_mode)}\n"
         f"[bold cyan]Rate:[/bold cyan] {rate} req/sec\n"
         f"[bold cyan]Concurrent:[/bold cyan] {concurrent} modules\n"
-        f"[bold cyan]Format:[/bold cyan] {output_format.upper()}",
+        f"[bold cyan]Format:[/bold cyan] {output_format.upper()}\n"
+        f"[bold cyan]Compliance:[/bold cyan] {compliance_str}",
         title="🎯 PHANTOM AI Scan Configuration",
         border_style="blue",
     ))
@@ -805,25 +955,59 @@ async def _run_phantom_scan(
                     pipeline = ValidationPipeline()
 
                     # Convert findings to RawFinding format
+                    # Skip INFO severity findings (http_probe, etc.) - they are informational only
                     raw_findings = []
+                    info_findings_skipped = 0
                     for finding in all_findings:
-                        # Build title from finding data
-                        vuln_type = finding.get("type", "unknown")
-                        title = finding.get("title", f"{vuln_type.upper()} Vulnerability Detected")
                         severity = finding.get("severity", "MEDIUM")
+                        
+                        # Skip INFO severity findings - they don't need validation
+                        if severity.upper() == "INFO":
+                            info_findings_skipped += 1
+                            continue
+                        
+                        # Build title from finding data (support both 'title' and 'name' fields)
+                        vuln_type = finding.get("type", "unknown")
+                        title = finding.get("title") or finding.get("name") or f"{vuln_type.upper()} Vulnerability Detected"
                         url = finding.get("url", finding.get("matched_at", target))
 
                         # Get evidence as string (RawFinding.evidence is str, not list)
                         evidence = finding.get("evidence", "")
                         if isinstance(evidence, list):
                             evidence = "\n".join(str(e) for e in evidence)
+                        
+                        # Also check description field if no evidence
+                        if not evidence:
+                            evidence = finding.get("description", "")
 
-                        # Normalize confidence to 0-1 scale (some modules use 0-100)
-                        confidence = finding.get("confidence", 0.5)
-                        if confidence is not None and confidence > 1.0:
-                            confidence = confidence / 100.0  # Convert percentage to decimal
-                        confidence = max(0.0, min(1.0, confidence or 0.5))  # Clamp to 0-1
+                        # Normalize confidence to 0-1 scale (some modules use 0-100 or strings)
+                        raw_confidence = finding.get("confidence", 0.5)
+                        try:
+                            if isinstance(raw_confidence, str):
+                                # Handle string labels like "HIGH", "MEDIUM", "LOW"
+                                confidence_map = {
+                                    "HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5,
+                                    "CRITICAL": 0.95, "INFO": 0.3,
+                                }
+                                upper_conf = raw_confidence.upper().strip()
+                                if upper_conf in confidence_map:
+                                    confidence = confidence_map[upper_conf]
+                                else:
+                                    # Handle percentage strings like "95%" or plain numbers
+                                    confidence = float(raw_confidence.rstrip('%'))
+                                    if confidence > 1:
+                                        confidence = confidence / 100.0
+                            else:
+                                confidence = float(raw_confidence) if raw_confidence is not None else 0.5
+                                if confidence > 1.0:
+                                    confidence = confidence / 100.0  # Convert percentage to decimal
+                        except (ValueError, TypeError):
+                            confidence = 0.5
+                        confidence = max(0.0, min(1.0, confidence))  # Clamp to 0-1
 
+                        # Ensure method is always a string
+                        method = finding.get("method", "GET") or "GET"
+                        
                         raw = create_raw_finding(
                             title=title,
                             vuln_type=vuln_type,
@@ -836,13 +1020,37 @@ async def _run_phantom_scan(
                             response=finding.get("raw_response", ""),  # RawFinding uses 'response'
                             metadata=finding,  # RawFinding uses 'metadata' for extra data
                             confidence=confidence,  # Pass normalized confidence
+                            method=method,  # Ensure method is passed
                         )
                         raw_findings.append(raw)
 
                     pentest_log.log_info(f"Validating {len(raw_findings)} raw findings")
+                    
+                    # Log raw findings for debugging
+                    validation_debug = os.environ.get("PHANTOM_VALIDATION_DEBUG", "0") == "1" or verbose
+                    if validation_debug:
+                        for i, rf in enumerate(raw_findings):
+                            console.print(f"[dim]   Raw finding {i+1}: {rf.title} (type={rf.vulnerability_type.value}, conf={rf.confidence:.2f})[/dim]")
+                            pentest_log.log_info(f"Raw finding {i+1}: {rf.title} (type={rf.vulnerability_type.value}, conf={rf.confidence:.2f}, url={rf.url})")
 
                     # Run validation - returns List[ValidatedFinding] directly
                     validated_list = await pipeline.validate_findings(raw_findings)
+
+                    # Log validation results for debugging
+                    if validation_debug:
+                        console.print(f"\n[bold cyan]Validation Results:[/bold cyan]")
+                        for vf in validated_list:
+                            status = "✓" if vf.final_confidence >= ConfidenceThreshold.MINIMUM_REPORT else "✗"
+                            status_color = "green" if status == "✓" else "yellow"
+                            console.print(f"[{status_color}]   {status} {vf.raw_finding.title}[/{status_color}]")
+                            console.print(f"[dim]      Final confidence: {vf.final_confidence:.2f} (threshold: {ConfidenceThreshold.MINIMUM_REPORT})[/dim]")
+                            console.print(f"[dim]      Stages:[/dim]")
+                            for sr in vf.stage_results:
+                                result_color = "green" if sr.result.value == "passed" else "red" if sr.result.value == "failed" else "yellow"
+                                console.print(f"[dim]        - {sr.stage.name}: [{result_color}]{sr.result.value}[/{result_color}] (delta: {sr.confidence_delta:+.2f}) {sr.message}[/dim]")
+                            
+                            pentest_log.log_info(f"Validation result: {vf.raw_finding.title} -> conf={vf.final_confidence:.2f}, valid={vf.is_valid}")
+                        console.print()
 
                     # Filter by confidence threshold
                     validated_findings = [
@@ -853,29 +1061,46 @@ async def _run_phantom_scan(
                     validation_duration = (datetime.now() - validation_start_time).total_seconds()
                     progress.update(task_validate, completed=100)
 
-                    original_count = len(all_findings)
+                    # Count findings properly (INFO findings were skipped from validation)
+                    findings_sent_to_validation = len(raw_findings)
                     validated_count = len(validated_findings)
-                    fp_count = original_count - validated_count
+                    fp_count = findings_sent_to_validation - validated_count
 
                     pentest_log.log_phase_end("validation", validation_duration, {
-                        "original_findings": original_count,
+                        "original_findings": len(all_findings),
+                        "info_findings_skipped": info_findings_skipped,
                         "validated_findings": validated_count,
                         "false_positives_removed": fp_count,
                     })
 
                     console.print(f"[green]✓ Validation complete[/green]")
-                    console.print(f"   Original findings: {original_count}")
+                    console.print(f"   Total findings: {len(all_findings)} ({info_findings_skipped} INFO skipped)")
+                    console.print(f"   Sent to validation: {findings_sent_to_validation}")
                     console.print(f"   Validated findings: {validated_count}")
-                    console.print(f"   False positives removed: [red]{fp_count}[/red]")
+                    if fp_count > 0:
+                        console.print(f"   Below threshold: [yellow]{fp_count}[/yellow]")
+
+                    # Cleanup pipeline resources
+                    try:
+                        await pipeline.close()
+                    except Exception:
+                        pass
 
                 except Exception as e:
                     if verbose:
                         console.print(f"[yellow]⚠️ Validation error: {e}[/yellow]")
                     pentest_log.log_error(f"Validation error: {e}", exception=e)
                     validated_findings = all_findings
+                    info_findings_skipped = 0
                     progress.update(task_validate, completed=100)
+                    # Try to close pipeline even on error
+                    try:
+                        await pipeline.close()
+                    except Exception:
+                        pass
             else:
                 validated_findings = all_findings
+                info_findings_skipped = 0
                 if not all_findings:
                     pentest_log.log_info("No findings to validate")
                 elif not PHANTOM_AVAILABLE:
@@ -889,36 +1114,149 @@ async def _run_phantom_scan(
             ]
 
             # =================================================================
-            # PHASE 7: Vulnerability Chaining
+            # PHASE 7: Vulnerability Chaining (Enhanced with Speculative Chains)
             # =================================================================
-            if validated_findings and not no_chain and PHANTOM_AVAILABLE:
+            chains = []
+            if not no_chain and PHANTOM_AVAILABLE:
                 task_chain = progress.add_task("[cyan]Analyzing vulnerability chains...", total=100)
                 pentest_log.log_phase_start("chaining", "Analyzing vulnerability chains for attack paths")
                 chain_start_time = datetime.now()
 
                 try:
-                    from ai_engine.chain_detector import ChainDetector
+                    # Part 1: Confirmed vulnerability chains (if we have findings)
+                    if validated_findings:
+                        from ai_engine.chain_detector import ChainDetector
 
-                    chain_detector = ChainDetector(settings)
-                    # Convert findings to dicts if they're objects
-                    findings_dicts = [
-                        f.to_dict() if hasattr(f, "to_dict") else f
-                        for f in validated_findings
-                    ]
-                    # Create assets dict for chain detection
-                    assets = {"target": target, "host": target}
-                    chains = await chain_detector.detect(findings_dicts, assets)
+                        chain_detector = ChainDetector(settings)
+                        # Convert findings to flat dicts with proper field names for chain detector
+                        findings_dicts = []
+                        for f in validated_findings:
+                            if hasattr(f, "to_dict"):
+                                d = f.to_dict()
+                                # ValidatedFinding.to_dict() nests under "finding" key
+                                inner = d.get("finding", d)
+                            else:
+                                inner = f
+
+                            # Get best name: title > name > derived from type
+                            name = inner.get("title") or inner.get("name") or ""
+                            if not name or name.lower() in ("unknown", "other", ""):
+                                # Derive name from vulnerability_type
+                                vtype = inner.get("vulnerability_type") or inner.get("type") or ""
+                                if vtype and vtype.lower() not in ("other", "unknown"):
+                                    type_names = {
+                                        "sqli": "SQL Injection", "xss": "XSS",
+                                        "cmdi": "Command Injection", "lfi": "LFI",
+                                        "ssrf": "SSRF", "xxe": "XXE", "ssti": "SSTI",
+                                        "crlf": "CRLF Injection", "idor": "IDOR",
+                                        "csrf": "CSRF", "jwt": "JWT Vulnerability",
+                                        "open_redirect": "Open Redirect",
+                                        "info_disclosure": "Information Disclosure",
+                                        "authentication": "Authentication Issue",
+                                        "authorization": "Authorization Issue",
+                                    }
+                                    name = type_names.get(vtype.lower(), vtype.upper() if len(vtype) <= 5 else vtype.title())
+                                else:
+                                    # Try module name
+                                    module = inner.get("module_name") or inner.get("module") or ""
+                                    module_names = {
+                                        "sqli_scanner": "SQL Injection",
+                                        "xss_scanner": "XSS",
+                                        "crlf_scanner": "CRLF Injection",
+                                        "dir_scanner": "Sensitive File Exposure",
+                                        "jwt_scanner": "JWT Vulnerability",
+                                    }
+                                    name = module_names.get(module, "Vulnerability")
+
+                            # Map fields for chain detector
+                            findings_dicts.append({
+                                "id": inner.get("id", ""),
+                                "name": name,
+                                "type": inner.get("vulnerability_type") or inner.get("type", "other"),
+                                "severity": inner.get("severity", "MEDIUM"),
+                                "url": inner.get("url", ""),
+                                "matched_at": inner.get("url", inner.get("matched_at", "")),
+                                "evidence": inner.get("evidence", []),
+                                "host": domain,
+                            })
+                        # Create assets dict for chain detection
+                        assets = {"target": target, "host": target}
+                        confirmed_chains = await chain_detector.detect(findings_dicts, assets)
+                        chains.extend(confirmed_chains or [])
+
+                    # Part 2: Speculative chains based on detected technologies
+                    # Even without confirmed vulns, suggest high-value attack paths
+                    detected_techs = scan_state.get("technologies", [])
+                    if detected_techs or "api" in target.lower():
+                        try:
+                            from scanning.vuln_chain_engine import VulnerabilityChainEngine, is_speculative_allowed
+
+                            if is_speculative_allowed():
+                                chain_engine = VulnerabilityChainEngine()
+                                tech_names = [t.get("name", str(t)) if isinstance(t, dict) else str(t)
+                                              for t in detected_techs]
+                                speculative_chains = await chain_engine.generate_speculative_chains(
+                                    tech_names, target
+                                )
+                                if speculative_chains:
+                                    chains.extend(speculative_chains)
+                                    console.print(f"[cyan]💡 Generated {len(speculative_chains)} technology-based attack path suggestions[/cyan]")
+                        except ImportError:
+                            pass  # Chain engine not available
+                        except Exception as spec_err:
+                            if verbose:
+                                console.print(f"[dim]Speculative chain generation: {spec_err}[/dim]")
 
                     chain_duration = (datetime.now() - chain_start_time).total_seconds()
 
+                    # Validate and deduplicate chains to remove false positives and duplicates
                     if chains:
-                        console.print(f"[green]✓ Discovered {len(chains)} attack chains[/green]")
-                        for chain in chains[:3]:
-                            chain_str = " → ".join([v.get("type", "?") for v in chain.get("vulnerabilities", [])])
-                            console.print(f"   [yellow]Chain:[/yellow] {chain_str}")
+                        try:
+                            from scanning.vuln_chain_engine import VulnerabilityChainEngine
+                            chain_validator = VulnerabilityChainEngine()
+
+                            # Build target context for validation
+                            target_context = {
+                                "technologies": scan_state.get("technologies", []),
+                                "is_cloud_hosted": any(
+                                    t.get("name", "").lower() in ["aws", "gcp", "azure", "cloudfront", "cloudflare"]
+                                    for t in scan_state.get("technologies", [])
+                                    if isinstance(t, dict)
+                                ),
+                                "has_internal_endpoints": scan_state.get("has_internal_endpoints", False),
+                            }
+
+                            original_count = len(chains)
+                            chains = chain_validator.validate_and_deduplicate_chains(chains, target_context)
+
+                            if len(chains) < original_count:
+                                removed = original_count - len(chains)
+                                console.print(f"[dim]   Chain cleanup: removed {removed} duplicates/invalid chains[/dim]")
+                                pentest_log.log_info(f"Chain cleanup: {original_count} → {len(chains)} (removed {removed})")
+
+                        except Exception as chain_val_err:
+                            if verbose:
+                                console.print(f"[dim]Chain validation: {chain_val_err}[/dim]")
+
+                    if chains:
+                        confirmed_count = len([c for c in chains if not c.get("metadata", {}).get("is_speculative")])
+                        speculative_count = len([c for c in chains if c.get("metadata", {}).get("is_speculative")])
+
+                        if confirmed_count > 0:
+                            console.print(f"[green]✓ Discovered {confirmed_count} confirmed attack chains[/green]")
+                        if speculative_count > 0:
+                            console.print(f"[cyan]💡 {speculative_count} speculative attack paths (based on tech stack)[/cyan]")
+
+                        for chain in chains[:5]:
+                            chain_name = chain.get("name", "Unknown Chain")
+                            is_spec = chain.get("metadata", {}).get("is_speculative", False)
+                            marker = "[dim](speculative)[/dim]" if is_spec else ""
+                            console.print(f"   [yellow]•[/yellow] {chain_name} {marker}")
 
                         pentest_log.log_phase_end("chaining", chain_duration, {
                             "chains_discovered": len(chains),
+                            "confirmed_chains": confirmed_count,
+                            "speculative_chains": speculative_count,
                         })
                     else:
                         pentest_log.log_phase_end("chaining", chain_duration, {
@@ -935,9 +1273,7 @@ async def _run_phantom_scan(
 
                 progress.update(task_chain, completed=100)
             else:
-                if not validated_findings:
-                    pentest_log.log_info("No findings for chain analysis")
-                elif no_chain:
+                if no_chain:
                     pentest_log.log_info("Chain analysis disabled by user")
 
             scan_state["phase"] = "reporting"
@@ -1010,8 +1346,48 @@ async def _run_phantom_scan(
         console.print("\n[bold]🔗 Attack Chains:[/bold]")
         for i, chain in enumerate(chains[:3], 1):
             chain_vulns = chain.get("vulnerabilities", [])
-            chain_str = " → ".join([v.get("type", "?") for v in chain_vulns])
-            impact = chain.get("impact", "Unknown")
+            # Use name or title for each vuln, fallback to chain name if no vulns
+            if chain_vulns:
+                vuln_names = []
+                for v in chain_vulns:
+                    name = None
+                    if isinstance(v, dict):
+                        # Priority order: title > name > type (if meaningful)
+                        name = v.get("title") or v.get("name")
+                        if not name or name.lower() in ("unknown", "other", ""):
+                            vtype = v.get("type") or v.get("vulnerability_type")
+                            if vtype and vtype.lower() not in ("unknown", "other", ""):
+                                # Convert type to readable name
+                                type_display = {
+                                    "sqli": "SQL Injection", "xss": "XSS",
+                                    "cmdi": "Command Injection", "lfi": "LFI",
+                                    "ssrf": "SSRF", "xxe": "XXE", "ssti": "SSTI",
+                                    "crlf": "CRLF Injection", "idor": "IDOR",
+                                    "csrf": "CSRF", "jwt": "JWT Issue",
+                                }.get(vtype.lower(), vtype.upper() if len(vtype) <= 5 else vtype.title())
+                                name = type_display
+                            else:
+                                # Try to extract from finding_id or other fields
+                                name = v.get("description", "").split(".")[0][:30] if v.get("description") else None
+                        # Final cleanup
+                        if not name or name.lower() in ("unknown", "other", ""):
+                            name = "Vulnerability"
+                    elif isinstance(v, str):
+                        name = v if v.lower() not in ("unknown", "other", "") else "Vulnerability"
+                    else:
+                        name = str(v) if v else "Vulnerability"
+                    vuln_names.append(name)
+                # Filter out duplicate consecutive names
+                deduped = [vuln_names[0]] if vuln_names else []
+                for n in vuln_names[1:]:
+                    if n != deduped[-1]:
+                        deduped.append(n)
+                chain_str = " → ".join(deduped) if deduped else chain.get("name", "Unknown Chain")
+            else:
+                chain_str = chain.get("name", "Unknown Chain")
+            impact = chain.get("impact", chain.get("description", ""))
+            if not impact or impact.lower() == "unknown":
+                impact = chain.get("attack_narrative", "Potential security impact")
             console.print(f"  [yellow]{i}. {chain_str}[/yellow]")
             console.print(f"     Impact: {impact}")
 
@@ -1034,7 +1410,10 @@ async def _run_phantom_scan(
         "config": scan_state["config"],
         "summary": summary,
         "findings": [
-            f.to_dict() if hasattr(f, "to_dict") else f
+            # ValidatedFinding.to_dict() returns nested {"finding": {...}, "is_valid": ...}
+            # The HTML report expects flat {"type": ..., "severity": ...}
+            # Extract and flatten the raw finding data for the report
+            _flatten_validated_finding(f) if hasattr(f, "to_dict") else f
             for f in validated_findings
         ],
         "chains": chains,
@@ -1089,23 +1468,62 @@ async def _run_phantom_scan(
 
     # Log findings to pentest log
     for finding in validated_findings:
+        # Extract raw finding data (ValidatedFinding wraps raw_finding)
+        raw = finding
+        if hasattr(finding, "raw_finding"):
+            raw = finding.raw_finding
+
+        # Get fields from raw finding or dict
+        if hasattr(raw, "parameter"):
+            param = raw.parameter
+        elif isinstance(raw, dict):
+            param = raw.get("parameter")
+        else:
+            param = None
+
+        if hasattr(raw, "payload"):
+            payload = raw.payload
+        elif isinstance(raw, dict):
+            payload = raw.get("payload")
+        else:
+            payload = None
+
+        if hasattr(raw, "evidence"):
+            evidence = raw.evidence
+        elif isinstance(raw, dict):
+            evidence = raw.get("evidence")
+        else:
+            evidence = None
+
+        if hasattr(raw, "module_name"):
+            module = raw.module_name
+        elif isinstance(raw, dict):
+            module = raw.get("module_name") or raw.get("module")
+        else:
+            module = None
+
         pentest_log.log_finding(
             vulnerability_type=_get_type(finding),
             severity=_get_severity(finding),
             url=_get_url(finding),
             confidence=_get_confidence(finding),
-            parameter=finding.get("parameter") if isinstance(finding, dict) else getattr(finding, "parameter", None),
-            payload=finding.get("payload") if isinstance(finding, dict) else getattr(finding, "payload", None),
-            evidence=finding.get("evidence") if isinstance(finding, dict) else getattr(finding, "evidence", None),
-            module=finding.get("module") if isinstance(finding, dict) else getattr(finding, "module", None),
+            parameter=param,
+            payload=payload,
+            evidence=evidence,
+            module=module,
         )
 
     # Log chains to pentest log
     for i, chain in enumerate(chains):
+        chain_vulns = chain.get("vulnerabilities", [])
+        if chain_vulns:
+            vuln_names = [_get_vuln_display_name(v) for v in chain_vulns]
+        else:
+            vuln_names = [chain.get("name", "Unknown Chain")]
         pentest_log.log_chain(
             chain_id=f"chain_{i+1}",
-            vulnerabilities=[v.get("type", "?") for v in chain.get("vulnerabilities", [])],
-            impact=chain.get("impact", "Unknown"),
+            vulnerabilities=vuln_names,
+            impact=chain.get("impact", "Potential security impact"),
             severity=chain.get("severity", "MEDIUM"),
         )
 
@@ -1140,6 +1558,65 @@ async def _run_phantom_scan(
     ))
 
 
+def _flatten_validated_finding(validated_finding) -> dict:
+    """
+    Flatten a ValidatedFinding to a dict suitable for report generation.
+
+    ValidatedFinding.to_dict() returns:
+        {"finding": {...}, "is_valid": ..., "final_confidence": ...}
+
+    Report generators expect:
+        {"type": ..., "severity": ..., "url": ..., "description": ...}
+
+    This function extracts the nested finding and adds validation metadata.
+    """
+    if hasattr(validated_finding, "raw_finding"):
+        # It's a ValidatedFinding object - extract from raw_finding
+        raw = validated_finding.raw_finding
+        result = {
+            "type": raw.vulnerability_type.value if hasattr(raw.vulnerability_type, "value") else str(raw.vulnerability_type),
+            "name": raw.title,
+            "title": raw.title,
+            "severity": raw.severity.upper() if isinstance(raw.severity, str) else str(raw.severity),
+            "url": raw.url,
+            "matched_at": raw.url,
+            "parameter": raw.parameter,
+            "payload": raw.payload,
+            "evidence": raw.evidence,
+            "description": raw.description or raw.evidence or f"{raw.title} detected at {raw.url}",
+            "module": raw.module_name,
+            "confidence": validated_finding.final_confidence,
+            "is_valid": validated_finding.is_valid,
+            "validation_confidence": validated_finding.final_confidence,
+        }
+        return result
+    elif hasattr(validated_finding, "to_dict"):
+        # Has to_dict but not raw_finding - might be dict-like
+        d = validated_finding.to_dict()
+        # Check if it's nested format from ValidatedFinding
+        if "finding" in d and isinstance(d["finding"], dict):
+            inner = d["finding"]
+            return {
+                "type": inner.get("vulnerability_type", inner.get("type", "unknown")),
+                "name": inner.get("title", inner.get("name", "Unknown")),
+                "title": inner.get("title", inner.get("name", "Unknown")),
+                "severity": inner.get("severity", "MEDIUM"),
+                "url": inner.get("url", "N/A"),
+                "matched_at": inner.get("url", "N/A"),
+                "parameter": inner.get("parameter"),
+                "payload": inner.get("payload"),
+                "evidence": inner.get("evidence", ""),
+                "description": inner.get("description") or inner.get("evidence") or "No description available.",
+                "module": inner.get("module_name"),
+                "confidence": d.get("final_confidence", 0.5),
+                "is_valid": d.get("is_valid", True),
+            }
+        return d
+    else:
+        # Already a dict
+        return validated_finding
+
+
 def _get_severity(finding) -> str:
     """Get severity from finding."""
     # ValidatedFinding wraps the raw finding
@@ -1153,18 +1630,80 @@ def _get_severity(finding) -> str:
 
 
 def _get_type(finding) -> str:
-    """Get vulnerability type from finding."""
+    """Get vulnerability type/name from finding for display."""
     # ValidatedFinding wraps the raw finding
+    raw = finding
     if hasattr(finding, "raw_finding"):
-        finding = finding.raw_finding
-    if hasattr(finding, "vulnerability_type"):
-        vt = finding.vulnerability_type
-        return vt.value if hasattr(vt, "value") else str(vt)
-    elif hasattr(finding, "title"):
-        return finding.title
-    elif isinstance(finding, dict):
-        return finding.get("title", finding.get("type", finding.get("name", "Unknown")))
-    return "Unknown"
+        raw = finding.raw_finding
+
+    # Priority 1: title field (human-readable name)
+    if hasattr(raw, "title") and raw.title:
+        title = raw.title
+        if title.lower() not in ("unknown", "other", "vulnerability"):
+            return title
+
+    # Priority 2: name field
+    if hasattr(raw, "name") and raw.name:
+        name = raw.name
+        if name.lower() not in ("unknown", "other", "vulnerability"):
+            return name
+
+    # Priority 3: vulnerability_type enum (if meaningful)
+    if hasattr(raw, "vulnerability_type"):
+        vt = raw.vulnerability_type
+        vt_value = vt.value if hasattr(vt, "value") else str(vt)
+        if vt_value.lower() not in ("other", "unknown"):
+            # Convert to readable format: "sqli" -> "SQL Injection"
+            type_display_names = {
+                "sqli": "SQL Injection",
+                "xss": "XSS",
+                "cmdi": "Command Injection",
+                "lfi": "LFI",
+                "ssrf": "SSRF",
+                "xxe": "XXE",
+                "ssti": "SSTI",
+                "nosql": "NoSQL Injection",
+                "crlf": "CRLF Injection",
+                "idor": "IDOR",
+                "open_redirect": "Open Redirect",
+                "csrf": "CSRF",
+                "jwt": "JWT Vulnerability",
+                "info_disclosure": "Information Disclosure",
+                "authentication": "Authentication Issue",
+                "authorization": "Authorization Issue",
+            }
+            return type_display_names.get(vt_value.lower(), vt_value.upper())
+
+    # For dict-based findings
+    if isinstance(raw, dict):
+        # Try title first
+        title = raw.get("title")
+        if title and title.lower() not in ("unknown", "other"):
+            return title
+        # Try name
+        name = raw.get("name")
+        if name and name.lower() not in ("unknown", "other"):
+            return name
+        # Try vulnerability_type
+        vt = raw.get("vulnerability_type") or raw.get("type")
+        if vt and vt.lower() not in ("unknown", "other"):
+            return vt.upper() if len(vt) <= 5 else vt.title()
+        # Try module_name to infer type
+        module = raw.get("module_name") or raw.get("module")
+        if module:
+            module_type_map = {
+                "sqli_scanner": "SQL Injection",
+                "xss_scanner": "XSS",
+                "crlf_scanner": "CRLF Injection",
+                "dir_scanner": "Sensitive File",
+                "jwt_scanner": "JWT Vulnerability",
+                "ssrf_scanner": "SSRF",
+                "ssti_scanner": "SSTI",
+            }
+            if module in module_type_map:
+                return module_type_map[module]
+
+    return "Vulnerability"
 
 
 def _get_url(finding) -> str:
@@ -1189,6 +1728,59 @@ def _get_confidence(finding) -> float:
     elif isinstance(finding, dict):
         return finding.get("final_confidence", finding.get("confidence", 0.0))
     return 0.0
+
+
+# Type display names mapping (reusable across functions)
+_TYPE_DISPLAY_NAMES = {
+    # Injection
+    "sqli": "SQL Injection", "xss": "XSS", "cmdi": "Command Injection",
+    "lfi": "LFI", "ssrf": "SSRF", "xxe": "XXE", "ssti": "SSTI",
+    "nosql": "NoSQL Injection", "crlf": "CRLF Injection",
+    "crlf_injection": "CRLF Injection", "idor": "IDOR",
+    # Access control
+    "open_redirect": "Open Redirect", "csrf": "CSRF", "cors": "CORS Misconfiguration",
+    # Auth
+    "jwt": "JWT Vulnerability", "authentication": "Auth Issue",
+    "authorization": "Authorization Issue",
+    # API
+    "api": "API Security Issue", "api_security": "API Security Issue",
+    "graphql": "GraphQL Issue",
+    # Files
+    "directory": "Directory Exposure", "sensitive_file": "Sensitive File Exposure",
+    "path_traversal": "Path Traversal",
+    # Code execution
+    "rce": "Remote Code Execution", "deserialization": "Insecure Deserialization",
+    # Info
+    "info_disclosure": "Information Disclosure", "information_disclosure": "Information Disclosure",
+    # Other
+    "misconfiguration": "Security Misconfiguration", "rate_limit": "Rate Limit Issue",
+}
+
+
+def _get_vuln_display_name(v) -> str:
+    """Get display name for a vulnerability in a chain."""
+    if isinstance(v, str):
+        return v if v.lower() not in ("unknown", "other", "") else "Vulnerability"
+
+    if not isinstance(v, dict):
+        return str(v) if v else "Vulnerability"
+
+    # Priority: title > name > type (if meaningful)
+    name = v.get("title") or v.get("name")
+    if name and name.lower() not in ("unknown", "other", ""):
+        return name
+
+    # Try type
+    vtype = v.get("type") or v.get("vulnerability_type")
+    if vtype and vtype.lower() not in ("unknown", "other", ""):
+        return _TYPE_DISPLAY_NAMES.get(vtype.lower(), vtype.upper() if len(vtype) <= 5 else vtype.title())
+
+    # Try description
+    desc = v.get("description", "")
+    if desc and len(desc) > 5:
+        return desc.split(".")[0][:40]
+
+    return "Vulnerability"
 
 
 def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
@@ -1474,17 +2066,51 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
         for i, finding in enumerate(findings, 1):
             severity = finding.get("severity", "INFO").lower()
             vuln_type = finding.get("type", finding.get("name", "Unknown"))
+            title = finding.get("title", finding.get("name", vuln_type))
             url = finding.get("url", finding.get("matched_at", "N/A"))
             description = finding.get("description", "No description available.")
+            parameter = finding.get("parameter", "")
+            payload = finding.get("payload", "")
+            evidence = finding.get("evidence", "")
+            confidence = finding.get("confidence", finding.get("validation_confidence", 0))
+            module = finding.get("module", "")
+
+            # Build evidence section
+            evidence_html = f'<div class="finding-detail">📍 <strong>URL:</strong> {url}</div>'
+
+            if parameter:
+                evidence_html += f'<div class="finding-detail">🎯 <strong>Parameter:</strong> <code>{parameter}</code></div>'
+
+            if payload:
+                # Escape HTML in payload
+                safe_payload = str(payload).replace("<", "&lt;").replace(">", "&gt;")
+                evidence_html += f'<div class="finding-detail">💉 <strong>Payload:</strong> <code>{safe_payload[:200]}</code></div>'
+
+            if evidence:
+                # Handle evidence as string or list
+                if isinstance(evidence, list):
+                    evidence_str = "; ".join(str(e)[:100] for e in evidence[:3])
+                else:
+                    evidence_str = str(evidence)[:300]
+                safe_evidence = evidence_str.replace("<", "&lt;").replace(">", "&gt;")
+                evidence_html += f'<div class="finding-detail">🔍 <strong>Evidence:</strong> {safe_evidence}</div>'
+
+            if confidence:
+                conf_percent = confidence if isinstance(confidence, (int, float)) and confidence <= 1 else confidence / 100
+                conf_color = "#27ae60" if conf_percent >= 0.75 else "#f1c40f" if conf_percent >= 0.5 else "#e74c3c"
+                evidence_html += f'<div class="finding-detail">📊 <strong>Confidence:</strong> <span style="color: {conf_color}">{conf_percent:.0%}</span></div>'
+
+            if module:
+                evidence_html += f'<div class="finding-detail">🔧 <strong>Module:</strong> {module}</div>'
 
             html += f"""
             <div class="finding {severity}">
                 <div class="finding-header">
-                    <h3>{i}. {vuln_type}</h3>
+                    <h3>{i}. {title}</h3>
                     <span class="severity-tag {severity}">{severity.upper()}</span>
                 </div>
                 <p>{description}</p>
-                <div class="finding-detail">📍 {url}</div>
+                {evidence_html}
             </div>
 """
         html += "        </div>\n"
@@ -1497,15 +2123,49 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
 """
         for i, chain in enumerate(chains, 1):
             chain_vulns = chain.get("vulnerabilities", [])
-            chain_str = " → ".join([v.get("type", "?") for v in chain_vulns])
-            impact = chain.get("impact", "Unknown")
+            is_speculative = chain.get("metadata", {}).get("is_speculative", False)
 
-            html += f"""
-            <div class="chain">
-                <div class="chain-path">Chain {i}: {chain_str}</div>
-                <p>Impact: {impact}</p>
-            </div>
+            # Handle both formats: multi-vuln chains and single speculative chains
+            if chain_vulns:
+                chain_str = " → ".join([_get_vuln_display_name(v) for v in chain_vulns])
+            else:
+                # Single chain (speculative or simple) - use name directly
+                chain_str = chain.get("name", chain.get("type", "Attack Path"))
+
+            description = chain.get("description", "")
+            impact = chain.get("impact", chain.get("metadata", {}).get("bounty_range", ""))
+            severity = chain.get("severity", "INFO").lower()
+
+            # Build chain HTML
+            spec_badge = '<span style="background: #3498db; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; margin-left: 10px;">SPECULATIVE</span>' if is_speculative else ''
+
+            chain_html = f"""
+            <div class="chain" style="border-left-color: {'#3498db' if is_speculative else 'var(--accent-purple)'};">
+                <div class="chain-path">{chain_str}{spec_badge}</div>
 """
+            if description:
+                chain_html += f"                <p>{description}</p>\n"
+
+            if impact:
+                chain_html += f"                <p><strong>Impact/Bounty:</strong> {impact}</p>\n"
+
+            # Add recommended tests for speculative chains
+            recommended_tests = chain.get("metadata", {}).get("recommended_tests", [])
+            if recommended_tests:
+                chain_html += "                <div style='margin-top: 10px;'><strong>Recommended Tests:</strong><ul style='margin: 5px 0; padding-left: 20px;'>\n"
+                for test in recommended_tests[:5]:
+                    test_name = test.get("name", "Test")
+                    test_desc = test.get("description", "")
+                    bounty = test.get("bounty_potential", "")
+                    chain_html += f"                    <li><strong>{test_name}</strong>: {test_desc}"
+                    if bounty:
+                        chain_html += f" <em>({bounty})</em>"
+                    chain_html += "</li>\n"
+                chain_html += "                </ul></div>\n"
+
+            chain_html += "            </div>\n"
+            html += chain_html
+
         html += "        </div>\n"
 
     # Footer
@@ -1574,22 +2234,48 @@ def _generate_phantom_md_report(data: Dict[str, Any], path: Path) -> None:
     for i, finding in enumerate(findings, 1):
         severity = finding.get("severity", "INFO")
         vuln_type = finding.get("type", finding.get("name", "Unknown"))
+        title = finding.get("title", finding.get("name", vuln_type))
         url = finding.get("url", finding.get("matched_at", "N/A"))
         description = finding.get("description", "No description available.")
         cwe = finding.get("cwe", "N/A")
+        parameter = finding.get("parameter", "")
+        payload = finding.get("payload", "")
+        evidence = finding.get("evidence", "")
+        confidence = finding.get("confidence", finding.get("validation_confidence", 0))
+        module = finding.get("module", "")
 
-        md += f"""### {i}. [{severity}] {vuln_type}
+        md += f"""### {i}. [{severity}] {title}
 
-**Severity:** {severity}
-**CWE:** {cwe}
-**Location:** `{url}`
+| Field | Value |
+|-------|-------|
+| **Severity** | {severity} |
+| **CWE** | {cwe} |
+| **Location** | `{url}` |
+"""
+        if parameter:
+            md += f"| **Parameter** | `{parameter}` |\n"
+        if confidence:
+            conf_val = confidence if isinstance(confidence, (int, float)) and confidence <= 1 else confidence / 100
+            md += f"| **Confidence** | {conf_val:.0%} |\n"
+        if module:
+            md += f"| **Module** | {module} |\n"
 
+        md += f"""
 **Description:**
 {description}
 
----
-
 """
+        if payload:
+            md += f"**Payload:**\n```\n{payload[:500]}\n```\n\n"
+
+        if evidence:
+            if isinstance(evidence, list):
+                evidence_str = "\n- ".join(str(e)[:200] for e in evidence[:5])
+                md += f"**Evidence:**\n- {evidence_str}\n\n"
+            else:
+                md += f"**Evidence:**\n{str(evidence)[:500]}\n\n"
+
+        md += "---\n\n"
 
     if chains:
         md += """## Attack Chains
@@ -1597,17 +2283,42 @@ def _generate_phantom_md_report(data: Dict[str, Any], path: Path) -> None:
 """
         for i, chain in enumerate(chains, 1):
             chain_vulns = chain.get("vulnerabilities", [])
-            chain_str = " → ".join([v.get("type", "?") for v in chain_vulns])
-            impact = chain.get("impact", "Unknown")
+            is_speculative = chain.get("metadata", {}).get("is_speculative", False)
 
-            md += f"""### Chain {i}
+            # Handle both formats
+            if chain_vulns:
+                chain_str = " → ".join([_get_vuln_display_name(v) for v in chain_vulns])
+            else:
+                chain_str = chain.get("name", chain.get("type", "Attack Path"))
+
+            description = chain.get("description", "")
+            impact = chain.get("impact", chain.get("metadata", {}).get("bounty_range", "Security Impact"))
+            spec_marker = " *(Speculative)*" if is_speculative else ""
+
+            md += f"""### Chain {i}{spec_marker}
 
 **Path:** {chain_str}
-**Impact:** {impact}
-
----
+**Impact/Bounty:** {impact}
 
 """
+            if description:
+                md += f"{description}\n\n"
+
+            # Add recommended tests for speculative chains
+            recommended_tests = chain.get("metadata", {}).get("recommended_tests", [])
+            if recommended_tests:
+                md += "**Recommended Tests:**\n"
+                for test in recommended_tests[:5]:
+                    test_name = test.get("name", "Test")
+                    test_desc = test.get("description", "")
+                    bounty = test.get("bounty_potential", "")
+                    md += f"- **{test_name}**: {test_desc}"
+                    if bounty:
+                        md += f" *({bounty})*"
+                    md += "\n"
+                md += "\n"
+
+            md += "---\n\n"
 
     md += f"""
 ## Appendix
@@ -1663,7 +2374,7 @@ def quick(ctx: click.Context, target: str, output: Optional[str], output_format:
         border_style="cyan",
     ))
 
-    asyncio.run(_run_phantom_scan(
+    safe_asyncio_run(_run_phantom_scan(
         target=target,
         output_dir=output,
         output_format=output_format,
@@ -1728,7 +2439,7 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
         border_style="green",
     ))
 
-    asyncio.run(_run_phantom_scan(
+    safe_asyncio_run(_run_phantom_scan(
         target=target,
         output_dir=output,
         output_format=output_format,
@@ -1766,11 +2477,14 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
 @click.option("--program-tier",
               type=click.Choice(["entry", "standard", "premium", "enterprise", "top_tier"]),
               default="standard", help="Program tier for bounty estimation")
-@click.option("--rate", "-r", type=float, default=1.0, help="Requests per second (conservative)")
+@click.option("--rate", "-r", type=float, default=3.0, help="Requests per second (safe for most programs)")
 @click.option("--estimate/--no-estimate", default=True, help="Show bounty estimates")
+@click.option("--header", "-H", multiple=True, help="Custom header (e.g., 'X-Bug-Bounty: username-twilio')")
+@click.option("--username", "-u", help="Bug bounty username (auto-generates X-Bug-Bounty header)")
 @click.pass_context
 def bounty(ctx: click.Context, target: str, output: Optional[str], output_format: str,
-           platform: str, program_tier: str, rate: float, estimate: bool):
+           platform: str, program_tier: str, rate: float, estimate: bool,
+           header: tuple, username: Optional[str]):
     """
     Bug bounty optimized PHANTOM AI scan.
 
@@ -1790,6 +2504,8 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
     Examples:
         phantom bounty https://api.target.com --platform hackerone
         phantom bounty target.com --program-tier premium --estimate
+        phantom bounty https://api.twilio.com -u myusername --platform hackerone
+        phantom bounty https://target.com -H "X-Bug-Bounty: user-twilio"
     """
     if not ctx.obj.get("no_banner"):
         print_banner()
@@ -1811,7 +2527,55 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
         border_style="yellow",
     ))
 
-    asyncio.run(_run_bounty_scan(
+    # Build custom headers dict
+    custom_headers: Dict[str, str] = {}
+
+    # Parse -H headers (format: "Header-Name: value")
+    for h in header:
+        if ":" in h:
+            key, value = h.split(":", 1)
+            custom_headers[key.strip()] = value.strip()
+
+    # Auto-generate X-Bug-Bounty header from username
+    if username:
+        # Platform-specific header formats
+        if platform == "hackerone":
+            custom_headers["X-Bug-Bounty"] = f"{username}-hackerone"
+        elif platform == "bugcrowd":
+            custom_headers["X-Bug-Bounty"] = f"{username}-bugcrowd"
+        elif platform == "intigriti":
+            custom_headers["X-Bug-Bounty"] = f"{username}-intigriti"
+        else:
+            custom_headers["X-Bug-Bounty"] = username
+
+    # Display headers if set
+    if custom_headers:
+        headers_display = "\n".join([f"  • {k}: {v}" for k, v in custom_headers.items()])
+        console.print(Panel(
+            f"[bold cyan]📋 Custom Headers Configured[/bold cyan]\n\n{headers_display}",
+            title="Request Headers",
+            border_style="cyan",
+        ))
+
+    # HACKERONE/BUGCROWD COMPLIANCE NOTICE
+    console.print(Panel(
+        "[bold green]✅ BUG BOUNTY COMPLIANCE ACTIVE[/bold green]\n\n"
+        "[cyan]Safety Guarantees:[/cyan]\n"
+        "  • 🛡️ SAFE MODE enforced (no state modifications)\n"
+        "  • 🚫 Destructive payloads blocked at HTTP layer\n"
+        "  • 📊 Evidence-only vulnerability detection\n"
+        "  • ⏱️ Conservative rate limiting (respects targets)\n"
+        "  • 📝 Audit trail of all blocked operations\n\n"
+        "[cyan]HackerOne Platform Standards Compliance:[/cyan]\n"
+        "  • No data modification/deletion\n"
+        "  • No DoS or service disruption\n"
+        "  • IDOR testing with AC:H (unpredictable IDs)\n"
+        "  • Responsible disclosure workflow",
+        title="🏆 Platform Compliance",
+        border_style="green",
+    ))
+
+    safe_asyncio_run(_run_bounty_scan(
         target=target,
         output_dir=output,
         output_format=output_format,
@@ -1820,6 +2584,7 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
         rate=rate,
         estimate=estimate,
         verbose=ctx.obj.get("verbose", False),
+        custom_headers=custom_headers,
     ))
 
 
@@ -1832,6 +2597,7 @@ async def _run_bounty_scan(
     rate: float,
     estimate: bool,
     verbose: bool,
+    custom_headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Execute bounty-optimized scan."""
 
@@ -1852,6 +2618,7 @@ async def _run_bounty_scan(
         no_chain=False,
         no_ai=False,
         no_auth=False,
+        custom_headers=custom_headers,
         timeout=None,
         scan_mode=ScanMode.BOUNTY if PHANTOM_AVAILABLE else "bounty",
         verbose=verbose,
@@ -1861,25 +2628,12 @@ async def _run_bounty_scan(
     if estimate and PHANTOM_AVAILABLE:
         console.print("\n[bold yellow]💰 Bounty Estimation:[/bold yellow]")
 
-        platform_enum = {
-            "hackerone": BountyPlatform.HACKERONE,
-            "bugcrowd": BountyPlatform.BUGCROWD,
-            "intigriti": BountyPlatform.INTIGRITI,
-            "other": BountyPlatform.OTHER,
-        }.get(platform, BountyPlatform.OTHER)
-
-        tier_enum = {
-            "entry": ProgramTier.ENTRY,
-            "standard": ProgramTier.STANDARD,
-            "premium": ProgramTier.PREMIUM,
-            "enterprise": ProgramTier.ENTERPRISE,
-            "top_tier": ProgramTier.TOP_TIER,
-        }.get(program_tier, ProgramTier.STANDARD)
-
+        # create_program_config expects strings, not enums
+        # It converts internally: BountyPlatform(platform.lower()), ProgramTier[tier.upper()]
         config = create_program_config(
-            platform=platform_enum,
-            tier=tier_enum,
-            program_name=get_domain(target),
+            name=get_domain(target),
+            platform=platform,  # string: "hackerone", "bugcrowd", etc.
+            tier=program_tier,  # string: "standard", "premium", etc.
         )
 
         estimator = BountyEstimator(config)
@@ -1955,7 +2709,7 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
             border_style="red",
         ))
 
-    asyncio.run(_run_phantom_scan(
+    safe_asyncio_run(_run_phantom_scan(
         target=target,
         output_dir=output,
         output_format=output_format,
@@ -2019,7 +2773,7 @@ def recon(ctx: click.Context, target: str, output: Optional[str],
         border_style="blue",
     ))
 
-    asyncio.run(_run_recon(
+    safe_asyncio_run(_run_recon(
         target=target,
         output=output,
         subdomains=subdomains,
@@ -2165,7 +2919,7 @@ def waf_detect(ctx: click.Context, target: str, bypass: bool):
         console.print("[red]❌ PHANTOM AI modules not available[/red]")
         return
 
-    asyncio.run(_detect_waf(target, bypass, ctx.obj.get("verbose", False)))
+    safe_asyncio_run(_detect_waf(target, bypass, ctx.obj.get("verbose", False)))
 
 
 async def _detect_waf(target: str, show_bypass: bool, verbose: bool) -> None:
@@ -2431,7 +3185,7 @@ def resume(ctx: click.Context, scan_id: str):
     # Resume the scan
     config = state.get("config", {})
 
-    asyncio.run(_run_phantom_scan(
+    safe_asyncio_run(_run_phantom_scan(
         target=state.get("target"),
         output_dir=None,
         output_format="html",
@@ -2632,7 +3386,7 @@ def chain(ctx: click.Context, scan_id: str, output: Optional[str], output_format
 
     console.print(f"[cyan]🔗 Analyzing vulnerability chains for {len(findings)} findings...[/cyan]")
 
-    asyncio.run(_analyze_chains(
+    safe_asyncio_run(_analyze_chains(
         findings=findings,
         target=state.get("target", ""),
         output=output,
@@ -2676,17 +3430,42 @@ async def _analyze_chains(
         # Display chains
         for i, chain in enumerate(chains, 1):
             chain_vulns = chain.get("vulnerabilities", [])
-            chain_str = " → ".join([v.get("type", "?") for v in chain_vulns])
-            impact = chain.get("impact", "Unknown")
-            priority = chain.get("priority", 0)
+            is_speculative = chain.get("metadata", {}).get("is_speculative", False)
 
-            priority_color = "red" if priority >= 8 else "orange1" if priority >= 5 else "yellow"
+            # Handle both formats: multi-vuln chains and single speculative chains
+            if chain_vulns:
+                chain_str = " → ".join([_get_vuln_display_name(v) for v in chain_vulns])
+            else:
+                chain_str = chain.get("name", chain.get("type", "Attack Path"))
+
+            description = chain.get("description", "")
+            impact = chain.get("impact", chain.get("metadata", {}).get("bounty_range", "Security Impact"))
+            priority = chain.get("priority", 5 if is_speculative else 0)
+
+            priority_color = "cyan" if is_speculative else ("red" if priority >= 8 else "orange1" if priority >= 5 else "yellow")
+            spec_marker = " (Speculative)" if is_speculative else ""
+
+            panel_content = f"[bold]Chain {i}{spec_marker}[/bold]\n\n"
+            panel_content += f"[{priority_color}]Path: {chain_str}[/{priority_color}]\n"
+            if description:
+                panel_content += f"\n{description[:200]}\n"
+            panel_content += f"\nImpact/Bounty: {impact}\n"
+            panel_content += f"Priority: {priority}/10"
+
+            # Add recommended tests for speculative chains
+            recommended_tests = chain.get("metadata", {}).get("recommended_tests", [])
+            if recommended_tests:
+                panel_content += "\n\n[bold]Recommended Tests:[/bold]\n"
+                for test in recommended_tests[:3]:
+                    test_name = test.get("name", "Test")
+                    bounty = test.get("bounty_potential", "")
+                    panel_content += f"  • {test_name}"
+                    if bounty:
+                        panel_content += f" ({bounty})"
+                    panel_content += "\n"
 
             console.print(Panel(
-                f"[bold]Chain {i}[/bold]\n\n"
-                f"[{priority_color}]Path: {chain_str}[/{priority_color}]\n"
-                f"Impact: {impact}\n"
-                f"Priority: {priority}/10",
+                panel_content,
                 title=f"🔗 Attack Chain",
                 border_style=priority_color,
             ))
@@ -2831,7 +3610,7 @@ def report(ctx: click.Context, scan_id: str, output: Optional[str], output_forma
     # Add bounty estimates if requested
     if bounty and PHANTOM_AVAILABLE:
         config = create_program_config(
-            platform=BountyPlatform.OTHER,
+            platform=BountyPlatform.CUSTOM,
             tier=ProgramTier.STANDARD,
             program_name=state.get("domain", ""),
         )
@@ -3325,11 +4104,462 @@ def update_kb(ctx: click.Context, source: str):
 
 
 # =============================================================================
+# GDPR COMPLIANCE COMMANDS
+# =============================================================================
+
+@cli.group()
+@click.pass_context
+def gdpr(ctx: click.Context):
+    """
+    GDPR compliance management commands.
+
+    Manage data protection, subject rights, and compliance reporting.
+
+    \b
+    Commands:
+        status    Show GDPR compliance status
+        cleanup   Run data retention cleanup
+        access    Process data access request (Art. 15)
+        erasure   Process data erasure request (Art. 17)
+        export    Export data for portability (Art. 20)
+        inventory Show data inventory
+        report    Generate Art. 30 processing records report
+
+    \b
+    Examples:
+        phantom gdpr status
+        phantom gdpr cleanup
+        phantom gdpr access --email user@example.com
+        phantom gdpr erasure --email user@example.com --confirm
+    """
+    pass
+
+
+@gdpr.command("status")
+@click.pass_context
+def gdpr_status(ctx: click.Context):
+    """
+    Show GDPR compliance status.
+
+    Displays current configuration, data inventory, and compliance status
+    for each GDPR article requirement.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]🔒 GDPR Compliance Status[/bold cyan]\n")
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+        report = engine.generate_compliance_report()
+
+        # Configuration table
+        config_table = Table(title="📋 Configuration", show_header=True)
+        config_table.add_column("Setting", style="cyan")
+        config_table.add_column("Value", style="green")
+
+        config = report["configuration"]
+        config_table.add_row("PII Anonymization", "✅ Enabled" if config["pii_anonymization"] else "❌ Disabled")
+        config_table.add_row("Auto Cleanup", "✅ Enabled" if config["auto_cleanup"] else "❌ Disabled")
+        config_table.add_row("Scan Data Retention", f"{config['scan_retention_days']} days")
+        config_table.add_row("Log Retention", f"{config['log_retention_days']} days")
+
+        console.print(config_table)
+
+        # Data inventory table
+        console.print("\n")
+        inventory_table = Table(title="📦 Data Inventory", show_header=True)
+        inventory_table.add_column("Category", style="cyan")
+        inventory_table.add_column("Files", style="white", justify="right")
+        inventory_table.add_column("Size (MB)", style="white", justify="right")
+        inventory_table.add_column("Oldest", style="dim")
+
+        inventory = report["data_inventory"]["categories"]
+        for category, data in inventory.items():
+            inventory_table.add_row(
+                category.replace("_", " ").title(),
+                str(data["file_count"]),
+                f"{data['total_size_mb']:.2f}",
+                data["oldest"][:10] if data["oldest"] else "N/A"
+            )
+
+        console.print(inventory_table)
+
+        # Compliance status table
+        console.print("\n")
+        compliance_table = Table(title="✅ Compliance Status", show_header=True)
+        compliance_table.add_column("GDPR Article", style="cyan")
+        compliance_table.add_column("Status", style="green")
+
+        status = report["compliance_status"]
+        for article, state in status.items():
+            article_name = article.replace("_", " ").replace("art ", "Art. ")
+            status_icon = "✅" if state == "Implemented" else "⚠️"
+            compliance_table.add_row(article_name, f"{status_icon} {state}")
+
+        console.print(compliance_table)
+
+        # Anonymization stats
+        stats = report["anonymization_stats"]
+        if any(v > 0 for v in stats.values()):
+            console.print("\n[dim]📊 PII Anonymization Stats (session):[/dim]")
+            for pii_type, count in stats.items():
+                if count > 0:
+                    console.print(f"   {pii_type}: {count} redacted")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("cleanup")
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting")
+@click.pass_context
+def gdpr_cleanup(ctx: click.Context, dry_run: bool):
+    """
+    Run data retention cleanup.
+
+    Deletes data older than the configured retention period.
+    Use --dry-run to preview what would be deleted.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]🧹 GDPR Data Retention Cleanup[/bold cyan]\n")
+
+    if dry_run:
+        console.print("[yellow]DRY RUN - No data will be deleted[/yellow]\n")
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine, GDPRConfig
+
+        # For dry run, show inventory instead
+        engine = get_gdpr_engine()
+
+        if dry_run:
+            inventory = engine.get_data_inventory()
+            console.print("[bold]Data that may be subject to cleanup:[/bold]\n")
+
+            for category, data in inventory["categories"].items():
+                if data["file_count"] > 0:
+                    console.print(f"  📁 {category}: {data['file_count']} files, {data['total_size_mb']:.2f} MB")
+                    if data["oldest"]:
+                        console.print(f"     Oldest: {data['oldest'][:10]}")
+        else:
+            with console.status("[cyan]Running cleanup...[/cyan]"):
+                report = engine.run_cleanup()
+
+            console.print("[green]✅ Cleanup completed[/green]\n")
+            console.print(f"   Scan data deleted: {report['scan_data_deleted']} files")
+            console.print(f"   Log files deleted: {report['log_files_deleted']} files")
+            console.print(f"   Space freed: {report['bytes_freed'] / 1024 / 1024:.2f} MB")
+
+            if report["errors"]:
+                console.print(f"\n[yellow]⚠️ {len(report['errors'])} errors occurred[/yellow]")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("access")
+@click.option("--email", help="Email address to search for")
+@click.option("--ip", help="IP address to search for")
+@click.option("--identifier", help="Generic identifier to search for")
+@click.pass_context
+def gdpr_access(ctx: click.Context, email: Optional[str], ip: Optional[str], identifier: Optional[str]):
+    """
+    Process data access request (GDPR Art. 15).
+
+    Find and display all data related to an identifier.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]📋 GDPR Art. 15 - Right of Access[/bold cyan]\n")
+
+    # Determine identifier
+    search_id = email or ip or identifier
+    id_type = "email" if email else ("ip" if ip else "generic")
+
+    if not search_id:
+        console.print("[red]❌ Please provide --email, --ip, or --identifier[/red]")
+        return
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+
+        with console.status(f"[cyan]Searching for data related to {id_type}...[/cyan]"):
+            result = engine.process_access_request(search_id, id_type)
+
+        console.print(f"[green]✅ Access request completed[/green]")
+        console.print(f"   Request ID: {result['request_id']}")
+        console.print(f"   Identifier hash: {result['identifier_hash']}")
+        console.print(f"   Files found: {len(result['data_found']['files'])}\n")
+
+        if result['data_found']['files']:
+            table = Table(title="📄 Files Containing Data", show_header=True)
+            table.add_column("Path", style="cyan", max_width=60)
+            table.add_column("Matches", style="white", justify="right")
+            table.add_column("Size", style="dim", justify="right")
+
+            for f in result['data_found']['files'][:20]:  # Limit display
+                table.add_row(
+                    f["path"][-60:],
+                    str(f["match_count"]),
+                    f"{f['size'] / 1024:.1f} KB"
+                )
+
+            console.print(table)
+
+            if len(result['data_found']['files']) > 20:
+                console.print(f"\n[dim]... and {len(result['data_found']['files']) - 20} more files[/dim]")
+        else:
+            console.print("[dim]No data found for this identifier[/dim]")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("erasure")
+@click.option("--email", help="Email address to delete data for")
+@click.option("--ip", help="IP address to delete data for")
+@click.option("--identifier", help="Generic identifier to delete data for")
+@click.option("--confirm", is_flag=True, help="Actually delete the data (without this, dry-run mode)")
+@click.pass_context
+def gdpr_erasure(ctx: click.Context, email: Optional[str], ip: Optional[str],
+                 identifier: Optional[str], confirm: bool):
+    """
+    Process data erasure request (GDPR Art. 17 - Right to be Forgotten).
+
+    Delete all data related to an identifier.
+    Use --confirm to actually delete (default is dry-run).
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]🗑️ GDPR Art. 17 - Right to Erasure[/bold cyan]\n")
+
+    # Determine identifier
+    search_id = email or ip or identifier
+    id_type = "email" if email else ("ip" if ip else "generic")
+
+    if not search_id:
+        console.print("[red]❌ Please provide --email, --ip, or --identifier[/red]")
+        return
+
+    dry_run = not confirm
+
+    if dry_run:
+        console.print("[yellow]DRY RUN - Use --confirm to actually delete data[/yellow]\n")
+    else:
+        console.print("[bold red]⚠️ WARNING: This will permanently delete data![/bold red]\n")
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+
+        with console.status(f"[cyan]{'Finding' if dry_run else 'Deleting'} data...[/cyan]"):
+            result = engine.process_erasure_request(search_id, id_type, dry_run=dry_run)
+
+        if dry_run:
+            console.print(f"[yellow]📋 Dry run completed[/yellow]")
+        else:
+            console.print(f"[green]✅ Erasure completed[/green]")
+
+        console.print(f"   Request ID: {result['request_id']}")
+        console.print(f"   Files found: {result['files_found']}")
+        console.print(f"   Files deleted: {result['files_deleted']}")
+
+        if result['deleted_files']:
+            console.print("\n[bold]Deleted files:[/bold]")
+            for f in result['deleted_files'][:10]:
+                console.print(f"   🗑️ {f}")
+            if len(result['deleted_files']) > 10:
+                console.print(f"   ... and {len(result['deleted_files']) - 10} more")
+
+        if result['errors']:
+            console.print(f"\n[yellow]⚠️ {len(result['errors'])} errors:[/yellow]")
+            for err in result['errors'][:5]:
+                console.print(f"   {err}")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("export")
+@click.option("--email", help="Email address to export data for")
+@click.option("--ip", help="IP address to export data for")
+@click.option("--identifier", help="Generic identifier to export data for")
+@click.option("-o", "--output", type=click.Path(), help="Output file path")
+@click.pass_context
+def gdpr_export(ctx: click.Context, email: Optional[str], ip: Optional[str],
+                identifier: Optional[str], output: Optional[str]):
+    """
+    Export data for portability (GDPR Art. 20).
+
+    Export all data related to an identifier in machine-readable format.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]📤 GDPR Art. 20 - Right to Data Portability[/bold cyan]\n")
+
+    # Determine identifier
+    search_id = email or ip or identifier
+    id_type = "email" if email else ("ip" if ip else "generic")
+
+    if not search_id:
+        console.print("[red]❌ Please provide --email, --ip, or --identifier[/red]")
+        return
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+        output_path = Path(output) if output else None
+
+        with console.status("[cyan]Exporting data...[/cyan]"):
+            result = engine.process_portability_request(search_id, id_type, output_path)
+
+        console.print(f"[green]✅ Export completed[/green]")
+        console.print(f"   Request ID: {result['request_id']}")
+        console.print(f"   Files included: {result['file_count']}")
+        console.print(f"   Export path: {result['export_path']}")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("inventory")
+@click.pass_context
+def gdpr_inventory(ctx: click.Context):
+    """
+    Show data inventory.
+
+    Displays all data stores and their contents.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]📦 Data Inventory[/bold cyan]\n")
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+        inventory = engine.get_data_inventory()
+
+        console.print(f"[dim]Generated: {inventory['timestamp']}[/dim]\n")
+
+        table = Table(show_header=True)
+        table.add_column("Category", style="cyan")
+        table.add_column("Files", style="white", justify="right")
+        table.add_column("Size (MB)", style="white", justify="right")
+        table.add_column("Oldest", style="dim")
+        table.add_column("Newest", style="dim")
+
+        total_files = 0
+        total_size = 0
+
+        for category, data in inventory["categories"].items():
+            table.add_row(
+                category.replace("_", " ").title(),
+                str(data["file_count"]),
+                f"{data['total_size_mb']:.2f}",
+                data["oldest"][:10] if data["oldest"] else "N/A",
+                data["newest"][:10] if data["newest"] else "N/A"
+            )
+            total_files += data["file_count"]
+            total_size += data["total_size_mb"]
+
+        table.add_section()
+        table.add_row("[bold]Total[/bold]", f"[bold]{total_files}[/bold]",
+                      f"[bold]{total_size:.2f}[/bold]", "", "")
+
+        console.print(table)
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@gdpr.command("report")
+@click.option("-o", "--output", type=click.Path(), help="Output file path (JSON)")
+@click.pass_context
+def gdpr_report(ctx: click.Context, output: Optional[str]):
+    """
+    Generate Art. 30 processing records report.
+
+    Creates a GDPR-compliant report of all processing activities.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]📋 GDPR Art. 30 - Processing Records Report[/bold cyan]\n")
+
+    try:
+        from utils.gdpr_compliance import get_gdpr_engine
+
+        engine = get_gdpr_engine()
+        report = engine.get_art30_report()
+
+        console.print(f"[bold]Report Type:[/bold] {report['report_type']}")
+        console.print(f"[bold]Generated:[/bold] {report['generated_at']}")
+        console.print(f"[bold]Controller:[/bold] {report['controller']}")
+        console.print(f"[bold]Processor:[/bold] {report['processor']}")
+        console.print(f"[bold]Total Records:[/bold] {report['record_count']}")
+
+        if report['data_categories_processed']:
+            console.print(f"\n[bold]Data Categories Processed:[/bold]")
+            for cat in report['data_categories_processed']:
+                console.print(f"   • {cat}")
+
+        if report['legal_bases_used']:
+            console.print(f"\n[bold]Legal Bases:[/bold]")
+            for basis in report['legal_bases_used']:
+                console.print(f"   • {basis}")
+
+        if output:
+            output_path = Path(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            console.print(f"\n[green]✅ Report saved to {output}[/green]")
+
+    except ImportError:
+        console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
 def main():
     """Main entry point."""
+    # Install subprocess cleanup error suppression
+    try:
+        from utils.async_subprocess import suppress_subprocess_cleanup_errors
+        suppress_subprocess_cleanup_errors()
+    except ImportError:
+        pass
+
     cli()
 
 

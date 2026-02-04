@@ -1,11 +1,17 @@
 """
 Advanced Authorization Testing Engine.
 Tests for horizontal/vertical access control, RBAC/ABAC, and multi-tenant isolation.
+
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - Only GET requests
+- standard: GET + HEAD + OPTIONS only (no state changes)
+- aggressive: Full testing with PUT/POST/DELETE
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -23,6 +29,11 @@ if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("aggressive",)  # Only aggressive mode allows PUT/DELETE
 
 
 @dataclass
@@ -158,8 +169,17 @@ class AuthorizationEngine(ScanModule):
         urls: list[str],
         rate_limiter: RateLimiter,
     ) -> None:
-        """Discover roles from application responses."""
+        """
+        Discover roles from application responses and JWT tokens.
+
+        Enhanced to extract roles from:
+        - API endpoints (/api/roles, /api/me, etc.)
+        - JWT token claims (role, roles, scope, permissions)
+        - Response headers (X-User-Role, etc.)
+        - JavaScript/HTML content
+        """
         role_patterns = set()
+        jwt_roles = set()
 
         # Check common endpoints that reveal roles
         role_endpoints = [
@@ -169,6 +189,11 @@ class AuthorizationEngine(ScanModule):
             "/admin/users",
             "/api/me",
             "/api/profile",
+            "/api/user",
+            "/api/account",
+            "/auth/userinfo",
+            "/oauth/userinfo",
+            "/.well-known/openid-configuration",
         ]
 
         # OPTIMIZATION: Filter to only existing endpoints
@@ -195,13 +220,182 @@ class AuthorizationEngine(ScanModule):
                             for indicator in indicators:
                                 if indicator in content:
                                     role_patterns.add(role_type)
+
+                        # Extract roles from JSON responses
+                        try:
+                            data = response.json()
+                            extracted = self._extract_roles_from_json(data)
+                            role_patterns.update(extracted)
+                        except:
+                            pass
+
+                    # Check for JWT in response
+                    jwt_roles.update(self._extract_jwt_roles_from_response(response))
+
                 except Exception:
                     continue
-        
-        # Create role objects
-        for i, role in enumerate(["guest", "user", "moderator", "admin"]):
-            if role in role_patterns or role in ["guest", "user"]:
-                self.discovered_roles.append(Role(name=role, level=i))
+
+        # Also check cookies and headers from base URL
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            await rate_limiter.acquire()
+            try:
+                response = await client.get(base_url)
+                jwt_roles.update(self._extract_jwt_roles_from_response(response))
+            except:
+                pass
+
+        # Merge discovered roles
+        all_roles = role_patterns.union(jwt_roles)
+        logger.info(f"[AuthzEngine] Discovered roles: {all_roles}")
+
+        # Create role objects with priority ordering
+        role_levels = {
+            "guest": 0, "anonymous": 0, "public": 0, "visitor": 0,
+            "user": 1, "member": 1, "customer": 1, "basic": 1,
+            "editor": 2, "author": 2, "contributor": 2,
+            "moderator": 3, "mod": 3, "manager": 3, "supervisor": 3,
+            "admin": 4, "administrator": 4, "owner": 4,
+            "superuser": 5, "superadmin": 5, "root": 5, "super": 5,
+        }
+
+        for role in all_roles:
+            role_lower = role.lower()
+            level = role_levels.get(role_lower, 1)  # Default to user level
+            self.discovered_roles.append(Role(name=role, level=level))
+
+        # Ensure we have at least guest and user
+        existing_names = {r.name.lower() for r in self.discovered_roles}
+        if "guest" not in existing_names:
+            self.discovered_roles.append(Role(name="guest", level=0))
+        if "user" not in existing_names:
+            self.discovered_roles.append(Role(name="user", level=1))
+
+        # Sort by level
+        self.discovered_roles.sort(key=lambda r: r.level)
+
+    def _extract_roles_from_json(self, data: dict | list, path: str = "") -> set[str]:
+        """Extract role names from JSON response data."""
+        roles = set()
+
+        role_keys = ["role", "roles", "user_role", "userRole", "user_type", "userType",
+                     "permission", "permissions", "scope", "scopes", "groups", "group",
+                     "access_level", "accessLevel", "account_type", "accountType"]
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                key_lower = key.lower()
+
+                # Direct role key
+                if key_lower in [k.lower() for k in role_keys]:
+                    if isinstance(value, str):
+                        roles.add(value)
+                    elif isinstance(value, list):
+                        for v in value:
+                            if isinstance(v, str):
+                                roles.add(v)
+
+                # Recurse into nested objects
+                elif isinstance(value, (dict, list)):
+                    roles.update(self._extract_roles_from_json(value, f"{path}.{key}"))
+
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    roles.update(self._extract_roles_from_json(item, path))
+
+        return roles
+
+    def _extract_jwt_roles_from_response(self, response: httpx.Response) -> set[str]:
+        """
+        Extract roles from JWT tokens in response.
+
+        Checks:
+        - Authorization header
+        - Set-Cookie headers
+        - Response body (access_token, id_token fields)
+        """
+        import base64
+
+        roles = set()
+
+        def decode_jwt_payload(token: str) -> dict | None:
+            """Decode JWT payload without verification."""
+            try:
+                parts = token.split(".")
+                if len(parts) != 3:
+                    return None
+
+                # Decode payload (part 1)
+                payload = parts[1]
+                # Add padding if needed
+                padding = 4 - len(payload) % 4
+                if padding != 4:
+                    payload += "=" * padding
+
+                decoded = base64.urlsafe_b64decode(payload)
+                return json.loads(decoded)
+            except:
+                return None
+
+        def extract_roles_from_claims(claims: dict) -> set[str]:
+            """Extract roles from JWT claims."""
+            found = set()
+            role_claim_names = [
+                "role", "roles", "scope", "scopes", "permissions", "permission",
+                "groups", "group", "authorities", "realm_access", "resource_access",
+                "cognito:groups", "custom:role", "user_role", "userRole",
+            ]
+
+            for claim_name in role_claim_names:
+                if claim_name in claims:
+                    value = claims[claim_name]
+                    if isinstance(value, str):
+                        # Could be space-separated (scopes) or single value
+                        found.update(value.split())
+                    elif isinstance(value, list):
+                        found.update(str(v) for v in value)
+                    elif isinstance(value, dict):
+                        # Keycloak realm_access format: {"roles": ["admin"]}
+                        if "roles" in value:
+                            found.update(value["roles"])
+
+            return found
+
+        # Check Authorization header in response
+        auth_header = response.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            claims = decode_jwt_payload(token)
+            if claims:
+                roles.update(extract_roles_from_claims(claims))
+
+        # Check Set-Cookie headers for JWT tokens
+        for cookie_header in response.headers.get_list("set-cookie"):
+            # Common JWT cookie names
+            for cookie_name in ["token", "access_token", "jwt", "auth_token", "session"]:
+                if cookie_name + "=" in cookie_header.lower():
+                    # Extract cookie value
+                    match = re.search(rf'{cookie_name}=([^;]+)', cookie_header, re.IGNORECASE)
+                    if match:
+                        token = match.group(1)
+                        claims = decode_jwt_payload(token)
+                        if claims:
+                            roles.update(extract_roles_from_claims(claims))
+
+        # Check response body for JWT tokens
+        try:
+            data = response.json()
+            for token_key in ["access_token", "id_token", "token", "jwt"]:
+                if token_key in data:
+                    token = data[token_key]
+                    if isinstance(token, str):
+                        claims = decode_jwt_payload(token)
+                        if claims:
+                            roles.update(extract_roles_from_claims(claims))
+        except:
+            pass
+
+        return roles
     
     async def _test_horizontal_access(
         self,
@@ -249,6 +443,7 @@ class AuthorizationEngine(ScanModule):
                                         type="authorization",
                                         name="Horizontal Privilege Escalation (IDOR)",
                                         severity="HIGH",
+                                        confidence=90,
                                         description=f"User data accessible by changing ID from {original_id} to {test_id}. "
                                                    f"No authorization check prevents accessing other users' data.",
                                         host=base_url,
@@ -276,29 +471,148 @@ class AuthorizationEngine(ScanModule):
         return findings
     
     def _generate_test_ids(self, original_id: str) -> list[str]:
-        """Generate test IDs based on original ID format."""
+        """
+        Generate test IDs based on original ID format.
+
+        Enhanced to support:
+        - Numeric IDs (sequential, boundary)
+        - UUIDs (v1, v4, manipulation)
+        - MongoDB ObjectIDs (24 hex chars)
+        - Base64-encoded IDs
+        - Hash-like IDs (MD5, SHA)
+        - Custom alphanumeric patterns
+        """
+        import base64
+        import hashlib
+
         test_ids = []
-        
-        # Numeric ID
+        id_lower = original_id.lower()
+
+        # 1. Numeric ID (most common for IDOR)
         if original_id.isdigit():
             num = int(original_id)
-            test_ids.extend([str(num + 1), str(num - 1), str(num + 100), "1", "0"])
-        
-        # UUID
-        elif len(original_id) == 36 and "-" in original_id:
-            # Modify last character
-            test_ids.append(original_id[:-1] + ("0" if original_id[-1] != "0" else "1"))
+            test_ids.extend([
+                str(num + 1),       # Next user
+                str(num - 1),       # Previous user
+                str(num + 100),     # Jump forward
+                str(num * 2),       # Double
+                "1",                # First user (often admin)
+                "0",                # Null/system user
+                "2",                # Second user
+                str(max(1, num - 100)),  # Jump backward
+            ])
+
+        # 2. UUID (36 chars with dashes)
+        elif len(original_id) == 36 and original_id.count("-") == 4:
+            parts = original_id.split("-")
+            # Modify last segment
+            last_modified = parts[-1][:-1] + ("0" if parts[-1][-1] != "0" else "1")
+            test_ids.append("-".join(parts[:-1] + [last_modified]))
+
+            # UUID v1 timestamp manipulation (if v1)
+            if parts[2].startswith("1"):  # Version 1
+                # Increment timestamp portion
+                try:
+                    ts_part = int(parts[0], 16)
+                    test_ids.append(f"{ts_part + 1:08x}-{'-'.join(parts[1:])}")
+                except:
+                    pass
+
             # Common test UUIDs
             test_ids.extend([
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000000",
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                # Same UUID with version bit flipped (v4 -> v1)
+                f"{parts[0]}-{parts[1]}-1{parts[2][1:]}-{parts[3]}-{parts[4]}",
             ])
-        
-        # Short hash
+
+        # 3. MongoDB ObjectID (24 hex characters)
+        elif len(original_id) == 24 and all(c in "0123456789abcdef" for c in id_lower):
+            # ObjectID format: timestamp(4) + machine(3) + pid(2) + counter(3)
+            # Increment counter (last 6 chars)
+            try:
+                counter = int(original_id[-6:], 16)
+                test_ids.append(original_id[:-6] + f"{counter + 1:06x}")
+                test_ids.append(original_id[:-6] + f"{counter - 1:06x}")
+                test_ids.append(original_id[:-6] + "000001")  # First counter
+            except:
+                pass
+
+            test_ids.extend([
+                "000000000000000000000001",
+                "000000000000000000000000",
+            ])
+
+        # 4. Base64-encoded ID (contains =, ends with = or ==, or base64 chars only)
+        elif original_id.endswith("=") or (len(original_id) % 4 == 0 and
+               all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in original_id)):
+            try:
+                # Decode, modify, re-encode
+                decoded = base64.b64decode(original_id).decode('utf-8', errors='ignore')
+                if decoded.isdigit():
+                    # Numeric inside base64
+                    num = int(decoded)
+                    test_ids.append(base64.b64encode(str(num + 1).encode()).decode())
+                    test_ids.append(base64.b64encode(str(num - 1).encode()).decode())
+                    test_ids.append(base64.b64encode(b"1").decode())
+                else:
+                    # String inside base64
+                    test_ids.append(base64.b64encode(b"1").decode())
+                    test_ids.append(base64.b64encode(b"admin").decode())
+                    test_ids.append(base64.b64encode(b"0").decode())
+            except:
+                pass
+
+            # Common base64 test values
+            test_ids.extend([
+                base64.b64encode(b"1").decode(),
+                base64.b64encode(b"admin").decode(),
+            ])
+
+        # 5. MD5 hash (32 hex chars)
+        elif len(original_id) == 32 and all(c in "0123456789abcdef" for c in id_lower):
+            # Try common values hashed
+            test_ids.extend([
+                hashlib.md5(b"1").hexdigest(),
+                hashlib.md5(b"admin").hexdigest(),
+                hashlib.md5(b"0").hexdigest(),
+                hashlib.md5(b"test").hexdigest(),
+            ])
+
+        # 6. SHA256 hash (64 hex chars)
+        elif len(original_id) == 64 and all(c in "0123456789abcdef" for c in id_lower):
+            test_ids.extend([
+                hashlib.sha256(b"1").hexdigest(),
+                hashlib.sha256(b"admin").hexdigest(),
+                hashlib.sha256(b"0").hexdigest(),
+            ])
+
+        # 7. Short alphanumeric (custom format)
+        elif len(original_id) <= 16 and original_id.isalnum():
+            # Increment last char
+            if original_id[-1].isdigit():
+                last_num = int(original_id[-1])
+                test_ids.append(original_id[:-1] + str((last_num + 1) % 10))
+            elif original_id[-1].isalpha():
+                next_char = chr((ord(original_id[-1].lower()) - ord('a') + 1) % 26 + ord('a'))
+                test_ids.append(original_id[:-1] + next_char)
+
+            test_ids.extend(["admin", "1", "test", "user1", original_id + "1"])
+
+        # 8. Fallback for unknown formats
         else:
-            test_ids.extend(["admin", "1", "test", original_id + "1"])
-        
-        return test_ids[:5]
+            test_ids.extend(["admin", "1", "test", "0", original_id + "1"])
+
+        # Deduplicate and limit
+        seen = set()
+        unique_ids = []
+        for tid in test_ids:
+            if tid and tid not in seen and tid != original_id:
+                seen.add(tid)
+                unique_ids.append(tid)
+
+        return unique_ids[:8]  # Return up to 8 test IDs
     
     async def _test_vertical_access(
         self,
@@ -362,6 +676,7 @@ class AuthorizationEngine(ScanModule):
                                 type="authorization",
                                 name="Vertical Privilege Escalation - Admin Access",
                                 severity="CRITICAL",
+                                confidence=95,
                                 description=f"Administrative endpoint {path} is accessible without proper authorization.",
                                 host=base_url,
                                 matched_at=url,
@@ -431,6 +746,7 @@ class AuthorizationEngine(ScanModule):
                         type="authorization",
                         name="Authorization Bypass",
                         severity="CRITICAL",
+                        confidence=95,
                         description=f"Authorization can be bypassed using: {technique}",
                         host=base_url,
                         matched_at=url,
@@ -510,6 +826,7 @@ class AuthorizationEngine(ScanModule):
                                             type="authorization",
                                             name="Privilege Escalation via Mass Assignment",
                                             severity="CRITICAL",
+                                            confidence=95,
                                             description=f"Role/privilege can be escalated by setting {param} parameter.",
                                             host=base_url,
                                             matched_at=url,
@@ -570,6 +887,7 @@ class AuthorizationEngine(ScanModule):
                                         type="authorization",
                                         name="Multi-Tenant Isolation Bypass",
                                         severity="CRITICAL",
+                                        confidence=95,
                                         description=f"Tenant isolation can be bypassed by changing {param} parameter.",
                                         host=base_url,
                                         matched_at=test_url,
@@ -655,6 +973,7 @@ class AuthorizationEngine(ScanModule):
                                 type="authorization",
                                 name="Forced Browsing - Sensitive Data Exposure",
                                 severity="HIGH",
+                                confidence=90,
                                 description=f"Restricted resource accessible via direct URL: {path}",
                                 host=base_url,
                                 matched_at=url,
@@ -687,6 +1006,28 @@ class AuthorizationEngine(ScanModule):
             ("PUT", "/api/config"),
             ("POST", "/api/export/all"),
         ]
+
+        # ⚠️ SAFE MODE: Skip DELETE/PUT/POST tests in non-aggressive modes
+        if not ALLOW_WRITES:
+            logger.info("⚠️ SAFE MODE: Skipping destructive authorization tests (DELETE/PUT/POST)")
+            logger.info("   Run with --safe-mode=aggressive to enable these tests")
+            # Return early with informational finding
+            findings.append(Finding(
+                type="authorization",
+                name="Function Level Authorization Test Skipped",
+                severity="INFO",
+                confidence=0,
+                description="Destructive authorization tests (DELETE/PUT/POST) were skipped due to safe mode. "
+                           "Run with --safe-mode=aggressive to test these endpoints.",
+                host=base_url,
+                matched_at=base_url,
+                evidence=["Safe mode active", f"Skipped {len(dangerous_methods)} dangerous endpoint tests"],
+                cvss_score=0.0,
+                cwe="CWE-285",
+                remediation="Manual verification recommended or run with aggressive mode.",
+                references=[],
+            ).to_dict())
+            return findings
 
         # OPTIMIZATION: Filter to only existing endpoints (extract paths)
         paths_only = [path for _, path in dangerous_methods]
@@ -722,6 +1063,7 @@ class AuthorizationEngine(ScanModule):
                             type="authorization",
                             name="Broken Function Level Authorization",
                             severity="HIGH",
+                            confidence=90,
                             description=f"Privileged function {method} {path} accessible without proper authorization.",
                             host=base_url,
                             matched_at=url,

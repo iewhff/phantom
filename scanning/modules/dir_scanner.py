@@ -252,6 +252,7 @@ class DirectoryScanner(ScanModule):
                 cwe="CWE-538",
                 remediation="Review and restrict access to sensitive directories.",
                 metadata={"discovered_by": "gobuster/ffuf", "paths": sensitive_paths},
+                confidence=85,
             ).to_dict())
 
         if admin_paths:
@@ -267,6 +268,7 @@ class DirectoryScanner(ScanModule):
                 cwe="CWE-200",
                 remediation="Ensure admin panels are properly protected.",
                 metadata={"discovered_by": "gobuster/ffuf", "paths": admin_paths},
+                confidence=75,
             ).to_dict())
 
         return findings
@@ -400,7 +402,7 @@ class DirectoryScanner(ScanModule):
         base_url: str,
         rate_limiter: RateLimiter,
     ) -> list[dict[str, Any]]:
-        """Scan for common directories."""
+        """Scan for common directories with SPA detection to avoid false positives."""
         findings = []
         found_dirs = []
 
@@ -413,24 +415,46 @@ class DirectoryScanner(ScanModule):
         )
 
         async with client:
+            # Get baseline response for SPA detection
+            baseline_response = None
+            await rate_limiter.acquire()
+            try:
+                import secrets
+                random_path = f"/_phantom_baseline_{secrets.token_hex(8)}/"
+                baseline_url = urljoin(base_url, random_path)
+                baseline_resp = await client.get(baseline_url)
+                if baseline_resp.status_code == 200:
+                    # Likely a SPA - all routes return same HTML
+                    baseline_response = baseline_resp.text
+                    logger.debug(f"[DirScanner] SPA detected - baseline response {len(baseline_response)} bytes")
+            except Exception:
+                pass
+
             for directory in self.DIRECTORIES:
                 await rate_limiter.acquire()
-                
+
                 url = urljoin(base_url, directory)
-                
+
                 try:
                     response = await client.get(url)
-                    
+
                     # Directory found
                     if response.status_code == 200:
+                        content = response.text
+
+                        # SPA false positive check
+                        if baseline_response and self._is_same_response(content, baseline_response):
+                            logger.debug(f"[DirScanner] Skipping directory {directory} - SPA shell response")
+                            continue
+
                         found_dirs.append({
                             "path": directory,
                             "status": response.status_code,
-                            "size": len(response.text),
+                            "size": len(content),
                         })
-                        
+
                         # Check for directory listing
-                        if self._is_directory_listing(response.text):
+                        if self._is_directory_listing(content):
                             findings.append(Finding(
                                 type="directory",
                                 name="Directory Listing Enabled",
@@ -443,8 +467,9 @@ class DirectoryScanner(ScanModule):
                                 cvss_score=5.3,
                                 cwe="CWE-548",
                                 remediation="Disable directory listing in web server configuration.",
+                                confidence=85,
                             ).to_dict())
-                            
+
                     elif response.status_code == 403:
                         # Exists but forbidden
                         found_dirs.append({
@@ -452,7 +477,7 @@ class DirectoryScanner(ScanModule):
                             "status": 403,
                             "size": 0,
                         })
-                        
+
                 except Exception as e:
                     logger.debug(f"Directory scan error for {url}: {e}")
         
@@ -475,6 +500,7 @@ class DirectoryScanner(ScanModule):
                     cwe="CWE-200",
                     remediation="Restrict access to sensitive directories. "
                                "Remove unnecessary files and folders.",
+                    confidence=75,
                 ).to_dict())
         
         return findings
@@ -503,6 +529,7 @@ class DirectoryScanner(ScanModule):
 
         This is an optimized version that only checks files not found by
         external tools, avoiding duplicate requests.
+        Includes SPA detection and content validation to avoid false positives.
         """
         findings = []
 
@@ -514,6 +541,19 @@ class DirectoryScanner(ScanModule):
         )
 
         async with client:
+            # Get baseline response for SPA detection
+            baseline_response = None
+            await rate_limiter.acquire()
+            try:
+                import secrets
+                random_path = f"/_phantom_baseline_{secrets.token_hex(8)}.txt"
+                baseline_url = urljoin(base_url, random_path)
+                baseline_resp = await client.get(baseline_url)
+                if baseline_resp.status_code == 200:
+                    baseline_response = baseline_resp.text
+            except Exception:
+                pass
+
             for filename in files:
                 await rate_limiter.acquire()
 
@@ -523,7 +563,20 @@ class DirectoryScanner(ScanModule):
                     response = await client.get(url)
 
                     if response.status_code == 200:
-                        severity = self._assess_file_severity(filename, response.text)
+                        content = response.text
+
+                        # SPA false positive check
+                        if baseline_response and self._is_same_response(content, baseline_response):
+                            logger.debug(f"[DirScanner] Skipping {filename} - SPA shell response")
+                            continue
+
+                        # Content validation
+                        if not self._validate_file_content(filename, content):
+                            logger.debug(f"[DirScanner] Skipping {filename} - content validation failed")
+                            continue
+
+                        severity = self._assess_file_severity(filename, content)
+                        confidence = {"CRITICAL": 95, "HIGH": 90, "MEDIUM": 85, "LOW": 75}.get(severity, 80)
 
                         findings.append(Finding(
                             type="sensitive_file",
@@ -534,11 +587,13 @@ class DirectoryScanner(ScanModule):
                             matched_at=url,
                             evidence=[
                                 f"File: {filename}",
-                                f"Size: {len(response.text)} bytes",
+                                f"Size: {len(content)} bytes",
+                                f"Content verified: true",
                             ],
                             cvss_score=self._severity_to_cvss(severity),
                             cwe="CWE-200",
                             remediation="Remove sensitive files from web root.",
+                            confidence=confidence,
                         ).to_dict())
 
                 except Exception as e:
@@ -551,7 +606,7 @@ class DirectoryScanner(ScanModule):
         base_url: str,
         rate_limiter: RateLimiter,
     ) -> list[dict[str, Any]]:
-        """Scan for sensitive files."""
+        """Scan for sensitive files with SPA detection to avoid false positives."""
         findings = []
 
         async with httpx.AsyncClient(
@@ -559,17 +614,46 @@ class DirectoryScanner(ScanModule):
             verify=False,
             follow_redirects=False,
         ) as client:
+            # Get baseline response for SPA detection
+            # Request a random path that shouldn't exist
+            baseline_response = None
+            await rate_limiter.acquire()
+            try:
+                import secrets
+                random_path = f"/_phantom_baseline_{secrets.token_hex(8)}.txt"
+                baseline_url = urljoin(base_url, random_path)
+                baseline_resp = await client.get(baseline_url)
+                if baseline_resp.status_code == 200:
+                    # SPA detected - all routes return same HTML
+                    baseline_response = baseline_resp.text
+                    logger.debug(f"[DirScanner] SPA detected - baseline response {len(baseline_response)} bytes")
+            except Exception:
+                pass
+
             for filename in self.SENSITIVE_FILES:
                 await rate_limiter.acquire()
-                
+
                 url = urljoin(base_url, filename)
-                
+
                 try:
                     response = await client.get(url)
-                    
+
                     if response.status_code == 200:
-                        severity = self._assess_file_severity(filename, response.text)
-                        
+                        content = response.text
+
+                        # SPA false positive check: if response matches baseline, skip
+                        if baseline_response and self._is_same_response(content, baseline_response):
+                            logger.debug(f"[DirScanner] Skipping {filename} - SPA shell response")
+                            continue
+
+                        # Content validation: verify response looks like the expected file type
+                        if not self._validate_file_content(filename, content):
+                            logger.debug(f"[DirScanner] Skipping {filename} - content doesn't match expected type")
+                            continue
+
+                        severity = self._assess_file_severity(filename, content)
+                        confidence = {"CRITICAL": 95, "HIGH": 90, "MEDIUM": 85, "LOW": 75}.get(severity, 80)
+
                         findings.append(Finding(
                             type="sensitive_file",
                             name=f"Sensitive File Exposed: {filename}",
@@ -579,18 +663,118 @@ class DirectoryScanner(ScanModule):
                             matched_at=url,
                             evidence=[
                                 f"File: {filename}",
-                                f"Size: {len(response.text)} bytes",
+                                f"Size: {len(content)} bytes",
+                                f"Content verified: true",
                             ],
                             cvss_score=self._severity_to_cvss(severity),
                             cwe="CWE-200",
                             remediation="Remove sensitive files from web root. "
                                        "Restrict access through web server configuration.",
+                            confidence=confidence,
                         ).to_dict())
-                        
+
                 except Exception as e:
                     logger.debug(f"File scan error for {url}: {e}")
-        
+
         return findings
+
+    def _is_same_response(self, content1: str, content2: str) -> bool:
+        """Check if two responses are essentially the same (SPA detection)."""
+        # Quick length check
+        if abs(len(content1) - len(content2)) > 100:
+            return False
+        # Check if content is very similar (allowing for minor dynamic differences)
+        # Compare first 500 chars and last 500 chars
+        c1_start = content1[:500].strip()
+        c2_start = content2[:500].strip()
+        c1_end = content1[-500:].strip() if len(content1) > 500 else ""
+        c2_end = content2[-500:].strip() if len(content2) > 500 else ""
+        return c1_start == c2_start and c1_end == c2_end
+
+    def _validate_file_content(self, filename: str, content: str) -> bool:
+        """Validate that file content matches expected type to avoid false positives."""
+        filename_lower = filename.lower()
+        content_lower = content.lower()
+
+        # HTML/SPA detection - these are NOT real config/backup files
+        html_indicators = ["<!doctype html", "<html", "<head>", "<body>", "<script", "ng-app", "react", "vue"]
+        is_html = any(ind in content_lower for ind in html_indicators)
+
+        # .env files should have KEY=value patterns
+        if ".env" in filename_lower:
+            if is_html:
+                return False
+            # Real .env files have patterns like KEY=value or KEY="value"
+            import re
+            env_pattern = re.compile(r'^[A-Z_][A-Z0-9_]*\s*=', re.MULTILINE)
+            return bool(env_pattern.search(content))
+
+        # SQL files should have SQL keywords
+        if filename_lower.endswith(".sql"):
+            if is_html:
+                return False
+            sql_keywords = ["select ", "insert ", "create ", "drop ", "alter ", "update ", "delete "]
+            return any(kw in content_lower for kw in sql_keywords)
+
+        # PHP config files should have PHP code
+        if filename_lower.endswith(".php"):
+            if is_html and "<?php" not in content_lower:
+                return False
+            return "<?php" in content_lower or "<?=" in content_lower
+
+        # Config files (yml, json, xml)
+        if any(filename_lower.endswith(ext) for ext in [".yml", ".yaml", ".json", ".xml"]):
+            if is_html:
+                return False
+            # YAML should have key: value patterns
+            if filename_lower.endswith((".yml", ".yaml")):
+                return ":" in content and not is_html
+            # JSON should start with { or [
+            if filename_lower.endswith(".json"):
+                stripped = content.strip()
+                return stripped.startswith(("{", "["))
+            # XML should have <?xml or <root tags
+            if filename_lower.endswith(".xml"):
+                return "<?xml" in content_lower or content.strip().startswith("<")
+
+        # Log files
+        if filename_lower.endswith(".log") or "log" in filename_lower:
+            if is_html:
+                return False
+            # Logs typically have timestamps or log levels
+            log_patterns = ["error", "warning", "info", "debug", "[", "timestamp", "exception"]
+            return any(p in content_lower for p in log_patterns)
+
+        # Git files
+        if ".git/" in filename_lower:
+            if is_html:
+                return False
+            if "HEAD" in filename:
+                return "ref:" in content_lower or content.strip().startswith(("refs/", "commit"))
+            if "config" in filename:
+                return "[core]" in content or "[remote" in content
+            return True  # Other git files
+
+        # htaccess/htpasswd
+        if filename_lower in [".htaccess", ".htpasswd"]:
+            if is_html:
+                return False
+            if ".htaccess" in filename_lower:
+                return any(d in content for d in ["RewriteRule", "Deny", "Allow", "Options", "DirectoryIndex"])
+            if ".htpasswd" in filename_lower:
+                return ":" in content and len(content.split(":")) >= 2
+
+        # Key files
+        if "id_rsa" in filename_lower or "private" in filename_lower:
+            if is_html:
+                return False
+            return "-----BEGIN" in content
+
+        # Default: if it looks like HTML, it's probably not the real file
+        if is_html:
+            return False
+
+        return True
     
     def _assess_file_severity(self, filename: str, content: str) -> str:
         """Assess severity based on file type and content."""
@@ -684,6 +868,7 @@ class DirectoryScanner(ScanModule):
                                 references=[
                                     "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/05-Enumerate_Infrastructure_and_Application_Admin_Interfaces"
                                 ],
+                                confidence=90,
                             ).to_dict())
                             
                 except Exception as e:
@@ -751,6 +936,7 @@ class DirectoryScanner(ScanModule):
                                     cwe="CWE-530",
                                     remediation="Remove backup files from web server. "
                                                "Configure web server to block backup extensions.",
+                                    confidence=90,
                                 ).to_dict())
                                 
                     except Exception as e:

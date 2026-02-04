@@ -1,6 +1,11 @@
 """
 Logic Chain Scanner v2.0 - GENERIC Real Attack Chain Detection
 
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - Analysis without state changes
+- standard: Safe tests with non-existent resources only
+- aggressive: Full testing including state-changing operations
+
 WORKS ON ANY WEBSITE using behavior-based detection:
 - Baseline Comparison: Normal vs malicious response analysis
 - Behavior Analysis: Status code, size, timing, field changes
@@ -26,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 import re
 import string
@@ -44,6 +50,11 @@ if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 
 
 # ============================================================================
@@ -484,6 +495,7 @@ class LogicChainScanner(ScanModule):
                                             type="logic_chain",
                                             name="IDOR Chain: ID Manipulation → Unauthorized Data Access",
                                             severity="CRITICAL" if sensitive_fields else "HIGH",
+                                            confidence=95 if sensitive_fields else 90,
                                             description=f"""**{'CRITICAL' if sensitive_fields else 'HIGH'}: Insecure Direct Object Reference (IDOR)**
 
 **Attack Chain Verified:**
@@ -611,6 +623,7 @@ changing the ID in the URL. This is a critical access control failure.""",
                                                 type="logic_chain",
                                                 name="Registration Mass Assignment → Admin Account Creation",
                                                 severity="CRITICAL",
+                                                confidence=95,
                                                 description=f"""**CRITICAL: Mass Assignment at Registration**
 
 **Attack Chain Verified:**
@@ -714,6 +727,7 @@ role properties during registration. Complete authentication bypass.""",
                                 type="logic_chain",
                                 name="Forbidden Bypass Chain: Header Injection → Admin Access",
                                 severity="HIGH",
+                                confidence=90,
                                 description=f"""**HIGH: Authorization Bypass via Header Injection**
 
 **Attack Chain Verified:**
@@ -763,6 +777,7 @@ header injection, allowing unauthorized access to protected resources.""",
                                 type="logic_chain",
                                 name="Forbidden Bypass Chain: Path Manipulation → Admin Access",
                                 severity="HIGH",
+                                confidence=90,
                                 description=f"""**HIGH: Authorization Bypass via Path Manipulation**
 
 **Attack Chain Verified:**
@@ -825,6 +840,11 @@ path manipulation, allowing unauthorized access.""",
         if not update_endpoints:
             update_endpoints = ["/api/user", "/api/profile", "/api/me", "/api/account"]
         
+        # ⚠️ SAFE MODE: Skip PUT/PATCH tests in non-write modes
+        if not ALLOW_WRITES:
+            logger.info("⚠️ SAFE MODE: Skipping mass assignment PUT/PATCH tests")
+            return findings
+        
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             for endpoint in update_endpoints[:5]:
                 url = urljoin(base_url, endpoint)
@@ -868,6 +888,7 @@ path manipulation, allowing unauthorized access.""",
                                             type="logic_chain",
                                             name="Privilege Escalation Chain: Profile Update → Admin Role",
                                             severity="CRITICAL",
+                                            confidence=95,
                                             description=f"""**CRITICAL: Mass Assignment Privilege Escalation**
 
 **Attack Chain Verified:**
@@ -976,6 +997,7 @@ by updating their profile with role properties.""",
                                 type="logic_chain",
                                 name="Token Manipulation Chain: Forged Auth → Admin Access",
                                 severity="CRITICAL",
+                                confidence=95,
                                 description=f"""**CRITICAL: Authentication Bypass via Token Manipulation**
 
 **Attack Chain Verified:**
@@ -1091,6 +1113,7 @@ This indicates the server doesn't properly validate authentication.""",
                             type="logic_chain",
                             name="List IDOR Chain: Unauthenticated Access → Multiple Users' Data",
                             severity="HIGH",
+                            confidence=90,
                             description=f"""**HIGH: Insecure Direct Object Reference in List Endpoint**
 
 **Attack Chain Verified:**

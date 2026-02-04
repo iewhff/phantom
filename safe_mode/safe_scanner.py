@@ -84,6 +84,14 @@ class SafeScanner:
             "rm -rf", "format c:",  # System destruction
             "shutdown", "reboot",
         ],
+        SafetyLevel.STANDARD: [
+            "DROP DATABASE", "DROP TABLE", "TRUNCATE",  # Database destruction
+            "rm -rf /", "format c:", "del /f /s /q",  # Filesystem destruction
+            "shutdown", "reboot", "halt", "poweroff",  # System shutdown
+            "; DROP", "'; DROP", "\"; DROP",  # SQL injection drops
+            "nc -e", "bash -i", "/dev/tcp",  # Reverse shells
+            "wget http", "curl http",  # Remote code download (in payloads)
+        ],
     }
     
     # Time delays for safe testing

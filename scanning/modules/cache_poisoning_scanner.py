@@ -337,6 +337,7 @@ class CachePoisoningScanner(ScanModule):
                     cvss_score=0.0,
                     cwe="CWE-444",
                     remediation="Informational - caching detected.",
+                    confidence=100,
                 ).to_dict())
             
             # Phase 2: Test unkeyed headers
@@ -502,6 +503,7 @@ class CachePoisoningScanner(ScanModule):
                             remediation="Include this header in cache key using Vary header, "
                                        "or strip it before caching. "
                                        "Review CDN configuration for unkeyed headers.",
+                            confidence=90,
                         ).to_dict())
                     else:
                         # Reflected but not cached
@@ -520,6 +522,7 @@ class CachePoisoningScanner(ScanModule):
                             cvss_score=5.3,
                             cwe="CWE-79",
                             remediation="Sanitize header values before reflection.",
+                            confidence=80,
                         ).to_dict())
                         
             except Exception as e:
@@ -586,6 +589,7 @@ class CachePoisoningScanner(ScanModule):
                             remediation="Validate Host header strictly. "
                                        "Include Host in cache key. "
                                        "Use absolute URLs in responses.",
+                            confidence=90,
                         ).to_dict())
                         return findings  # One finding is enough
                         
@@ -642,6 +646,7 @@ class CachePoisoningScanner(ScanModule):
                             cwe="CWE-444",
                             remediation="Include all parameters in cache key. "
                                        "Use consistent parameter parsing.",
+                            confidence=85,
                         ).to_dict())
                         break
                         
@@ -707,6 +712,7 @@ class CachePoisoningScanner(ScanModule):
                             cwe="CWE-444",
                             remediation="Reject GET requests with body. "
                                        "Include Content-Length in cache key.",
+                            confidence=85,
                         ).to_dict())
                         return findings
                         
@@ -774,6 +780,7 @@ class CachePoisoningScanner(ScanModule):
                                 remediation="Don't cache based on file extension alone. "
                                            "Use Cache-Control: no-store for dynamic content. "
                                            "Validate path normalization.",
+                                confidence=85 if is_cached else 80,
                             ).to_dict())
                             break
                             
@@ -833,6 +840,7 @@ class CachePoisoningScanner(ScanModule):
                             cwe="CWE-94",
                             remediation="Disable ESI processing or sanitize input strictly. "
                                        "Filter ESI tags from all user input.",
+                            confidence=85,
                         ).to_dict())
                         return findings
                         
@@ -903,6 +911,7 @@ class CachePoisoningScanner(ScanModule):
                             cwe="CWE-436",
                             remediation="Normalize paths before cache key generation. "
                                        "Use consistent URL handling.",
+                            confidence=80,
                         ).to_dict())
                         break
                         
@@ -950,6 +959,7 @@ class CachePoisoningScanner(ScanModule):
                     cvss_score=0.0,
                     cwe="CWE-444",
                     remediation="Ensure all user-controlled headers are in Vary.",
+                    confidence=100,
                 ).to_dict())
                 
                 # Test if Vary is respected
@@ -982,6 +992,7 @@ class CachePoisoningScanner(ScanModule):
                             cvss_score=5.3,
                             cwe="CWE-444",
                             remediation="Sanitize header values before reflection.",
+                            confidence=80,
                         ).to_dict())
                         
         except Exception as e:

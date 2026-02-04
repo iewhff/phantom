@@ -8,12 +8,18 @@ Covers SecureDev checklist phases:
 - FASE 5: Supabase Realtime
 - FASE 6: Supabase Auth Weaknesses
 - FASE 20: Supabase Dashboard Exposure
+
+SAFETY MODES:
+- passive/safe/cautious: READ-ONLY mode - NO inserts, NO updates, NO deletes
+- standard: Safe tests with non-existent IDs only
+- aggressive: Full testing
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -29,6 +35,11 @@ if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+
+# Safe mode environment variable - set by full_scanner.py
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 
 
 class Severity(Enum):
@@ -51,6 +62,7 @@ class SupabaseFinding:
     remediation: str = ""
     table_or_bucket: str = ""
     cwe: str = ""
+    confidence: float = 85.0  # Default confidence for Supabase findings
     
     def to_dict(self) -> dict:
         return {
@@ -62,6 +74,7 @@ class SupabaseFinding:
             "remediation": self.remediation,
             "table_or_bucket": self.table_or_bucket,
             "cwe": self.cwe,
+            "confidence": self.confidence,
         }
 
 
@@ -308,46 +321,53 @@ class SupabaseScanner:
                             cwe="CWE-284"
                         ))
                 
-                # Test 2: Write attempt (POST)
-                test_data = {"test_field": "rls_bypass_test", "id": str(uuid.uuid4())}
-                response = await client.post(
-                    f"{rest_url}/{table}",
-                    headers=self.headers,
-                    json=test_data
-                )
+                # Test 2: Write attempt (POST) - ONLY in write-allowed modes
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping write test for table '{table}'")
+                else:
+                    test_data = {"test_field": "rls_bypass_test", "id": str(uuid.uuid4())}
+                    response = await client.post(
+                        f"{rest_url}/{table}",
+                        headers=self.headers,
+                        json=test_data
+                    )
+                    
+                    if response.status_code in [200, 201]:
+                        self.result.findings.append(SupabaseFinding(
+                            phase="FASE_2",
+                            title=f"Unauthenticated INSERT on '{table}'",
+                            severity=Severity.CRITICAL,
+                            description=f"The table '{table}' allows INSERT without proper authentication. "
+                                       "Attackers can inject malicious data.",
+                            evidence=f"POST request succeeded with status {response.status_code}",
+                            table_or_bucket=table,
+                            remediation="Add RLS policy: CREATE POLICY ... ON table FOR INSERT WITH CHECK (auth.uid() IS NOT NULL)",
+                            cwe="CWE-284"
+                        ))
                 
-                if response.status_code in [200, 201]:
-                    self.result.findings.append(SupabaseFinding(
-                        phase="FASE_2",
-                        title=f"Unauthenticated INSERT on '{table}'",
-                        severity=Severity.CRITICAL,
-                        description=f"The table '{table}' allows INSERT without proper authentication. "
-                                   "Attackers can inject malicious data.",
-                        evidence=f"POST request succeeded with status {response.status_code}",
-                        table_or_bucket=table,
-                        remediation="Add RLS policy: CREATE POLICY ... ON table FOR INSERT WITH CHECK (auth.uid() IS NOT NULL)",
-                        cwe="CWE-284"
-                    ))
-                
-                # Test 3: Delete attempt
-                response = await client.delete(
-                    f"{rest_url}/{table}",
-                    headers={**self.headers, "Prefer": "return=minimal"},
-                    params={"id": "eq.999999999"}  # Non-existent ID
-                )
-                
-                # 404 is expected, but 200/204 with no RLS check is bad
-                if response.status_code in [200, 204]:
-                    self.result.findings.append(SupabaseFinding(
-                        phase="FASE_2",
-                        title=f"DELETE allowed on '{table}'",
-                        severity=Severity.HIGH,
-                        description=f"The table '{table}' may allow DELETE operations without proper checks.",
-                        evidence=f"DELETE request returned {response.status_code}",
-                        table_or_bucket=table,
-                        remediation="Add RLS policy for DELETE operations",
-                        cwe="CWE-284"
-                    ))
+                # Test 3: Delete attempt - ONLY in write-allowed modes
+                # NOTE: Uses non-existent ID (999999999) so even if successful, nothing is deleted
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping delete test for table '{table}'")
+                else:
+                    response = await client.delete(
+                        f"{rest_url}/{table}",
+                        headers={**self.headers, "Prefer": "return=minimal"},
+                        params={"id": "eq.999999999"}  # Non-existent ID - SAFE!
+                    )
+                    
+                    # 404 is expected, but 200/204 with no RLS check is bad
+                    if response.status_code in [200, 204]:
+                        self.result.findings.append(SupabaseFinding(
+                            phase="FASE_2",
+                            title=f"DELETE allowed on '{table}'",
+                            severity=Severity.HIGH,
+                            description=f"The table '{table}' may allow DELETE operations without proper checks.",
+                            evidence=f"DELETE request returned {response.status_code}",
+                            table_or_bucket=table,
+                            remediation="Add RLS policy for DELETE operations",
+                            cwe="CWE-284"
+                        ))
                     
             except Exception as e:
                 logger.debug(f"Error testing table {table}: {e}")
@@ -410,32 +430,35 @@ class SupabaseScanner:
                         cwe="CWE-284"
                     ))
                 
-                # Test 3: Unauthorized upload
-                test_content = b"security_test_upload"
-                response = await client.post(
-                    f"{storage_url}/object/{bucket}/security_test.txt",
-                    headers={**self.headers, "Content-Type": "text/plain"},
-                    content=test_content
-                )
-                
-                if response.status_code in [200, 201]:
-                    self.result.findings.append(SupabaseFinding(
-                        phase="FASE_3",
-                        title=f"Unauthorized upload to bucket '{bucket}'",
-                        severity=Severity.HIGH,
-                        description=f"Files can be uploaded to bucket '{bucket}' with just the anon key. "
-                                   "This may allow malicious file uploads.",
-                        evidence=f"Upload succeeded with status {response.status_code}",
-                        table_or_bucket=bucket,
-                        remediation="Add storage policies to restrict uploads to authenticated users",
-                        cwe="CWE-434"
-                    ))
-                    
-                    # Try to delete the test file
-                    await client.delete(
+                # Test 3: Unauthorized upload - ONLY in write-allowed modes
+                if not ALLOW_WRITES:
+                    logger.debug(f"⚠️ SAFE MODE: Skipping upload test for bucket '{bucket}'")
+                else:
+                    test_content = b"security_test_upload"
+                    response = await client.post(
                         f"{storage_url}/object/{bucket}/security_test.txt",
-                        headers=self.headers
+                        headers={**self.headers, "Content-Type": "text/plain"},
+                        content=test_content
                     )
+                    
+                    if response.status_code in [200, 201]:
+                        self.result.findings.append(SupabaseFinding(
+                            phase="FASE_3",
+                            title=f"Unauthorized upload to bucket '{bucket}'",
+                            severity=Severity.HIGH,
+                            description=f"Files can be uploaded to bucket '{bucket}' with just the anon key. "
+                                       "This may allow malicious file uploads.",
+                            evidence=f"Upload succeeded with status {response.status_code}",
+                            table_or_bucket=bucket,
+                            remediation="Add storage policies to restrict uploads to authenticated users",
+                            cwe="CWE-434"
+                        ))
+                        
+                        # Try to delete the test file (cleanup)
+                        await client.delete(
+                            f"{storage_url}/object/{bucket}/security_test.txt",
+                            headers=self.headers
+                        )
                 
                 # Test 4: Path traversal
                 traversal_paths = [
