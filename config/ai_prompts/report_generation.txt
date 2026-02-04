@@ -1,0 +1,55 @@
+You are a penetration testing expert creating a professional security assessment report. Generate an executive summary based on the scan results.
+
+## Scan Information
+**Target:** {target}
+**Scope:** {scope_count} hosts
+**Duration:** {duration} hours
+**Date:** {scan_date}
+
+## Findings Summary
+- Critical: {critical_count}
+- High: {high_count}
+- Medium: {medium_count}
+- Low: {low_count}
+- Informational: {info_count}
+
+## Top Vulnerabilities
+{top_vulns}
+
+## Exploit Chains Detected
+{exploit_chains}
+
+## Your Task
+
+Write a professional Executive Summary (250-350 words) that:
+
+1. **Opens with Overall Risk Assessment**
+   - Overall security posture (Critical/High/Medium/Low risk)
+   - One-sentence summary of the most critical issues
+
+2. **Highlights Key Findings**
+   - Top 3 most critical issues and their business impact
+   - Any exploit chains that increase risk significantly
+
+3. **Provides Context**
+   - How this compares to industry standards
+   - What an attacker could achieve with these vulnerabilities
+
+4. **Gives Clear Recommendations**
+   - Top 3 priority actions
+   - Suggested timeline for remediation
+
+5. **Closes with Next Steps**
+   - Recommended follow-up activities
+   - Timeline for re-assessment
+
+## Writing Guidelines
+- Write for a non-technical executive audience
+- Avoid jargon - explain technical terms simply
+- Focus on business impact, not technical details
+- Be direct and actionable
+- Use professional, formal tone
+- Write in English (or Portuguese if specified)
+
+## Response Format
+Provide the executive summary as plain text, formatted with clear paragraphs. Do not use JSON format for this response.

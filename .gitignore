@@ -1,0 +1,210 @@
+# ============================================================================
+# PHANTOM AI - .gitignore
+# Protects sensitive data from being pushed to GitHub
+# ============================================================================
+
+# ============================================================================
+# SECRETS & ENCRYPTION KEYS (CRITICAL - NEVER COMMIT)
+# ============================================================================
+.secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.yaml
+secrets.json
+.env
+.env.*
+!.env.example
+
+# Encrypted configuration files
+config/authorized_clients.enc
+config/authorized_targets.enc
+
+# Local settings with potential credentials
+config/settings.local.yaml
+config/settingsBUGBOUNTY.yaml
+
+# ============================================================================
+# SCAN RESULTS & REPORTS (Contains target data)
+# ============================================================================
+reports/
+ci-results/
+data/scans/
+data/reports/
+data/logs/
+data/metrics/
+data/checkpoints/
+
+# Scan output files
+*.log
+scan_*
+sqli_*.txt
+sqli_*.log
+pentest_*.log
+*_scan.log
+*_test.log
+*_output.log
+full_pentest_output.log
+
+# ============================================================================
+# CLIENT/TARGET DATA (Sensitive pentest data)
+# ============================================================================
+programs/
+data/knowledge_base_client/
+
+# ============================================================================
+# PYTHON
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# ============================================================================
+# IDEs & EDITORS
+# ============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================================
+# OS FILES
+# ============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.bak
+*.tmp
+*.temp
+
+# ============================================================================
+# DOCKER
+# ============================================================================
+docker-compose.override.yml
+.docker/
+
+# ============================================================================
+# JUPYTER NOTEBOOKS (May contain sensitive output)
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ============================================================================
+# DATABASE FILES
+# ============================================================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================================================
+# PHANTOM SPECIFIC
+# ============================================================================
+# Local phantom data
+~/.phantom/
+
+# Tool outputs (may contain sensitive data)
+tools/output/
+tools/results/
+tools/*.out
+
+# Knowledge base data (may contain target-specific data)
+data/knowledge/
+data/knowledge_base/
+
+# Wordlists (large files)
+data/wordlists/*.txt
+data/wordlists/*.lst
+!data/wordlists/README.md
+
+# Storage (session data, cache)
+storage/
+
+# Retest data
+retest/results/
+retest/data/
+
+# ============================================================================
+# LARGE FILES
+# ============================================================================
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.iso
+
+# ============================================================================
+# TEMPORARY & BACKUP FILES
+# ============================================================================
+*.orig
+*.backup
+*_backup
+*.old
+temp/
+tmp/

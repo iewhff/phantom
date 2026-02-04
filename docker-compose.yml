@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # Main pentesting service
+  pentest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-pentest
+    environment:
+      - AI_PENTEST_ENV=production
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      # Persistent data
+      - pentest-data:/app/data
+      - pentest-reports:/app/data/reports
+      # Configuration (optional override)
+      - ./config:/app/config:ro
+    networks:
+      - pentest-network
+    depends_on:
+      - ollama
+      - chromadb
+    restart: unless-stopped
+    
+  # Ollama for local LLM inference
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - pentest-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    # Pull models on startup
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        sleep 5 &&
+        ollama pull mistral &&
+        ollama pull codellama &&
+        wait
+      "
+
+  # ChromaDB for RAG/vector storage
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - pentest-network
+    restart: unless-stopped
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - pentest-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Web UI (optional - placeholder for future)
+  # webui:
+  #   build:
+  #     context: ./webui
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - pentest
+  #   networks:
+  #     - pentest-network
+
+networks:
+  pentest-network:
+    driver: bridge
+
+volumes:
+  pentest-data:
+  pentest-reports:
+  ollama-data:
+  chroma-data:
+  redis-data:

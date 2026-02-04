@@ -1,0 +1,408 @@
+# =============================================================================
+# PHANTOM AI - Configuration File
+# Professional Heuristic Automated Network Threat Operations Module
+# Version: 3.0.0 Enterprise Edition
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CORE SETTINGS
+# -----------------------------------------------------------------------------
+phantom:
+  version: "3.0.0"
+  codename: "Enterprise Edition"
+
+  # Default scan mode: quick, standard, thorough, full, stealth, bounty, client
+  default_mode: "standard"
+
+  # Default safety level: passive, safe, cautious, standard, aggressive
+  default_safety: "standard"
+
+  # Enable verbose logging
+  verbose: false
+
+  # Enable debug mode (very verbose)
+  debug: false
+
+# -----------------------------------------------------------------------------
+# RATE LIMITING
+# -----------------------------------------------------------------------------
+rate_limiting:
+  # Global rate limit (requests per second)
+  global_rate: 10.0
+
+  # Per-domain rate limit
+  per_domain_rate: 5.0
+
+  # Adaptive rate limiting (adjust based on target response)
+  adaptive: true
+
+  # Minimum rate when adapting (never go below this)
+  min_rate: 0.5
+
+  # Maximum rate when adapting (never go above this)
+  max_rate: 50.0
+
+  # Backoff on 429 responses (multiplier)
+  backoff_multiplier: 0.5
+
+  # Recovery rate after backoff
+  recovery_rate: 1.1
+
+  # Burst allowance (tokens)
+  burst_size: 10
+
+# -----------------------------------------------------------------------------
+# NETWORK PROTECTION (OPSEC)
+# -----------------------------------------------------------------------------
+network_protection:
+  # Enable kill switch (emergency stop)
+  kill_switch_enabled: true
+
+  # Kill switch triggers
+  kill_switch_triggers:
+    - consecutive_errors: 10
+    - rate_limit_exceeded: true
+    - out_of_scope_detected: true
+    - unusual_response_pattern: true
+
+  # Use Tor for anonymity (requires tor service)
+  use_tor: false
+  tor_port: 9050
+
+  # Proxy configuration
+  proxy:
+    enabled: false
+    http: ""
+    https: ""
+    socks5: ""
+
+  # User agent rotation
+  rotate_user_agent: true
+
+  # Request header randomization
+  randomize_headers: true
+
+# -----------------------------------------------------------------------------
+# SCANNING ENGINE
+# -----------------------------------------------------------------------------
+scanning:
+  # Maximum concurrent modules
+  max_concurrent_modules: 5
+
+  # Module timeout (seconds)
+  module_timeout: 300
+
+  # Request timeout (seconds)
+  request_timeout: 30
+
+  # Enable Linux tools integration (nmap, nuclei, sqlmap, etc.)
+  use_linux_tools: true
+
+  # Enable vulnerability chaining
+  enable_chaining: true
+
+  # Maximum chain depth
+  max_chain_depth: 5
+
+  # Enable AI-powered analysis
+  enable_ai_analysis: true
+
+  # Save intermediate results for resume capability
+  enable_checkpoints: true
+  checkpoint_interval: 60  # seconds
+
+# -----------------------------------------------------------------------------
+# VALIDATION PIPELINE (6-Stage)
+# -----------------------------------------------------------------------------
+validation:
+  # Enable 6-stage validation
+  enabled: true
+
+  # Minimum confidence to report finding
+  min_confidence: 0.75
+
+  # Enable AI verification stage
+  ai_verification: true
+
+  # Stages configuration
+  stages:
+    deduplication:
+      enabled: true
+    pattern_verification:
+      enabled: true
+      timeout: 10
+    safe_replay:
+      enabled: true
+      timeout: 15
+    negative_control:
+      enabled: true
+      timeout: 15
+    context_validation:
+      enabled: true
+      timeout: 20
+    ai_verification:
+      enabled: true
+      timeout: 30
+      model: "llama3.2"  # Ollama model for validation
+
+# -----------------------------------------------------------------------------
+# PAYLOAD SYSTEM
+# -----------------------------------------------------------------------------
+payloads:
+  # Enable WAF detection
+  waf_detection: true
+
+  # Enable automatic WAF bypass
+  waf_bypass: true
+
+  # Maximum payloads per test
+  max_payloads_per_test: 50
+
+  # Enable context-aware selection
+  context_aware: true
+
+  # Enable adaptive payload learning
+  adaptive_learning: true
+
+  # Payload encoding depth
+  max_encoding_depth: 3
+
+# -----------------------------------------------------------------------------
+# INTELLIGENCE (AI/ML)
+# -----------------------------------------------------------------------------
+intelligence:
+  # Knowledge base settings
+  knowledge_base:
+    enabled: true
+    path: "data/knowledge"
+    # ChromaDB collection name
+    collection: "phantom_security_kb"
+    # Embedding model
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+  # LLM settings (Ollama)
+  llm:
+    provider: "ollama"
+    base_url: "http://localhost:11434"
+    model: "llama3.2"
+    fallback_model: "mistral"
+    timeout: 60
+    temperature: 0.1
+
+  # Tech fingerprinting
+  fingerprinting:
+    enabled: true
+    min_confidence: 0.7
+    cve_lookup: true
+
+# -----------------------------------------------------------------------------
+# REPORTING
+# -----------------------------------------------------------------------------
+reporting:
+  # Default output format: pdf, html, json, md, sarif
+  default_format: "html"
+
+  # Output directory
+  output_dir: "reports"
+
+  # Include executive summary
+  executive_summary: true
+
+  # Include technical details
+  technical_details: true
+
+  # Include remediation steps
+  remediation: true
+
+  # Include compliance mapping (CWE, OWASP, PCI DSS)
+  compliance_mapping: true
+
+  # Include bounty estimation
+  bounty_estimation: false
+
+  # Chain visualization
+  chain_visualization: true
+  chain_format: "svg"  # svg, png, html
+
+# -----------------------------------------------------------------------------
+# BUG BOUNTY SETTINGS
+# -----------------------------------------------------------------------------
+bug_bounty:
+  # Default platform: hackerone, bugcrowd, intigriti
+  default_platform: "hackerone"
+
+  # Strict scope enforcement
+  strict_scope: true
+
+  # Required headers for identification
+  headers:
+    X-Bug-Bounty: "PHANTOM-AI"
+
+  # Rate limiting multiplier (more conservative)
+  rate_multiplier: 0.5
+
+  # Disable aggressive tests
+  disable_aggressive: true
+
+  # SSRF safety (block cloud metadata, private IPs)
+  ssrf_safety: true
+
+  # Bounty estimation ranges (USD)
+  payout_ranges:
+    critical:
+      min: 5000
+      max: 50000
+    high:
+      min: 1000
+      max: 10000
+    medium:
+      min: 300
+      max: 3000
+    low:
+      min: 50
+      max: 500
+
+# -----------------------------------------------------------------------------
+# CLIENT ENGAGEMENT SETTINGS
+# -----------------------------------------------------------------------------
+client:
+  # Methodology to follow: ptes, owasp, custom
+  methodology: "ptes"
+
+  # Enable subdomain enumeration
+  subdomain_enum: true
+
+  # Enable port scanning
+  port_scanning: true
+
+  # Comprehensive report
+  comprehensive_report: true
+
+  # Audit logging
+  audit_logging: true
+
+  # Evidence collection
+  evidence_collection: true
+
+# -----------------------------------------------------------------------------
+# CHAIN ENGINE
+# -----------------------------------------------------------------------------
+chain_engine:
+  # Automatic chain execution
+  auto_execute: false  # Requires explicit consent
+
+  # Maximum chains to attempt
+  max_chains: 10
+
+  # Chain timeout (seconds)
+  chain_timeout: 120
+
+  # Rollback on failure
+  rollback_on_failure: true
+
+  # Priority chains to attempt
+  priority_chains:
+    - "sqli_to_rce"
+    - "lfi_to_creds"
+    - "idor_to_enumeration"
+    - "ssrf_to_metadata"
+    - "auth_bypass_to_admin"
+
+# -----------------------------------------------------------------------------
+# LINUX TOOLS INTEGRATION
+# -----------------------------------------------------------------------------
+linux_tools:
+  # Tool paths (auto-detect if not specified)
+  paths:
+    nmap: ""
+    nuclei: ""
+    sqlmap: ""
+    ffuf: ""
+    gobuster: ""
+    nikto: ""
+    testssl: ""
+    arjun: ""
+
+  # Tool-specific settings
+  nmap:
+    scripts: "default,vuln"
+    ports: "1-1000"
+
+  nuclei:
+    severity: "medium,high,critical"
+    rate_limit: 150
+    templates: ""  # Use default
+
+  sqlmap:
+    level: 2
+    risk: 1
+    batch: true
+    techniques: "BEUSTQ"
+
+  ffuf:
+    threads: 40
+    wordlist: "/usr/share/wordlists/dirb/common.txt"
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+
+  # Log format: json, text
+  format: "json"
+
+  # Log directory
+  directory: "data/logs"
+
+  # Rotate logs
+  rotate: true
+  max_size_mb: 100
+  max_files: 10
+
+  # Structured logging fields
+  include_fields:
+    - timestamp
+    - level
+    - module
+    - scan_id
+    - target
+    - message
+
+# -----------------------------------------------------------------------------
+# STORAGE
+# -----------------------------------------------------------------------------
+storage:
+  # Database path
+  database: "data/phantom.db"
+
+  # Checkpoint directory
+  checkpoints: "data/checkpoints"
+
+  # Findings cache
+  findings_cache: "data/findings"
+
+  # Reports directory
+  reports: "reports"
+
+# -----------------------------------------------------------------------------
+# METRICS & TELEMETRY
+# -----------------------------------------------------------------------------
+metrics:
+  # Enable metrics collection
+  enabled: true
+
+  # Metrics to track
+  track:
+    - scan_duration
+    - findings_count
+    - false_positive_rate
+    - chain_success_rate
+    - waf_bypass_rate
+    - requests_total
+    - requests_404_rate
+
+  # Export format: json, prometheus
+  export_format: "json"
+  export_path: "data/metrics"

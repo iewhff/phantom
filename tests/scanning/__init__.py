@@ -1,0 +1,1 @@
+"""Scanning module tests."""

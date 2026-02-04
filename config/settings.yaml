@@ -1,0 +1,945 @@
+# =============================================================================
+# AI-Enhanced Pentesting Framework - CLIENT ENGAGEMENT Configuration
+# Version: 2.0.0-CLIENT
+# =============================================================================
+# This configuration is optimized for AUTHORIZED client pentesting engagements
+# - No anonymity/OPSEC (legitimate testing with client permission)
+# - Aggressive scanning (fast, comprehensive)
+# - No artificial rate limits or delays
+# - Extended/no timeouts for complete enumeration
+# - All security modules enabled
+# =============================================================================
+
+project:
+  name: "AI-Pentest Framework - Client Mode"
+  version: "2.0.0-CLIENT"
+  environment: "production"  # development, staging, production
+
+# =============================================================================
+# AI Model Configuration
+# =============================================================================
+ai:
+  provider: "ollama"
+  model: "${OLLAMA_MODEL:mistral:latest}"  # Use env var or default
+  base_url: "${OLLAMA_BASE_URL:http://localhost:11434}"  # Use env var or default
+  
+  # Generation parameters
+  temperature: 0.3
+  max_tokens: 4096
+  context_window: 128000
+  top_p: 0.9
+  
+  # Retry configuration
+  max_retries: 3
+  retry_delay: 1.0
+  timeout: 180  # Increased for complex analysis
+  
+  # Embeddings for RAG
+  embedding_model: "nomic-embed-text"
+
+# =============================================================================
+# Network Protection (OPSEC) - ENABLED FOR ANONYMOUS SCANNING
+# =============================================================================
+network_protection:
+  # Enable anonymization
+  enabled: true
+  
+  # Protection level: maximum (full anonymity)
+  level: "maximum"
+  
+  # Proxy configuration - DISABLED
+  proxy:
+    enabled: false
+    type: "http"
+    host: "127.0.0.1"
+    port: 8080
+    username: null
+    password: null
+  
+  # Tor integration - ENABLED
+  tor:
+    enabled: true
+    socks_port: 9050
+    control_port: 9051
+    password: null
+    rotate_circuit_every: 10
+
+  # SSL/TLS verification for HTTP client
+  # SECURITY: Keep verify_ssl=true in production for MITM protection
+  # Set to false ONLY for local lab environments with self-signed certs
+  ssl:
+    verify_ssl: true           # Verify SSL certificates (RECOMMENDED: true)
+    verify_hostname: true      # Verify hostname matches certificate
+    allow_self_signed: false   # Allow self-signed certificates (DANGEROUS)
+
+  # User-Agent settings - Consistent professional UA
+  user_agent:
+    rotate: false
+    use_realistic: true
+    custom: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 PentestFramework/2.0"
+
+  # Header randomization - DISABLED
+  headers:
+    randomize: false
+    add_dnt: true
+    
+  # IP Leak protection - DISABLED (not needed)
+  leak_protection:
+    check_before_scan: false
+    abort_on_leak: false
+    verify_every_n_requests: 0
+    
+  # DNS leak prevention - DISABLED
+  dns:
+    use_proxy_dns: false
+    custom_servers: []
+  
+  # ═══════════════════════════════════════════════════════════════════
+  # OPSEC SETTINGS - DISABLED FOR CLIENT MODE
+  # ═══════════════════════════════════════════════════════════════════
+  
+  # Kill Switch - DISABLED
+  kill_switch:
+    enabled: false
+    trigger_on_ip_leak: false
+    trigger_on_timeout: false
+  
+  # Human-like request timing - MINIMAL DELAYS
+  timing:
+    enabled: false  # No artificial delays
+    min_delay_ms: 0
+    max_delay_ms: 0
+    burst_probability: 1.0  # Always burst mode
+    jitter_enabled: false
+  
+  # Circuit rotation - DISABLED
+  circuit_rotation:
+    enabled: false
+    rotate_every_n_requests: 0
+    rotate_every_n_minutes: 0
+  
+  # Request limits - REMOVED
+  limits:
+    max_requests_per_domain: 999999
+    max_errors_before_pause: 100
+    pause_duration_seconds: 5
+  
+  # Canary system - DISABLED
+  canary:
+    enabled: false
+    check_every_n_minutes: 0
+  
+  # Evidence cleanup - KEEP LOGS FOR CLIENT REPORTING
+  cleanup:
+    auto_cleanup_logs: false
+    cleanup_on_exit: false
+    secure_delete: false
+
+  # ═══════════════════════════════════════════════════════════════════
+  # ELITE OPSEC SETTINGS - ALL DISABLED FOR CLIENT MODE
+  # ═══════════════════════════════════════════════════════════════════
+  
+  elite:
+    browser_emulation:
+      enabled: false
+      rotate_profile: false
+      rotation_interval: 0
+      profiles: ["chrome"]
+    
+    geo_exit:
+      enabled: false
+      preferred_region: ""
+      preferred_countries: []
+      exclude_countries: []
+      rotate_countries: false
+    
+    decoy_injection:
+      enabled: false
+      rate: 0.0
+      targets: []
+    
+    natural_navigation:
+      enabled: false
+      simulate_dwell_time: false
+      load_resources: false
+      maintain_referer_chain: true  # Keep this for proper testing
+    
+    session_isolation:
+      enabled: false
+      max_session_age_minutes: 0
+      clear_on_new_target: false
+    
+    traffic_obfuscation:
+      enabled: false
+      simulate_timezone: ""
+      burst_mode_probability: 1.0
+      random_pause_probability: 0.0
+      max_pause_seconds: 0
+    
+    request_entropy:
+      randomize_header_order: false
+      add_random_innocuous_headers: false
+      vary_accept_language: false
+    
+    proxy_chain:
+      enabled: false
+      hops: []
+
+# =============================================================================
+# Rate Limiting - AGGRESSIVE FOR CLIENT PENTESTING
+# =============================================================================
+rate_limit:
+  # Global limits - HIGH PERFORMANCE
+  requests_per_second: 20        # 20 req/sec (was 2 in bug bounty)
+  concurrent_scans: 10           # 10 concurrent (was 2 in bug bounty)
+  max_requests_per_minute: 1000  # 1000/min (was 90 in bug bounty)
+
+  # Adaptive rate limiting - More aggressive
+  adaptive: true
+  backoff_factor: 1.5
+  min_delay: 0.05               # 50ms min delay (was 0.5s)
+  max_delay: 10.0               # Reduce max delay
+
+  # Per-module limits - AGGRESSIVE
+  modules:
+    nuclei: 50     # 50 req/sec
+    nmap: 100      # 100 req/sec
+    dirbrute: 30   # 30 req/sec
+    subdomain: 50  # 50 req/sec for subdomain enum
+    default: 20    # 20 req/sec
+
+# =============================================================================
+# Timeouts (seconds) - EXTENDED FOR COMPLETE ENUMERATION
+# =============================================================================
+timeouts:
+  # Network operations
+  connection: 30      # Increased from 15
+  read: 120           # Increased from 45
+
+  # Scan phases - SIGNIFICANTLY EXTENDED
+  subdomain_enum: 7200     # 2 hours (was 10 min) - for massive wordlists
+  port_scan: 3600          # 1 hour (was 15 min) - for all ports
+  vuln_scan: 7200          # 2 hours (was 1 hour) - comprehensive testing
+  crawl: 3600              # 1 hour (was 15 min) - deep crawling
+
+  # Heavy module timeouts
+  module_heavy: 3600       # 1 hour per heavy module
+  module_normal: 1800      # 30 minutes per normal module
+
+  # AI operations
+  ai_analysis: 300         # 5 minutes
+  ai_generation: 360       # 6 minutes
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+storage:
+  # SQLite database
+  database_url: "sqlite+aiosqlite:///data/pentest-client.db"
+  
+  # Vector store (ChromaDB)
+  vector_store_path: "data/knowledge_base_client"
+  collection_name: "pentest_knowledge_client"
+  
+  # Encryption
+  encryption_key_file: ".secrets/encryption.key"
+  
+  # Cleanup - Keep data longer for client reporting
+  auto_cleanup_days: 90      # 90 days (was 30)
+  max_scan_history: 500      # 500 scans (was 100)
+
+# =============================================================================
+# Reconnaissance Settings - AGGRESSIVE ENUMERATION
+# =============================================================================
+reconnaissance:
+  # Subdomain enumeration - COMPREHENSIVE
+  subdomains:
+    wordlist: "data/wordlists/subdomains-100k.txt"  # Larger wordlist
+    wordlist_fallback: "data/wordlists/subdomains-10k.txt"
+    resolvers: "data/wordlists/resolvers.txt"
+    concurrent_resolvers: 100    # Increased from 50
+    use_crt_sh: true
+    use_virustotal: true         # Enable if you have API key
+    use_censys: true             # Enable if you have API key
+    use_shodan: true             # Enable if you have API key
+    use_securitytrails: true     # Enable if you have API key
+    use_threatcrowd: true
+    use_hackertarget: true
+    use_dnsdumpster: true
+    use_wayback: true            # Check wayback machine
+    bruteforce_enabled: true     # Enable subdomain bruteforce
+    permutation_enabled: true    # Try subdomain permutations
+    recursion_depth: 3           # Recursive subdomain discovery
+    
+  # Port scanning - ALL PORTS
+  ports:
+    default_ports: "all"         # Scan ALL 65535 ports (was top1000)
+    quick_scan_ports: "top1000"  # Quick scan option
+    scan_type: "syn"             # syn, connect, udp
+    timing: 5                    # nmap timing 5 = aggressive (was 4)
+    version_detection: true      # Enable service version detection
+    os_detection: true           # Enable OS detection
+    script_scan: true            # Enable NSE scripts
+    udp_scan: false              # Optional: enable UDP scanning (slow)
+    
+  # Web crawling - DEEP AND COMPREHENSIVE
+  crawler:
+    max_depth: 10                # Deep crawling (was 5)
+    max_pages: 10000             # Large sites (was 2000)
+    respect_robots: false        # Ignore robots.txt
+    follow_redirects: true
+    parse_forms: true
+    parse_javascript: true       # Extract URLs from JS
+    parse_comments: true         # Extract from comments
+    parse_css: true              # Extract URLs from CSS
+    parse_json: true             # Parse JSON responses
+    parse_xml: true              # Parse XML/SOAP
+    parse_api_docs: true         # Look for Swagger/OpenAPI
+    extract_emails: true         # Extract email addresses
+    extract_subdomains: true     # Extract additional subdomains
+    screenshot_enabled: true     # Take screenshots
+    technology_detection: true   # Detect technologies (Wappalyzer)
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    excluded_extensions: [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".avi", ".mp3", ".zip", ".tar", ".gz"]
+    include_extensions: [".php", ".asp", ".aspx", ".jsp", ".do", ".action", ".cgi", ".pl", ".py", ".rb", ".js", ".json", ".xml", ".yaml", ".yml"]
+    interesting_params: ["id", "user", "page", "file", "path", "url", "redirect", "next", "return", "callback", "data", "query", "search", "q", "cmd", "exec", "action", "admin", "debug", "test", "api", "key", "token", "session", "auth"]
+    follow_external_links: false  # Don't follow external domains
+    max_retries: 3
+    timeout: 30
+
+# =============================================================================
+# Scanning Modules - ALL ENABLED, AGGRESSIVE SETTINGS
+# =============================================================================
+scanning:
+  # Default modules to run - ALL MODULES
+  default_modules:
+    - nuclei
+    - headers
+    - ssl
+    - cors
+    - sqli
+    - xss
+    - xxe
+    - ssrf
+    - lfi
+    - rce
+    - idor
+    - nosql
+    - ldap
+    - dirbrute
+    - api_fuzzing
+    - jwt
+    - graphql
+    - websocket
+    
+  # Module-specific settings - AGGRESSIVE
+  modules:
+    nuclei:
+      enabled: true
+      templates_path: "~/.nuclei-templates"
+      severity: ["critical", "high", "medium", "low", "info"]  # All severities
+      exclude_tags: []  # Don't exclude anything (include dos, fuzz)
+      rate_limit: 50
+      timeout: 30
+      
+    sqli:
+      enabled: true
+      techniques: ["boolean", "time", "error", "union", "stacked"]  # All techniques
+      risk_level: 3  # Maximum risk level
+      payloads: "extended"  # Use extended payload set
+      tamper_scripts: true  # Use tamper scripts for WAF bypass
+      dbms: ["mysql", "postgresql", "mssql", "oracle", "sqlite"]  # All DBMS
+      
+    xss:
+      enabled: true
+      contexts: ["html", "attr", "js", "url", "css", "svg"]  # All contexts
+      polyglot_payloads: true
+      dom_xss: true  # Test for DOM-based XSS
+      stored_xss: true  # Test for stored XSS
+      waf_bypass: true  # Try WAF bypass techniques
+      
+    xxe:
+      enabled: true
+      test_blind: true
+      test_oob: true  # Out-of-band XXE
+      
+    ssrf:
+      enabled: true
+      test_internal_ips: true  # Test internal IP ranges
+      test_cloud_metadata: true  # Test cloud metadata endpoints
+      protocols: ["http", "https", "file", "gopher", "dict"]
+      
+    lfi:
+      enabled: true
+      depth: 10  # Directory traversal depth
+      test_rfi: true  # Also test RFI
+      wrappers: ["php", "data", "expect", "zip"]
+      
+    rce:
+      enabled: true
+      techniques: ["injection", "deserialization", "template"]
+      shells: true  # Try to upload web shells
+      
+    idor:
+      enabled: true
+      numeric_ids: true
+      uuid_ids: true
+      hash_ids: true
+      
+    nosql:
+      enabled: true
+      databases: ["mongodb", "couchdb", "redis"]
+      injection_types: ["auth_bypass", "data_extraction"]
+      
+    ldap:
+      enabled: true
+      injection_types: ["auth_bypass", "data_extraction"]
+      
+    dirbrute:
+      enabled: true
+      wordlist: "data/wordlists/directories-large.txt"  # Large wordlist
+      wordlist_fallback: "data/wordlists/directories.txt"
+      extensions: [".php", ".asp", ".aspx", ".jsp", ".html", ".js", ".json", ".xml", ".txt", ".bak", ".old", ".swp", ".config", ".env"]
+      recursive: true  # Recursive directory bruteforce
+      depth: 3
+      force_extensions: true
+      status_codes: [200, 204, 301, 302, 307, 401, 403, 405, 500]
+      
+    api_fuzzing:
+      enabled: true
+      methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+      test_verb_tampering: true
+      test_mass_assignment: true
+      
+    jwt:
+      enabled: true
+      test_none_alg: true
+      test_weak_secret: true
+      test_key_confusion: true
+      wordlist: "data/wordlists/jwt-secrets.txt"
+      
+    graphql:
+      enabled: true
+      introspection: true
+      depth_limit_test: true
+      batch_attack: true
+      
+    websocket:
+      enabled: true
+      test_hijacking: true
+      test_injection: true
+      
+    ssl:
+      enabled: true
+      check_ciphers: true
+      check_certificates: true
+      check_vulnerabilities: true  # Heartbleed, POODLE, etc.
+      test_tls_versions: true
+      
+    headers:
+      enabled: true
+      check_csp: true
+      check_hsts: true
+      check_all_security_headers: true
+      
+    cors:
+      enabled: true
+      test_origins: ["null", "https://evil.com", "http://attacker.com"]
+      test_wildcard: true
+      test_subdomain: true
+
+# =============================================================================
+# AI Analysis Settings
+# =============================================================================
+analysis:
+  # False positive filtering - Less aggressive
+  fp_filter:
+    enabled: true
+    confidence_threshold: 0.6  # Lower threshold (was 0.8)
+    use_signatures: true
+    use_ai: true
+    
+  # Exploit chain detection
+  chain_detection:
+    enabled: true
+    max_chain_length: 10  # Longer chains (was 5)
+    min_confidence: 0.5   # Lower threshold (was 0.7)
+    
+  # Exploit suggestion
+  exploit_suggest:
+    enabled: true
+    generate_poc: true
+    generate_full_exploit: true  # Generate complete exploits
+    severity_threshold: "low"    # All severities (was "high")
+
+# =============================================================================
+# Reporting
+# =============================================================================
+reporting:
+  # Output settings
+  default_format: "pdf"
+  available_formats: ["pdf", "html", "json", "markdown", "docx", "xlsx"]
+  
+  # Content settings
+  include_raw_data: true        # Include all raw data
+  anonymize_sensitive: false    # Don't anonymize (client engagement)
+  include_screenshots: true     # Include screenshots
+  include_payloads: true        # Include all payloads used
+  include_requests: true        # Include HTTP requests/responses
+  
+  # Filtering - Report everything
+  cvss_threshold: 0.0           # Report all findings (was 4.0)
+  
+  # Templates
+  default_template: "professional"
+  templates_path: "reporting/templates"
+  
+  # Branding - Customize for your company
+  company_name: "Your Company Name"
+  company_logo: "reporting/assets/logo.png"
+  
+  # Executive summary
+  include_executive_summary: true
+  include_risk_matrix: true
+  include_remediation_priority: true
+
+# =============================================================================
+# Logging - COMPREHENSIVE FOR CLIENT ENGAGEMENTS
+# =============================================================================
+logging:
+  level: "DEBUG"  # Detailed logging (was INFO)
+  format: "json"  # json, console
+  
+  # File logging
+  file:
+    enabled: true
+    path: "data/logs/client"
+    rotation: "50 MB"  # Larger rotation (was 10 MB)
+    retention: 180     # Keep longer (was 90 days)
+    
+  # Console output
+  console:
+    enabled: true
+    colors: true
+    verbose: true  # More verbose output
+    
+  # Sensitive data masking - Less aggressive
+  mask_patterns:
+    - "password"
+    - "api_key"
+    # Don't mask tokens and secrets - we need them for client reports
+
+# =============================================================================
+# API Keys (use environment variables in production)
+# =============================================================================
+apis:
+  virustotal_key: "${VIRUSTOTAL_API_KEY}"
+  shodan_key: "${SHODAN_API_KEY}"
+  censys_key: "${CENSYS_API_KEY}"
+  securitytrails_key: "${SECURITYTRAILS_API_KEY}"
+  binaryedge_key: "${BINARYEDGE_API_KEY}"
+  hunter_key: "${HUNTER_API_KEY}"
+
+# =============================================================================
+# Security Settings - CLIENT MODE
+# =============================================================================
+security:
+  # Target authorization - REQUIRED
+  require_authorization: true
+  authorized_targets_file: "config/authorized_clients.enc"
+  signed_contract_required: true  # Require signed contract on file
+  
+  # Scan restrictions
+  allowed_scan_hours:
+    start: "00:00"
+    end: "23:59"
+    timezone: "UTC"
+    # Or specify client's business hours if agreed
+    
+  # Network restrictions - MINIMAL (client networks)
+  excluded_ips:
+    # Only exclude truly dangerous ranges
+    - "127.0.0.0/8"       # Loopback
+  exclude_private_ips: false  # Allow scanning client's private IPs
+
+# =============================================================================
+# External Tools Paths
+# =============================================================================
+tools:
+  # System tools (in PATH)
+  nmap: "nmap"
+  nikto: "nikto"
+  sqlmap: "sqlmap"
+  gobuster: "gobuster"
+  dirb: "dirb"
+  hydra: "hydra"
+  masscan: "masscan"
+  zap: "zap-cli"
+  burpsuite: "burpsuite"
+  metasploit: "msfconsole"
+
+  # Local tools (in project tools/ directory)
+  nuclei: "tools/nuclei"
+  ffuf: "tools/ffuf"
+  httpx: "tools/httpx"
+  subfinder: "tools/subfinder"
+  amass: "tools/amass"
+  assetfinder: "tools/assetfinder"
+  waybackurls: "tools/waybackurls"
+  gau: "tools/gau"
+  hakrawler: "tools/hakrawler"
+
+  # Python tools (in venv)
+  wafw00f: ".venv/bin/wafw00f"
+  wpscan: ".venv/bin/wpscan"
+  
+  # Node tools
+  retire: "retire"
+  npm_audit: "npm"
+
+# =============================================================================
+# BUG BOUNTY SAFETY CONFIGURATION - DISABLED FOR CLIENT MODE
+# =============================================================================
+# This section is DISABLED for legitimate client pentesting engagements.
+# All safety restrictions are removed as we have written authorization.
+# =============================================================================
+bug_bounty:
+  # DISABLE bug bounty safety mode for client work
+  enabled: false
+
+  # Mode: aggressive (unlimited, authorized testing - was "client")
+  mode: "aggressive"
+
+  # Scope enforcement - Managed by contract
+  scope:
+    strict_enforcement: true      # Still enforce agreed scope
+    require_confirmation: true    # Confirm scope from contract
+    block_redirects_out_of_scope: false  # Allow testing redirects
+
+  # SSRF protection - MINIMAL (may need to test internal services)
+  ssrf_protection:
+    block_cloud_metadata: false   # May need to test
+    block_private_ips: false      # Client may want internal testing
+    block_localhost: false        # May need to test
+    block_dangerous_protocols: false
+    allowed_protocols:
+      - "http"
+      - "https"
+      - "ftp"
+      - "file"
+      - "gopher"
+      - "dict"
+
+  # Brute force protection - DISABLED (may be in scope)
+  brute_force:
+    block_login_attacks: false
+    block_otp_enumeration: false
+    max_auth_attempts: 999999
+
+  # DoS protection - CONTROLLED (discuss with client)
+  dos_protection:
+    block_large_payloads: false
+    max_payload_size_kb: 10240  # 10MB
+    block_recursive_requests: false
+    max_recursion_depth: 100
+    block_slow_http: false
+
+  # Rate limits - Use global aggressive limits
+  rate_limits:
+    client:
+      requests_per_second: 20
+      burst: 50
+      min_delay_ms: 0
+
+  # Logging - CRITICAL for client accountability and reporting
+  logging:
+    log_all_requests: true
+    log_blocked_requests: true
+    log_file: "logs/client_audit.jsonl"
+    include_timestamps: true
+    include_payloads: true        # Log payloads for client report
+    include_responses: true       # Log responses
+
+  # Kill switch - Only for emergencies
+  kill_switch:
+    enabled: true
+    trigger_on_scope_violation: true   # Still respect scope
+    trigger_on_rate_limit_exceeded: false
+    trigger_on_dangerous_action: false
+
+  # Legal disclaimer (shown before each scan)
+  disclaimer:
+    show_before_scan: true
+    require_acceptance: true
+    text: |
+      CLIENT PENTESTING MODE
+      
+      This scan is being performed under a signed contract with:
+      - Client: [CLIENT_NAME]
+      - Contract ID: [CONTRACT_ID]
+      - Authorized by: [AUTHORIZED_PERSON]
+      - Valid until: [EXPIRY_DATE]
+      
+      Ensure you have:
+      ✓ Signed statement of work (SOW)
+      ✓ Written authorization letter
+      ✓ Defined scope and rules of engagement
+      ✓ Emergency contact information
+      ✓ Agreed testing windows
+      
+      By continuing, you confirm all legal requirements are met.
+
+  # Client-specific settings
+  client_mode:
+    enabled: true
+    
+    # Evidence collection
+    evidence:
+      screenshot_all_findings: true
+      record_video: false  # Optional: record testing session
+      save_all_requests: true
+      save_all_responses: true
+      create_timeline: true
+      
+    # Collaboration
+    collaboration:
+      shared_workspace: true
+      real_time_updates: true
+      team_chat: false
+      
+    # Reporting
+    reporting:
+      auto_generate_daily: true
+      executive_summary: true
+      technical_details: true
+      remediation_guidance: true
+      retest_tracking: true
+
+# =============================================================================
+# CLIENT ENGAGEMENT TEMPLATES
+# =============================================================================
+# Pre-configured profiles for different types of client engagements
+# =============================================================================
+engagement_types:
+  
+  # Full external pentest (black box)
+  external_blackbox:
+    name: "External Black Box Penetration Test"
+    description: "Comprehensive external testing with no prior knowledge"
+    duration_days: 5
+    scope:
+      - subdomain_enumeration
+      - port_scanning
+      - vulnerability_scanning
+      - web_application_testing
+      - api_testing
+      - social_engineering_recon
+    modules:
+      - all_web_modules
+      - all_network_modules
+      - osint
+    credentials: false
+    internal_access: false
+    
+  # Internal network pentest (gray box)
+  internal_graybox:
+    name: "Internal Network Penetration Test"
+    description: "Internal network testing with limited credentials"
+    duration_days: 5
+    scope:
+      - network_scanning
+      - active_directory_testing
+      - lateral_movement
+      - privilege_escalation
+      - data_exfiltration
+    modules:
+      - network_modules
+      - ad_modules
+      - post_exploitation
+    credentials: true
+    credential_level: "user"
+    internal_access: true
+    
+  # Web application pentest (white box)
+  webapp_whitebox:
+    name: "Web Application Penetration Test (White Box)"
+    description: "Detailed web app testing with source code access"
+    duration_days: 10
+    scope:
+      - full_application_mapping
+      - authentication_testing
+      - authorization_testing
+      - business_logic
+      - api_security
+      - source_code_review
+    modules:
+      - all_web_modules
+      - api_modules
+      - code_analysis
+    credentials: true
+    credential_level: "multiple_roles"
+    source_code_access: true
+    
+  # API security assessment
+  api_security:
+    name: "API Security Assessment"
+    description: "Focused API testing (REST, GraphQL, SOAP)"
+    duration_days: 3
+    scope:
+      - api_discovery
+      - authentication_testing
+      - authorization_testing
+      - rate_limiting
+      - injection_testing
+      - mass_assignment
+    modules:
+      - api_fuzzing
+      - graphql
+      - jwt
+      - injection_modules
+    credentials: true
+    
+  # Cloud infrastructure pentest
+  cloud_pentest:
+    name: "Cloud Infrastructure Penetration Test"
+    description: "AWS/Azure/GCP security assessment"
+    duration_days: 7
+    scope:
+      - iam_review
+      - storage_security
+      - network_security
+      - compute_security
+      - database_security
+      - misconfiguration_scanning
+    modules:
+      - cloud_modules
+      - misconfiguration_scanners
+    credentials: true
+    credential_level: "read_only"
+    
+  # Mobile app pentest
+  mobile_pentest:
+    name: "Mobile Application Penetration Test"
+    description: "iOS/Android application security testing"
+    duration_days: 5
+    scope:
+      - static_analysis
+      - dynamic_analysis
+      - api_testing
+      - local_storage
+      - crypto_analysis
+      - network_communication
+    modules:
+      - mobile_modules
+      - api_modules
+      - crypto_modules
+    app_binary: required
+    
+  # Red team engagement
+  red_team:
+    name: "Red Team Engagement"
+    description: "Adversary simulation with defined objectives"
+    duration_days: 14
+    scope:
+      - everything
+    modules:
+      - all_modules
+      - social_engineering
+      - physical_security
+      - post_exploitation
+    stealth_mode: true
+    blue_team_notification: false
+
+# =============================================================================
+# PERFORMANCE TUNING
+# =============================================================================
+performance:
+  # Threading/concurrency
+  max_workers: 20              # Parallel workers
+  max_threads_per_module: 10   # Threads per module
+  
+  # Memory management
+  max_memory_percent: 80       # Max RAM usage
+  cache_size_mb: 1024          # 1GB cache
+  
+  # Database optimization
+  db_connection_pool_size: 20
+  db_pool_max_overflow: 10
+  
+  # Batch processing
+  batch_size: 1000
+  batch_commit_interval: 100
+
+# =============================================================================
+# NOTIFICATIONS (Optional - for long-running scans)
+# =============================================================================
+notifications:
+  enabled: true
+  
+  # Email notifications
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    username: "${EMAIL_USERNAME}"
+    password: "${EMAIL_PASSWORD}"
+    from_address: "pentest@yourcompany.com"
+    to_addresses:
+      - "pentester@yourcompany.com"
+    notify_on:
+      - scan_complete
+      - critical_finding
+      - error
+  
+  # Slack notifications
+  slack:
+    enabled: false
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+    channel: "#pentesting"
+    notify_on:
+      - scan_complete
+      - critical_finding
+  
+  # Discord notifications
+  discord:
+    enabled: false
+    webhook_url: "${DISCORD_WEBHOOK_URL}"
+    notify_on:
+      - scan_complete
+      - critical_finding
+
+# =============================================================================
+# QUALITY ASSURANCE
+# =============================================================================
+quality_assurance:
+  # Verification of findings
+  verify_findings: true
+  retest_attempts: 3
+  manual_verification_required: true  # Flag findings for manual review
+  
+  # Peer review
+  peer_review:
+    enabled: true
+    require_second_opinion: true  # For critical findings
+    
+  # False positive tracking
+  fp_tracking:
+    enabled: true
+    learn_from_manual_reviews: true
+    
+# =============================================================================
+# COMPLIANCE & STANDARDS
+# =============================================================================
+compliance:
+  # Standards to test against
+  standards:
+    - "OWASP Top 10"
+    - "OWASP API Security Top 10"
+    - "OWASP Mobile Top 10"
+    - "PCI DSS"
+    - "NIST"
+    - "CWE Top 25"
+    
+  # Report mapping
+  map_findings_to_standards: true
+  include_compliance_gaps: true

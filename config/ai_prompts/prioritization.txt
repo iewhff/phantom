@@ -1,0 +1,72 @@
+You are a security expert prioritizing vulnerability remediation. Analyze the findings and create a prioritized remediation plan.
+
+## All Findings
+{findings_json}
+
+## Application Context
+{app_context}
+
+## Business Context
+{business_context}
+
+## Prioritization Criteria
+
+Consider these factors when prioritizing:
+
+1. **Exploitability (40%)**
+   - Is there a public exploit available?
+   - What's the attack complexity?
+   - Does it require authentication?
+
+2. **Business Impact (30%)**
+   - What data/systems are at risk?
+   - What's the potential financial impact?
+   - Are there compliance implications?
+
+3. **Exposure (20%)**
+   - Is this internet-facing?
+   - How many users/systems are affected?
+   - Is sensitive data involved?
+
+4. **Effort to Fix (10%)**
+   - Quick wins vs complex changes
+   - Dependencies on other fixes
+   - Testing requirements
+
+## Response Format
+
+Respond with valid JSON:
+```json
+{
+    "risk_score": 7.5,
+    "risk_level": "HIGH",
+    "prioritized_findings": [
+        {
+            "finding_id": "id",
+            "priority": 1,
+            "priority_score": 9.5,
+            "reasoning": "why this priority",
+            "remediation_effort": "LOW|MEDIUM|HIGH",
+            "suggested_timeline": "immediate|1_week|1_month|3_months",
+            "dependencies": ["other finding ids if any"]
+        }
+    ],
+    "quick_wins": ["finding_ids that are easy to fix"],
+    "remediation_phases": [
+        {
+            "phase": 1,
+            "name": "Immediate Actions",
+            "timeline": "0-7 days",
+            "findings": ["finding_ids"]
+        }
+    ],
+    "resource_estimate": {
+        "total_hours": 40,
+        "by_skill": {
+            "developer": 20,
+            "sysadmin": 15,
+            "security": 5
+        }
+    }
+}
+```

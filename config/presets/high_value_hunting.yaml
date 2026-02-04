@@ -1,0 +1,268 @@
+# =============================================================================
+# HIGH-VALUE BUG BOUNTY HUNTING PRESET
+# =============================================================================
+# This preset prioritizes vulnerabilities that typically have the highest
+# payouts on bug bounty platforms like HackerOne and Bugcrowd.
+#
+# Based on 2025 HackerOne statistics:
+# - IDOR/Broken Access Control: Average $2,000-$15,000
+# - SSRF: Average $3,000-$10,000
+# - Authentication Bypass: Average $5,000-$25,000
+# - SQL Injection: Average $3,000-$15,000
+# - RCE: Average $10,000-$50,000+
+# - AI/LLM Vulnerabilities: Growing 540%, up to $30,000
+# =============================================================================
+
+name: "High-Value Bug Bounty Hunter"
+description: "Prioritizes high-payout vulnerabilities for bug bounty hunting"
+version: "1.0.0"
+
+# =============================================================================
+# SCANNING PRIORITIES
+# =============================================================================
+# Modules are ordered by typical bounty value (highest first)
+
+priority_modules:
+  # TIER 1 - Critical ($10,000+)
+  critical:
+    - name: "rce_scanner"
+      description: "Remote Code Execution - Highest payouts"
+      typical_bounty: "$10,000-$50,000+"
+      priority: 1
+
+    - name: "auth_bypass_scanner"
+      description: "Authentication Bypass"
+      typical_bounty: "$5,000-$25,000"
+      priority: 1
+
+    - name: "sqli_scanner"
+      description: "SQL Injection with data access"
+      typical_bounty: "$3,000-$15,000"
+      priority: 1
+
+  # TIER 2 - High ($3,000-$10,000)
+  high:
+    - name: "ssrf_scanner"
+      description: "Server-Side Request Forgery"
+      typical_bounty: "$3,000-$10,000"
+      priority: 2
+      notes: "Cloud metadata access = higher payout (but be careful!)"
+
+    - name: "api_logic_profiler"
+      description: "IDOR and Broken Access Control"
+      typical_bounty: "$2,000-$15,000"
+      priority: 2
+      notes: "Most common high-value vulnerability"
+
+    - name: "llm_security_scanner"
+      description: "AI/LLM Prompt Injection"
+      typical_bounty: "$5,000-$30,000"
+      priority: 2
+      notes: "540% growth in 2025 - emerging category"
+
+    - name: "business_logic_scanner"
+      description: "Business Logic Flaws"
+      typical_bounty: "$2,000-$10,000"
+      priority: 2
+
+  # TIER 3 - Medium ($500-$3,000)
+  medium:
+    - name: "xss_scanner"
+      description: "Cross-Site Scripting"
+      typical_bounty: "$500-$3,000"
+      priority: 3
+      notes: "Stored XSS = higher payout"
+
+    - name: "xxe_scanner"
+      description: "XML External Entity Injection"
+      typical_bounty: "$1,000-$5,000"
+      priority: 3
+
+    - name: "jwt_scanner"
+      description: "JWT Token Vulnerabilities"
+      typical_bounty: "$1,000-$5,000"
+      priority: 3
+
+    - name: "graphql_scanner"
+      description: "GraphQL Introspection & Injection"
+      typical_bounty: "$500-$3,000"
+      priority: 3
+
+  # TIER 4 - Lower but still valuable ($100-$500)
+  lower:
+    - name: "cors_scanner"
+      description: "CORS Misconfiguration"
+      typical_bounty: "$100-$1,000"
+      priority: 4
+
+    - name: "ssl_scanner"
+      description: "SSL/TLS Issues"
+      typical_bounty: "$100-$500"
+      priority: 4
+
+    - name: "header_scanner"
+      description: "Security Header Issues"
+      typical_bounty: "$50-$300"
+      priority: 4
+
+# =============================================================================
+# RECOMMENDED SCAN ORDER
+# =============================================================================
+# Run these modules in order for maximum efficiency
+
+scan_order:
+  # Phase 1: Quick wins (often overlooked by others)
+  phase_1_quick_wins:
+    timeout_minutes: 15
+    modules:
+      - api_logic_profiler     # IDOR - often missed, high payout
+      - jwt_scanner            # JWT issues - quick to test
+      - cors_scanner           # CORS - quick, often found
+      - graphql_scanner        # GraphQL introspection
+
+  # Phase 2: High-value deep testing
+  phase_2_high_value:
+    timeout_minutes: 60
+    modules:
+      - ssrf_scanner           # SSRF - high complexity, high payout
+      - auth_bypass_scanner    # Auth bypass
+      - business_logic_scanner # Business logic
+
+  # Phase 3: Injection testing
+  phase_3_injections:
+    timeout_minutes: 45
+    modules:
+      - sqli_scanner           # SQL injection
+      - xss_scanner            # XSS
+      - xxe_scanner            # XXE
+      - llm_security_scanner   # AI/LLM injection
+
+  # Phase 4: Code execution
+  phase_4_rce:
+    timeout_minutes: 30
+    modules:
+      - rce_scanner            # RCE - highest payout
+
+# =============================================================================
+# MODULE-SPECIFIC SETTINGS FOR HIGH-VALUE HUNTING
+# =============================================================================
+
+module_settings:
+  # IDOR/Access Control - Focus on ID enumeration
+  api_logic_profiler:
+    enabled: true
+    test_horizontal_privilege: true
+    test_vertical_privilege: true
+    test_numeric_ids: true
+    test_uuid_ids: true
+    test_sequential_ids: true
+    enum_range: 100  # Try 100 IDs around current ID
+    detect_patterns: true
+
+  # SSRF - Be careful with cloud metadata!
+  ssrf_scanner:
+    enabled: true
+    # IMPORTANT: In bug bounty mode, cloud metadata is blocked
+    test_localhost_bypass: true
+    test_dns_rebinding: true
+    test_protocol_smuggling: false  # Disabled for safety
+    safe_payloads_only: true
+
+  # SQL Injection - Focus on data extraction
+  sqli_scanner:
+    enabled: true
+    techniques:
+      - boolean
+      - time
+      - error
+      - union
+    risk_level: 2  # Medium risk (avoid stacked queries)
+    test_waf_bypass: true
+
+  # XSS - Focus on stored XSS
+  xss_scanner:
+    enabled: true
+    test_stored: true
+    test_reflected: true
+    test_dom: true
+    contexts:
+      - html
+      - attr
+      - js
+      - url
+
+  # AI/LLM Security
+  llm_security_scanner:
+    enabled: true
+    test_prompt_injection: true
+    test_jailbreak: true
+    test_data_extraction: true
+    test_output_manipulation: true
+
+  # Business Logic
+  business_logic_scanner:
+    enabled: true
+    test_race_conditions: true
+    test_price_manipulation: true
+    test_quantity_manipulation: true
+    test_workflow_bypass: true
+
+# =============================================================================
+# TIPS FOR MAXIMIZING BOUNTIES
+# =============================================================================
+
+hunting_tips:
+  general:
+    - "Focus on functionality others ignore (settings, profile, admin panels)"
+    - "Test all API endpoints, not just the documented ones"
+    - "Look for IDOR in every request with an ID parameter"
+    - "Check for auth bypass by removing/modifying tokens"
+    - "Test race conditions on state-changing operations"
+
+  idor:
+    - "Change numeric IDs: /api/user/1 -> /api/user/2"
+    - "Test with different user roles (admin vs user)"
+    - "Try UUID enumeration if pattern is predictable"
+    - "Check both GET and POST/PUT/DELETE methods"
+    - "Look for indirect references in export/download features"
+
+  ssrf:
+    - "Test URL parameters: ?url=, ?redirect=, ?callback="
+    - "Try localhost bypasses: 127.0.0.1, 0.0.0.0, localhost"
+    - "Test webhook/callback functionality"
+    - "Check PDF generation, image fetching features"
+
+  auth:
+    - "Test password reset flow for token leakage"
+    - "Try OAuth misconfigurations"
+    - "Check for JWT algorithm confusion (none, HS256 vs RS256)"
+    - "Test MFA bypass possibilities"
+
+  llm:
+    - "Test any AI/chatbot features for prompt injection"
+    - "Try to extract system prompts"
+    - "Test for indirect prompt injection via documents"
+    - "Check AI-generated content for data leakage"
+
+# =============================================================================
+# REPORT WRITING TIPS
+# =============================================================================
+
+report_tips:
+  impact_demonstration:
+    - "Show real data access, not just 'could potentially'"
+    - "Calculate business impact in monetary terms if possible"
+    - "Chain vulnerabilities for higher severity"
+    - "Include screenshots/videos of exploitation"
+
+  severity_boosters:
+    - "Account takeover = Critical"
+    - "PII/financial data access = Critical/High"
+    - "Admin access = Critical"
+    - "Ability to modify other users' data = High"
+
+  writing_style:
+    - "Clear, concise title describing the issue"
+    - "Step-by-step reproduction instructions"
+    - "Impact section explaining real-world consequences"
+    - "Remediation suggestions show expertise"
