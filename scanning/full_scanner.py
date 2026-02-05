@@ -311,6 +311,40 @@ class FullScanner:
         # Communications API Security (Twilio, SendGrid, Authy)
         # High-value for bounty programs - SMS pumping, toll fraud, phone enumeration
         "comms": "scanning.modules.communications_api_scanner.CommunicationsAPIScanner",
+
+        # Session & Token Abuse (CAMADA 4)
+        "session_abuse": "scanning.modules.session_abuse_scanner.SessionAbuseScanner",
+
+        # Creative Exploiter (CAMADA 4) - Senior pentester instinct
+        "creative_exploiter": "scanning.modules.creative_exploiter.CreativeExploiterScanner",
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MODULE SAFETY LEVELS - Minimum safety mode required to run each module.
+    # Modules not listed here default to "passive" (always allowed).
+    #
+    # Safety hierarchy: passive → safe → cautious → standard → aggressive → unrestricted
+    #
+    # RATIONALE:
+    # - aggressive: Modules that use raw sockets, can poison caches, or cause
+    #   request desync affecting other users (smuggling, cache poisoning)
+    # - standard: Modules that perform potentially disruptive tests like
+    #   DNS rebinding, race conditions, or post-exploitation
+    # - cautious: Modules that send active payloads but use standard HTTP
+    #   (most injection scanners)
+    # ═══════════════════════════════════════════════════════════════════════════
+    MODULE_SAFETY_LEVELS = {
+        # AGGRESSIVE: Can affect other users, uses raw sockets, or modifies shared state
+        "smuggling": "aggressive",       # Raw sockets, request desync affects other users
+        "cache": "aggressive",           # Poisons shared caches, affects real users
+        "cache_deception": "aggressive", # Web cache deception, affects cached responses
+        "postexploit": "standard",       # Post-exploitation, potentially destructive
+        "dns_rebind": "standard",        # DNS rebinding, can access internal services
+        "race": "standard",              # Race conditions, can create duplicate records/charges
+        "host_header": "standard",       # Host header attacks, can poison caches
+        "file_upload": "standard",       # File upload, can write files to server
+        "session_abuse": "cautious",     # POST for login/logout + token tampering
+        "creative_exploiter": "aggressive",  # Sends mutations, forged headers, identity swaps
     }
 
     # Module categories for selective scanning
@@ -319,7 +353,7 @@ class FullScanner:
         "web": ["sqli", "xss", "dom_xss", "cmdi", "lfi", "xxe", "ssrf", "csrf", "headers", "ssl", "cors"],
         "api": ["api", "graphql", "grpc", "websocket", "sse", "auth", "oauth", "ratelimit", "idor", "mass_assign"],
         "injection": ["sqli", "xss", "dom_xss", "cmdi", "xxe", "nosql", "ssti", "ldap", "crlf"],
-        "auth": ["auth", "oauth", "saml", "mfa", "authz", "ratelimit", "idor", "csrf"],
+        "auth": ["auth", "oauth", "saml", "mfa", "authz", "ratelimit", "idor", "csrf", "session_abuse"],
         "infra": ["ssl", "headers", "cors", "cloud", "k8s", "dns_rebind", "supabase", "firebase"],
         "advanced": ["smuggling", "cache", "deser", "prototype", "dns_rebind", "rls_bypass"],
 
@@ -330,7 +364,7 @@ class FullScanner:
             "sqli", "xss", "dom_xss", "cmdi", "xxe", "ssrf", "lfi",
             "nosql", "ssti", "ldap", "crlf",
             # Authentication & Authorization
-            "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor",
+            "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor", "session_abuse",
             # API Security
             "api", "graphql", "grpc", "websocket", "sse",
             # Infrastructure
@@ -338,7 +372,7 @@ class FullScanner:
             # Advanced Attacks
             "smuggling", "cache", "deser", "prototype", "cache_deception",
             # Business Logic
-            "business", "race", "mass_assign", "ratelimit",
+            "business", "race", "mass_assign", "ratelimit", "creative_exploiter",
             # Discovery
             "dir", "cms", "nuclei", "backend", "third_party",
             # BaaS
@@ -363,6 +397,7 @@ class FullScanner:
             "authz",          # Authorization bypass
             "auth",           # Authentication vulnerabilities
             "jwt",            # JWT misconfigurations - HIGH VALUE
+            "session_abuse",  # Session & token abuse - logout bypass, role escalation
             "ssrf",           # Server-Side Request Forgery
             "business",       # Business logic flaws - HIGH VALUE
             "race",           # Race conditions - HIGH VALUE
@@ -377,6 +412,7 @@ class FullScanner:
             "rls_bypass",     # Row Level Security bypass
             "mobile",         # Mobile API vulnerabilities
             "comms",          # Communications API (Twilio/SendGrid) - SMS pumping, toll fraud
+            "creative_exploiter",  # Creative exploitation - senior pentester instinct
         ],
 
         # BaaS (Backend-as-a-Service) focused scan
@@ -389,7 +425,7 @@ class FullScanner:
             "sqli", "xss", "dom_xss", "cmdi", "xxe", "ssrf", "lfi",
             "nosql", "ssti", "ldap", "crlf",
             # Authentication & Authorization
-            "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor",
+            "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor", "session_abuse",
             # API Security
             "api", "graphql", "grpc", "websocket", "sse",
             # Infrastructure
@@ -397,7 +433,7 @@ class FullScanner:
             # Advanced Attacks
             "smuggling", "cache", "deser", "prototype", "cache_deception",
             # Business Logic
-            "business", "race", "mass_assign", "ratelimit",
+            "business", "race", "mass_assign", "ratelimit", "creative_exploiter",
             # Discovery
             "dir", "cms", "nuclei", "backend", "third_party",
             # BaaS
@@ -584,13 +620,25 @@ class FullScanner:
         """Dynamically load a scanner module."""
         if name in self.loaded_modules:
             return self.loaded_modules[name]
-        
+
         if name not in self.ALL_MODULES:
             logger.warning(f"Unknown module: {name}")
             return None
-        
+
+        # Second-layer safety check: prevent loading dangerous modules
+        required_level = self.MODULE_SAFETY_LEVELS.get(name, "passive")
+        SAFETY_HIERARCHY = ["passive", "safe", "cautious", "standard", "aggressive", "unrestricted"]
+        current_idx = SAFETY_HIERARCHY.index(self.safe_mode) if self.safe_mode in SAFETY_HIERARCHY else 1
+        required_idx = SAFETY_HIERARCHY.index(required_level) if required_level in SAFETY_HIERARCHY else 0
+        if current_idx < required_idx:
+            logger.warning(
+                f"SAFETY BLOCK (load): Module '{name}' requires '{required_level}' mode, "
+                f"current mode is '{self.safe_mode}'"
+            )
+            return None
+
         module_path = self.ALL_MODULES[name]
-        
+
         try:
             parts = module_path.rsplit(".", 1)
             module_name, class_name = parts[0], parts[1]
@@ -616,6 +664,7 @@ class FullScanner:
         concurrent: int = 5,
         skip_classification: bool = False,
         use_linux_tools: bool = True,  # ENABLED BY DEFAULT - tools run before modules
+        on_progress: Optional[Any] = None,  # Callback(result) for incremental state updates
     ) -> ScanResult:
         """
         Run security scan on target with INTELLIGENT INFRASTRUCTURE.
@@ -649,6 +698,11 @@ class FullScanner:
             safe_mode=self.safe_mode,
             intelligent_mode=self.intelligent_mode,
         )
+
+        # Set target locality BEFORE modules are loaded — allows ScopeGuard
+        # to permit localhost requests when the scan target itself is localhost
+        from scanning.vuln_scanner import ScanModule
+        ScanModule.set_target_is_local(target)
 
         # Initialize Evidence Engine v3.0 session for comprehensive evidence collection
         # This provides automatic screenshots, timeline reconstruction, and evidence packages
@@ -761,15 +815,33 @@ class FullScanner:
                                 })
 
                             # Merge module recommendations from TechIntelligence
-                            # (TechIntelligence is more specific, so prioritize it)
+                            # SAFEGUARD: Never skip critical injection modules based on
+                            # tech fingerprinting alone. The cost of missing a real SQLi/XXE
+                            # far outweighs the ~30s cost of running the module. Many apps
+                            # defy assumptions (e.g., Node.js with SQLite, Express with XML).
+                            NEVER_SKIP_MODULES = {
+                                'sqli', 'xss', 'dom_xss', 'nosql', 'cmdi', 'xxe', 'ssti', 'lfi', 'ssrf',
+                            }
+                            _tech_skipped = 0
+                            _tech_protected = []
                             for mod in self.tech_analysis.skip_modules:
+                                if mod in NEVER_SKIP_MODULES:
+                                    _tech_protected.append(mod)
+                                    continue  # Never skip injection modules
                                 if mod not in skipped_modules:
                                     skipped_modules.append(mod)
+                                    _tech_skipped += 1
                                 if mod in self.tech_analysis.skip_reasons and mod not in skip_reasons:
                                     skip_reasons[mod] = self.tech_analysis.skip_reasons[mod]
 
+                            if _tech_protected:
+                                logger.info(
+                                    f"   🛡️ Protected {len(_tech_protected)} injection modules from skip: "
+                                    f"{_tech_protected}"
+                                )
+
                             logger.info(f"   Recommended Modules: {len(self.tech_analysis.recommended_modules)}")
-                            logger.info(f"   Skip Modules: {len(self.tech_analysis.skip_modules)}")
+                            logger.info(f"   Skip Modules: {_tech_skipped} (of {len(self.tech_analysis.skip_modules)} suggested)")
 
                             # Store tech analysis in result
                             result.info.append({
@@ -842,6 +914,32 @@ class FullScanner:
                 logger.warning(f"Target classification failed: {e}")
                 self.classification = None
 
+        # Phase 0.8: Domain Classification
+        # After endpoints are discovered, classify the business domain
+        try:
+            from scanning.domain_classifier import DomainClassifier
+            endpoint_map_instance = EndpointMap.get_instance()
+            classifier = DomainClassifier(
+                endpoint_map=endpoint_map_instance,
+                tech_analysis=getattr(self, 'tech_analysis', None),
+            )
+            self._domain_classification = await classifier.classify(target, self.rate_limiter)
+            if self._domain_classification.primary.value != "unknown":
+                logger.info(
+                    f"   Domain classified: {self._domain_classification.primary.value} "
+                    f"(confidence={self._domain_classification.confidence:.0%})"
+                )
+            result.info.append({
+                "type": "domain_classification",
+                "domain": self._domain_classification.primary.value,
+                "confidence": self._domain_classification.confidence,
+                "signals": self._domain_classification.signals[:10],
+                "features": sorted(self._domain_classification.detected_features),
+            })
+        except Exception as e:
+            logger.debug(f"Domain classification skipped: {e}")
+            self._domain_classification = None
+
         # Phase 1: Verify network protection
         await self._verify_network_protection(result)
 
@@ -857,6 +955,44 @@ class FullScanner:
 
         # Track what was requested vs what will run
         result.modules_requested = list(module_names)
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # SAFETY FILTER: Remove modules that require a higher safety level
+        # than what is currently configured. This prevents dangerous modules
+        # (smuggling, cache poisoning, etc.) from running in safe/cautious modes.
+        # ═══════════════════════════════════════════════════════════════════════
+        SAFETY_HIERARCHY = ["passive", "safe", "cautious", "standard", "aggressive", "unrestricted"]
+        current_safety_idx = SAFETY_HIERARCHY.index(self.safe_mode) if self.safe_mode in SAFETY_HIERARCHY else 1
+
+        safety_blocked = []
+        safety_filtered = []
+        for mod in module_names:
+            required_level = self.MODULE_SAFETY_LEVELS.get(mod, "passive")
+            required_idx = SAFETY_HIERARCHY.index(required_level) if required_level in SAFETY_HIERARCHY else 0
+            if current_safety_idx >= required_idx:
+                safety_filtered.append(mod)
+            else:
+                safety_blocked.append(mod)
+                logger.warning(
+                    f"SAFETY BLOCK: Module '{mod}' requires safety_mode='{required_level}' "
+                    f"but current mode is '{self.safe_mode}' — skipping to protect target"
+                )
+                result.tests_skipped += 1
+                if mod not in result.modules_not_executed:
+                    result.modules_not_executed.append(mod)
+
+        if safety_blocked:
+            module_names = safety_filtered
+            logger.info(
+                f"Safety filter: blocked {len(safety_blocked)} dangerous modules "
+                f"({', '.join(safety_blocked)}) in {self.safe_mode} mode"
+            )
+            result.info.append({
+                "type": "safety_filter",
+                "message": f"Blocked {len(safety_blocked)} modules that require higher safety level",
+                "blocked_modules": safety_blocked,
+                "current_mode": self.safe_mode,
+            })
 
         # Filter modules based on classification (if available)
         if skipped_modules and not modules:  # Only filter if not using explicit modules
@@ -968,11 +1104,26 @@ class FullScanner:
         if use_linux_tools:
             await self._run_linux_tools_scan(result, target)
 
+        # Phase 2.5: Auth Acquisition — acquire auth token for business logic testing
+        self._auth_context = None
+        try:
+            from scanning.auth_context import AuthAcquisition, AuthContext
+            auth_acq = AuthAcquisition()
+            self._auth_context = await auth_acq.acquire(target, None)
+            if self._auth_context.has_auth:
+                logger.info(f"[AUTH] Token acquired via {self._auth_context.method} ({self._auth_context.email}) — basket_id={self._auth_context.basket_id}")
+            else:
+                logger.warning("[AUTH] No authentication acquired — business logic tests will be limited")
+        except Exception as e:
+            logger.warning(f"[AUTH] Auth acquisition failed: {e}")
+            from scanning.auth_context import AuthContext
+            self._auth_context = AuthContext()
+
         # Phase 3: Execute modules
         module_results = await self._execute_modules(target, module_names, concurrent)
 
         # Phase 4: Aggregate and validate results
-        self._aggregate_results(result, module_names, module_results)
+        self._aggregate_results(result, module_names, module_results, on_progress=on_progress)
 
         # Phase 4.3: Vulnerability chain processing
         # Process findings to discover additional vulnerabilities through chaining
@@ -1140,21 +1291,41 @@ class FullScanner:
         logger.debug(f"Module timeouts: heavy={timeout_heavy}s, normal={timeout_normal}s")
         module_instances: dict[str, Any] = {}
 
+        import time as _time
+        _total = len(module_names)
+        _completed = 0
+
         async def run_module(name: str) -> dict:
+            nonlocal _completed
             async with semaphore:
                 module = self._load_module(name)
                 if module:
                     module_instances[name] = module
+                else:
+                    _completed += 1
+                    logger.warning(f"   [{_completed}/{_total}] {name}: SKIPPED (failed to load)")
+                    return {"findings": [], "info": [], "error": f"module {name} failed to load"}
 
+                t0 = _time.monotonic()
+                logger.info(f"   [{_completed + 1}/{_total}] {name}: STARTING...")
                 try:
                     timeout = timeout_heavy if name in HEAVY_MODULES else timeout_normal
-                    return await asyncio.wait_for(
+                    result = await asyncio.wait_for(
                         self._run_single_module_with_instance(name, target, module),
                         timeout=timeout
                     )
+                    elapsed = _time.monotonic() - t0
+                    n_findings = len(result.get("findings", []))
+                    _completed += 1
+                    if n_findings > 0:
+                        logger.info(f"   [{_completed}/{_total}] {name}: DONE in {elapsed:.1f}s — {n_findings} finding(s)")
+                    else:
+                        logger.info(f"   [{_completed}/{_total}] {name}: DONE in {elapsed:.1f}s — clean")
+                    return result
                 except asyncio.TimeoutError:
                     timeout = timeout_heavy if name in HEAVY_MODULES else timeout_normal
-                    logger.warning(f"Module {name} timed out after {timeout}s")
+                    _completed += 1
+                    logger.warning(f"   [{_completed}/{_total}] {name}: TIMEOUT after {timeout}s")
 
                     # Recover partial findings
                     partial_findings = []
@@ -1164,15 +1335,20 @@ class FullScanner:
                             try:
                                 partial_findings = instance.get_partial_findings()
                                 if partial_findings:
-                                    logger.info(f"🔄 Recovered {len(partial_findings)} partial findings from {name}")
+                                    logger.info(f"   Recovered {len(partial_findings)} partial findings from {name}")
                             except Exception as e:
-                                logger.warning(f"Failed to get partial findings from {name}: {e}")
+                                logger.warning(f"   Failed to get partial findings from {name}: {e}")
 
                     return {
                         "findings": partial_findings,
                         "info": [],
                         "error": f"timeout after {timeout}s (recovered {len(partial_findings)} findings)"
                     }
+                except Exception as e:
+                    elapsed = _time.monotonic() - t0
+                    _completed += 1
+                    logger.warning(f"   [{_completed}/{_total}] {name}: ERROR in {elapsed:.1f}s — {e}")
+                    return {"findings": [], "info": [], "error": str(e)}
 
         tasks = [run_module(name) for name in module_names]
         return await asyncio.gather(*tasks, return_exceptions=True)
@@ -1182,6 +1358,7 @@ class FullScanner:
         result: ScanResult,
         module_names: list[str],
         module_results: list[dict | Exception],
+        on_progress: Optional[Any] = None,
     ) -> None:
         """Aggregate module results with intelligent validation."""
         for i, mod_result in enumerate(module_results):
@@ -1192,6 +1369,11 @@ class FullScanner:
                     "module": module_name,
                     "error": str(mod_result),
                 })
+                if on_progress:
+                    try:
+                        on_progress(result)
+                    except Exception:
+                        pass
                 continue
 
             result.modules_run.append(module_name)
@@ -1230,6 +1412,13 @@ class FullScanner:
 
             result.info.extend(mod_result.get("info", []))
 
+            # Incremental progress callback — lets CLI save partial state
+            if on_progress:
+                try:
+                    on_progress(result)
+                except Exception:
+                    pass
+
     def _deduplicate_findings(self, result: ScanResult) -> None:
         """
         Deduplicate findings across modules.
@@ -1265,7 +1454,13 @@ class FullScanner:
             matched_at = finding.get("matched_at", "")
 
             # Create dedup key
-            key = f"{normalized_type}:{host}:{matched_at}"
+            # For business logic findings, include name since different vuln types
+            # can exist at the same endpoint (e.g., IDOR + negative quantity)
+            name = finding.get("name", "")
+            if normalized_type in ("business_logic", "session_abuse") and name:
+                key = f"{normalized_type}:{name}:{host}:{matched_at}"
+            else:
+                key = f"{normalized_type}:{host}:{matched_at}"
 
             if key not in seen_keys:
                 seen_keys.add(key)
@@ -1694,6 +1889,14 @@ class FullScanner:
             # Modules can query this to see what other modules have found
             asset_data["shared_findings_store"] = get_shared_findings()
 
+            # Add auth context for business logic, race condition, and IDOR modules
+            if hasattr(self, '_auth_context') and self._auth_context:
+                asset_data["auth_context"] = self._auth_context
+
+            # Add domain classification for business logic scanner
+            if hasattr(self, '_domain_classification') and self._domain_classification:
+                asset_data["domain_classification"] = self._domain_classification
+
             # Run the scan - try different method signatures
             result = None
 
@@ -1717,6 +1920,13 @@ class FullScanner:
                     module.rate_limiter = rate_limiter
                 except AttributeError:
                     pass  # Read-only or no such attribute
+
+            # Inject auth context for race condition scanner
+            if name == "race" and hasattr(self, '_auth_context') and self._auth_context:
+                try:
+                    module._auth_context = self._auth_context
+                except AttributeError:
+                    pass
 
             # Extract endpoints list for modules that expect List[str] instead of dict
             endpoints_list = asset_data.get("endpoints", [target])
@@ -1748,6 +1958,8 @@ class FullScanner:
                 # Other critical modules
                 "mobile", "email", "subdomain_takeover",
                 "llm", "post_exploit",
+                # Session & Token Abuse
+                "session_abuse",
             }
 
             if hasattr(module, "scan"):

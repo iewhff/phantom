@@ -668,10 +668,99 @@ class ComplianceConfig(BaseModel):
 
 class ProjectConfig(BaseModel):
     """Project metadata configuration."""
-    
+
     name: str = "AI-Pentest Framework"
     version: str = "2.0.0"
     environment: str = "production"
+
+
+# =============================================================================
+# GDPR COMPLIANCE CONFIGURATION
+# =============================================================================
+
+class GDPRRetentionConfig(BaseModel):
+    """GDPR data retention configuration."""
+    scan_data_days: int = Field(default=30, ge=1)
+    log_retention_days: int = Field(default=90, ge=1)
+    report_retention_days: int = Field(default=365, ge=1)
+    gdpr_records_days: int = Field(default=1095, ge=365)  # 3 years minimum
+
+
+class GDPRCleanupConfig(BaseModel):
+    """GDPR cleanup configuration."""
+    enabled: bool = True
+    run_on_startup: bool = True
+    schedule: str = "weekly"
+
+
+class GDPRPIIProtectionConfig(BaseModel):
+    """GDPR PII protection configuration."""
+    anonymize_in_logs: bool = True
+    anonymize_in_reports: bool = False
+    redact_sensitive_fields: bool = True
+    detect_types: list[str] = Field(default_factory=lambda: [
+        "email", "phone", "credit_card", "ip_address", "jwt", "password_field"
+    ])
+
+
+class GDPRDataMinimizationConfig(BaseModel):
+    """GDPR data minimization configuration."""
+    store_full_responses: bool = False
+    max_evidence_length: int = Field(default=1000, ge=100)
+    store_non_findings: bool = False
+
+
+class GDPRSubjectRightsConfig(BaseModel):
+    """GDPR subject rights configuration."""
+    enabled: bool = True
+    erasure_requires_confirmation: bool = True
+    log_requests: bool = True
+
+
+class GDPRProcessingRecordsConfig(BaseModel):
+    """GDPR processing records configuration."""
+    enabled: bool = True
+    file: str = "data/gdpr/processing_records.jsonl"
+
+
+class GDPRPathsConfig(BaseModel):
+    """GDPR paths configuration."""
+    data_root: str = "data"
+    gdpr_records: str = "data/gdpr"
+    exports: str = "data/gdpr/exports"
+
+
+class GDPRLegalBasisConfig(BaseModel):
+    """GDPR legal basis configuration."""
+    default: str = "Legitimate interest / Authorized security testing"
+    alternatives: list[str] = Field(default_factory=lambda: [
+        "Contractual obligation",
+        "Legal obligation"
+    ])
+
+
+class GDPRConfig(BaseModel):
+    """
+    GDPR compliance configuration.
+
+    Implements requirements from Regulation (EU) 2016/679:
+    - Art. 5: Data minimization, storage limitation
+    - Art. 15: Right of access
+    - Art. 17: Right to erasure
+    - Art. 20: Right to data portability
+    - Art. 25: Privacy by design
+    - Art. 30: Processing records
+    - Art. 32: Security of processing
+    """
+    enabled: bool = True
+    retention: GDPRRetentionConfig = Field(default_factory=GDPRRetentionConfig)
+    cleanup: GDPRCleanupConfig = Field(default_factory=GDPRCleanupConfig)
+    pii_protection: GDPRPIIProtectionConfig = Field(default_factory=GDPRPIIProtectionConfig)
+    data_minimization: GDPRDataMinimizationConfig = Field(default_factory=GDPRDataMinimizationConfig)
+    subject_rights: GDPRSubjectRightsConfig = Field(default_factory=GDPRSubjectRightsConfig)
+    processing_records: GDPRProcessingRecordsConfig = Field(default_factory=GDPRProcessingRecordsConfig)
+    paths: GDPRPathsConfig = Field(default_factory=GDPRPathsConfig)
+    legal_basis: GDPRLegalBasisConfig = Field(default_factory=GDPRLegalBasisConfig)
 
 
 class Settings(BaseSettings):
@@ -704,6 +793,7 @@ class Settings(BaseSettings):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     quality_assurance: QualityAssuranceConfig = Field(default_factory=QualityAssuranceConfig)
     compliance: ComplianceConfig = Field(default_factory=ComplianceConfig)
+    gdpr: GDPRConfig = Field(default_factory=GDPRConfig)
 
     class Config:
         env_prefix = "PENTEST_"

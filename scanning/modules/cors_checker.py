@@ -29,9 +29,9 @@ class CORSChecker(ScanModule):
     - Null origin acceptance
     - Origin reflection
     - Credential exposure
-    - Subdomain bypass (evil.target.com)
-    - Suffix bypass (target.com.evil.com)
-    - Prefix bypass (eviltarget.com)
+    - Subdomain bypass (attacker.target.com)
+    - Suffix bypass (target.com.attacker.example.com)
+    - Prefix bypass (attacker-target.com)
     - Protocol downgrade (https → http)
     - Preflight bypass techniques
     - Cloudflare/CDN bypass patterns
@@ -47,7 +47,7 @@ class CORSChecker(ScanModule):
         module_config = settings.scanning.modules.get("cors", {})
         self.base_origins = module_config.get(
             "test_origins",
-            ["null", "https://evil.com", "https://attacker.com"]
+            ["null", "https://attacker.example.com", "https://test.example.com"]
         )
 
     def _generate_bypass_origins(self, target: str) -> list[dict[str, Any]]:
@@ -66,34 +66,34 @@ class CORSChecker(ScanModule):
         origins = [
             # Standard attacks
             {"origin": "null", "type": "null_origin", "description": "Null origin (sandboxed iframe)"},
-            {"origin": "https://evil.com", "type": "arbitrary", "description": "Arbitrary origin"},
+            {"origin": "https://attacker.example.com", "type": "arbitrary", "description": "Arbitrary external origin"},
 
             # Subdomain bypass - pretend to be a subdomain
-            {"origin": f"https://evil.{base_domain}", "type": "subdomain_inject",
-             "description": f"Subdomain injection: evil.{base_domain}"},
             {"origin": f"https://attacker.{base_domain}", "type": "subdomain_inject",
-             "description": f"Attacker subdomain: attacker.{base_domain}"},
+             "description": f"Subdomain injection: attacker.{base_domain}"},
+            {"origin": f"https://test.{base_domain}", "type": "subdomain_inject",
+             "description": f"Test subdomain: test.{base_domain}"},
 
-            # Suffix bypass - target.com.evil.com
-            {"origin": f"https://{base_domain}.evil.com", "type": "suffix_bypass",
-             "description": f"Suffix bypass: {base_domain}.evil.com"},
+            # Suffix bypass - target.com.attacker.example.com
+            {"origin": f"https://{base_domain}.attacker.example.com", "type": "suffix_bypass",
+             "description": f"Suffix bypass: {base_domain}.attacker.example.com"},
 
-            # Prefix bypass - eviltarget.com
-            {"origin": f"https://evil{base_domain}", "type": "prefix_bypass",
-             "description": f"Prefix bypass: evil{base_domain}"},
+            # Prefix bypass - attacker-target.com
+            {"origin": f"https://attacker-{base_domain}", "type": "prefix_bypass",
+             "description": f"Prefix bypass: attacker-{base_domain}"},
 
             # Protocol downgrade
             {"origin": f"http://{domain}", "type": "protocol_downgrade",
              "description": "HTTP protocol downgrade"},
 
             # Regex bypass with special chars
-            {"origin": f"https://{base_domain}%60.evil.com", "type": "regex_bypass",
+            {"origin": f"https://{base_domain}%60.attacker.example.com", "type": "regex_bypass",
              "description": "Regex bypass with backtick"},
-            {"origin": f"https://{base_domain}%00.evil.com", "type": "null_byte",
+            {"origin": f"https://{base_domain}%00.attacker.example.com", "type": "null_byte",
              "description": "Null byte injection"},
 
             # Underscore/hyphen variations
-            {"origin": f"https://{base_domain.replace('.', '_')}.evil.com", "type": "underscore_bypass",
+            {"origin": f"https://{base_domain.replace('.', '_')}.attacker.example.com", "type": "underscore_bypass",
              "description": "Underscore domain bypass"},
 
             # Cloudflare bypass patterns
@@ -148,6 +148,20 @@ class CORSChecker(ScanModule):
 
         for test_url in test_urls:
             try:
+                # Collect ALL test evidence for this URL so the report
+                # can show real captured data for every step (arbitrary,
+                # null, preflight) — not just the single finding that won
+                # deduplication.
+                url_evidence_map: dict[str, dict] = {}
+
+                # Capture baseline: request WITHOUT Origin header.
+                # This proves CORS headers only appear when Origin is sent
+                # (i.e., they are reflection-based, not always-present).
+                await rate_limiter.acquire()
+                baseline_ev = await self._capture_baseline(test_url)
+                if baseline_ev:
+                    url_evidence_map["baseline"] = baseline_ev
+
                 # Test each bypass origin
                 for origin_config in bypass_origins:
                     await rate_limiter.acquire()
@@ -160,13 +174,28 @@ class CORSChecker(ScanModule):
                     )
 
                     if result:
+                        # Stash this test's evidence keyed by attack type
+                        ev = (result.metadata or {}).get("http_evidence")
+                        if ev:
+                            url_evidence_map[origin_config["type"]] = ev
                         findings.append(result)
 
                 # Test preflight bypass
                 await rate_limiter.acquire()
                 preflight_result = await self._test_preflight_bypass(test_url)
                 if preflight_result:
+                    ev = (preflight_result.metadata or {}).get("http_evidence")
+                    if ev:
+                        url_evidence_map["preflight"] = ev
                     findings.append(preflight_result)
+
+                # Enrich ALL findings for this URL with the full evidence map.
+                # This way, whichever finding survives deduplication still
+                # carries evidence from every test type.
+                if url_evidence_map:
+                    for f in findings:
+                        if f.matched_at == test_url and f.metadata is not None:
+                            f.metadata["all_cors_evidence"] = url_evidence_map
 
             except Exception as e:
                 logger.debug(f"[cors] Error testing {test_url}: {e}")
@@ -201,6 +230,26 @@ class CORSChecker(ScanModule):
                     acam = resp.headers.get("Access-Control-Allow-Methods", "")
                     acah = resp.headers.get("Access-Control-Allow-Headers", "")
 
+                    # Capture full HTTP evidence for report generation
+                    status_code = resp.status
+                    all_response_headers = dict(resp.headers)
+                    try:
+                        body_bytes = await resp.read()
+                        body_preview = body_bytes[:500].decode("utf-8", errors="replace")
+                    except Exception:
+                        body_preview = ""
+
+                    http_evidence = {
+                        "request": {"method": "GET", "url": url, "headers": {"Origin": origin}},
+                        "response": {
+                            "status_code": status_code,
+                            "headers": all_response_headers,
+                            "body_preview": body_preview,
+                        },
+                        "target_domain": urlparse(url).netloc,
+                        "test_origin": origin,
+                    }
+
                     # Check for vulnerabilities
                     if acao == "*":
                         return Finding(
@@ -208,7 +257,7 @@ class CORSChecker(ScanModule):
                             name="CORS Wildcard Origin",
                             severity="MEDIUM",
                             description="Server allows any origin to access resources. "
-                                       "This enables cross-origin data theft from any website.",
+                                       "This enables data theft from any website via CORS.",
                             host=url,
                             matched_at=url,
                             evidence=[
@@ -220,6 +269,7 @@ class CORSChecker(ScanModule):
                             cwe="CWE-346",
                             confidence=100,
                             remediation="Restrict CORS to specific trusted origins. Never use '*' in production.",
+                            metadata={"http_evidence": http_evidence},
                         )
 
                     # Origin reflection (most dangerous)
@@ -235,7 +285,7 @@ class CORSChecker(ScanModule):
                             description=(
                                 f"Server reflects arbitrary origin: {description}. "
                                 f"{'WITH CREDENTIALS - can steal authenticated data!' if has_credentials else ''} "
-                                f"Attacker can read responses cross-origin."
+                                f"Attacker can read responses via CORS."
                             ),
                             host=url,
                             matched_at=url,
@@ -256,6 +306,7 @@ class CORSChecker(ScanModule):
                                 "4. Be careful with subdomain wildcards\n"
                                 "5. Review: https://portswigger.net/research/exploiting-cors-misconfigurations"
                             ),
+                            metadata={"http_evidence": http_evidence},
                         )
 
                     # Null origin acceptance
@@ -282,6 +333,7 @@ class CORSChecker(ScanModule):
                             cwe="CWE-346",
                             confidence=100,
                             remediation="Reject null origins. Add explicit check: if (origin === 'null') return;",
+                            metadata={"http_evidence": http_evidence},
                         )
 
         except Exception:
@@ -291,27 +343,123 @@ class CORSChecker(ScanModule):
 
     async def _test_preflight_bypass(self, url: str) -> Finding | None:
         """
-        Test for preflight bypass vulnerabilities.
+        Test preflight (OPTIONS) to capture evidence of allowed methods/headers.
 
-        IMPORTANT: Only report as exploitable if we have REAL evidence:
-        - Access-Control-Allow-Credentials: true
-        - Sensitive endpoint with auth data
-        - Origin reflection (not just wildcard)
-
-        Without these, it's just "Potential" - not confirmed.
+        Does NOT produce a standalone finding (preflight alone is not exploitable).
+        Instead, captures the evidence into metadata so the report generator can
+        embed real preflight data in reproduction steps.
         """
-        # Skip this test - it produces false positives without:
-        # 1. Authenticated session to test with
-        # 2. Sensitive endpoint identified
-        # 3. Proof that credentials are included
+        timeout = aiohttp.ClientTimeout(total=10)
+        origin = "https://attacker.example.com"
+        headers = {
+            "Origin": origin,
+            "Access-Control-Request-Method": "DELETE",
+        }
 
-        # A proper CORS test requires:
-        # - JavaScript PoC that reads response cross-origin
-        # - Credentials mode enabled
-        # - Sensitive data in response
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.options(
+                    url,
+                    headers=headers,
+                    ssl=False,
+                    allow_redirects=True,
+                ) as resp:
+                    acao = resp.headers.get("Access-Control-Allow-Origin", "")
+                    acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+                    acam = resp.headers.get("Access-Control-Allow-Methods", "")
 
-        # For now, return None - don't report unverified findings
+                    status_code = resp.status
+                    all_response_headers = dict(resp.headers)
+                    try:
+                        body_bytes = await resp.read()
+                        body_preview = body_bytes[:500].decode("utf-8", errors="replace")
+                    except Exception:
+                        body_preview = ""
+
+                    http_evidence = {
+                        "request": {
+                            "method": "OPTIONS",
+                            "url": url,
+                            "headers": {
+                                "Origin": origin,
+                                "Access-Control-Request-Method": "DELETE",
+                            },
+                        },
+                        "response": {
+                            "status_code": status_code,
+                            "headers": all_response_headers,
+                            "body_preview": body_preview,
+                        },
+                        "target_domain": urlparse(url).netloc,
+                        "test_origin": origin,
+                    }
+
+                    # Only return a "finding" if the server reflects the origin
+                    # AND allows dangerous methods — purely to carry evidence.
+                    # Severity is set low; the real finding is the origin reflection.
+                    if acao in (origin, "*") and acam and "DELETE" in acam.upper():
+                        return Finding(
+                            type="cors_preflight",
+                            name="CORS Preflight Allows Dangerous Methods",
+                            severity="INFO",
+                            description=(
+                                f"Preflight response allows {acam} from arbitrary origins."
+                            ),
+                            host=url,
+                            matched_at=url,
+                            evidence=[
+                                f"Origin sent: {origin}",
+                                f"Access-Control-Allow-Origin: {acao}",
+                                f"Access-Control-Allow-Methods: {acam}",
+                                f"Access-Control-Allow-Credentials: {acac}",
+                            ],
+                            cvss_score=0.0,
+                            cwe="CWE-346",
+                            confidence=80,
+                            remediation="Restrict allowed methods in preflight responses.",
+                            metadata={"http_evidence": http_evidence},
+                        )
+        except Exception:
+            pass
+
         return None
+
+    async def _capture_baseline(self, url: str) -> dict | None:
+        """
+        Capture a baseline response WITHOUT any Origin header.
+
+        This proves that CORS headers are only added when an Origin is present
+        (reflection-based), strengthening the evidence that the misconfiguration
+        is real and not just always-present headers.
+        """
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, ssl=False, allow_redirects=True) as resp:
+                    status_code = resp.status
+                    all_headers = dict(resp.headers)
+                    try:
+                        body_bytes = await resp.read()
+                        body_preview = body_bytes[:500].decode("utf-8", errors="replace")
+                    except Exception:
+                        body_preview = ""
+
+                    return {
+                        "request": {
+                            "method": "GET",
+                            "url": url,
+                            "headers": {},  # No Origin header
+                        },
+                        "response": {
+                            "status_code": status_code,
+                            "headers": all_headers,
+                            "body_preview": body_preview,
+                        },
+                        "target_domain": urlparse(url).netloc,
+                        "test_origin": "(none — baseline)",
+                    }
+        except Exception:
+            return None
 
     async def _test_origin(self, url: str, origin: str) -> Finding | None:
         """Legacy method - use _test_origin_advanced instead."""

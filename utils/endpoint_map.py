@@ -246,6 +246,14 @@ class EndpointMap:
             EndpointCategory.AUTH,
             EndpointCategory.API_REST,
         ],
+        "creative_exploiter": [
+            EndpointCategory.PAYMENT,
+            EndpointCategory.USER_DATA,
+            EndpointCategory.AUTH,
+            EndpointCategory.ADMIN,
+            EndpointCategory.API_REST,
+            EndpointCategory.SEARCH,
+        ],
         "auth_scanner": [
             EndpointCategory.AUTH,
         ],

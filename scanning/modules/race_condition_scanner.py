@@ -799,6 +799,13 @@ class RaceConditionScanner:
         """
         logger.info(f"[RaceCondition] Starting scan: {target_url}")
 
+        # Extract auth context if available (injected by full_scanner)
+        auth_ctx = kwargs.get("auth_context") or getattr(self, "_auth_context", None)
+        auth_headers: dict = {}
+        if auth_ctx and hasattr(auth_ctx, "auth_headers"):
+            auth_headers = auth_ctx.auth_headers
+            logger.info(f"[RaceCondition] Using auth token for race tests")
+
         # Create config if not provided
         if not self.config:
             self.config = ScanConfig(target_url=target_url)
@@ -809,6 +816,11 @@ class RaceConditionScanner:
 
         if not endpoints:
             endpoints = [RaceEndpoint(url=target_url, method="POST")]
+
+        # Inject auth headers into all endpoints
+        if auth_headers:
+            for ep in endpoints:
+                ep.headers.update(auth_headers)
 
         logger.info(f"[RaceCondition] Testing {len(endpoints)} endpoint(s)")
 

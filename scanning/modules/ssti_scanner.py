@@ -995,6 +995,16 @@ class SSTIScanner(ScanModule):
                 
                 for indicator, desc in rce_indicators:
                     if indicator in response.text:
+                        # Extract actual command output from response
+                        rce_output = ""
+                        text = response.text
+                        idx = text.find(indicator)
+                        if idx >= 0:
+                            # Grab context around the indicator (100 chars before/after)
+                            start = max(0, idx - 50)
+                            end = min(len(text), idx + 200)
+                            rce_output = text[start:end].strip()
+
                         findings.append(Finding(
                             type="ssti",
                             name=f"SSTI Remote Code Execution Confirmed ({engine.name})",
@@ -1007,12 +1017,19 @@ class SSTIScanner(ScanModule):
                                 f"Engine: {engine.name}",
                                 f"RCE payload: {payload[:100]}...",
                                 f"RCE indicator: {indicator} ({desc})",
+                                f"Command output captured: {rce_output[:300]}" if rce_output else "Output present but not extracted",
                             ],
                             cvss_score=10.0,
                             cwe="CWE-94",
                             remediation="CRITICAL: Immediate action required. "
                                        "This vulnerability allows full server compromise. "
                                        "Patch the application immediately.",
+                            metadata={
+                                "rce_confirmed": True,
+                                "rce_output": rce_output[:500] if rce_output else None,
+                                "rce_payload": payload,
+                                "template_engine": engine.name,
+                            },
                         ).to_dict())
                         return findings  # One RCE confirmation is enough
                         

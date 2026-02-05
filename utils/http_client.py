@@ -176,7 +176,7 @@ def set_required_headers(headers: dict[str, str], preset_name: str = "") -> None
         preset_name: Name of the bug bounty preset for logging
 
     Example:
-        set_required_headers({"X-Bug-Bounty": "canigetrichpls-twilio"}, "twilio")
+        set_required_headers({"X-Bug-Bounty": "youruser-twilio"}, "twilio")
     """
     global _global_required_headers, _active_preset_name
     with _state_lock:

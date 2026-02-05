@@ -343,9 +343,29 @@ class HTTPSmugglingScanner(ScanModule):
     ) -> dict[str, Any]:
         """
         Enterprise: Comprehensive HTTP smuggling scan.
+
+        SAFETY: This module uses raw sockets which bypass SafeAsyncClient.
+        It is blocked in passive, safe, and cautious modes to prevent
+        sending malformed requests that can disrupt production services.
         """
         findings: list[dict[str, Any]] = []
-        
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # SAFETY CHECK: Raw sockets bypass SafeAsyncClient entirely.
+        # Smuggling payloads can cause request desync, affecting other users.
+        # Only allow in aggressive/unrestricted modes.
+        # ═══════════════════════════════════════════════════════════════════════
+        import os
+        safety_mode = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+        ALLOWED_MODES = {"aggressive", "unrestricted"}
+        if safety_mode not in ALLOWED_MODES:
+            logger.info(
+                f"HTTP Smuggling scanner BLOCKED: safety_mode={safety_mode} "
+                f"(requires aggressive or unrestricted). "
+                f"Smuggling uses raw sockets that bypass HTTP safety controls."
+            )
+            return {"findings": [], "skipped": True, "reason": f"Blocked by safety mode: {safety_mode}"}
+
         # Parse host
         if host.startswith("http"):
             parsed = urlparse(host)

@@ -80,7 +80,28 @@ class DOMXSSVector(Enum):
     POSTMESSAGE = auto()        # postMessage
     LOCAL_STORAGE = auto()      # localStorage
     SESSION_STORAGE = auto()    # sessionStorage
-    DOCUMENT_COOKIE = auto()    # document.cookie
+    DOCUMENT_COOKIE = auto()
+    SPA_ROUTE_PARAM = auto()    # SPA hash route parameter (/#/route?param=)
+
+
+# Common SPA route patterns mapped to likely XSS-susceptible parameter names.
+# Used when testing Angular/React/Vue apps with hash-based routing.
+SPA_ROUTE_PARAMS: dict[str, list[str]] = {
+    "search": ["q", "query", "search", "term", "keyword"],
+    "track-result": ["id", "orderId"],
+    "track-order": ["id", "orderId", "tracking"],
+    "profile": ["id", "user", "username"],
+    "user": ["id", "name"],
+    "product": ["id", "name"],
+    "item": ["id", "name"],
+    "error": ["message", "msg", "error", "url"],
+    "redirect": ["url", "to", "next", "returnUrl"],
+    "callback": ["url", "redirect_uri"],
+    "complain": ["message", "complaint"],
+    "contact": ["comment", "message"],
+    # Fallback params tried on any route not matched above
+    "__default__": ["q", "id", "search", "query", "name"],
+}
 
 
 class DOMXSSSink(Enum):
@@ -293,7 +314,12 @@ class DOMXSSScanner(ScanModule):
 
         # Add default endpoint if none provided
         if not endpoints:
-            endpoints = [f"https://{host}/"]
+            if host.startswith("http://") or host.startswith("https://"):
+                endpoints = [host.rstrip("/") + "/"]
+            else:
+                port = host.split(":")[-1] if ":" in host else "443"
+                scheme = "http" if port in ("80", "8080", "8000", "3000", "5000", "8888") else "https"
+                endpoints = [f"{scheme}://{host}/"]
 
         # Add crawled pages to endpoints
         for page in crawled_pages:
@@ -334,6 +360,28 @@ class DOMXSSScanner(ScanModule):
 
                     except Exception as e:
                         logger.debug(f"[DOM-XSS] Error testing {endpoint}: {e}")
+
+                # --- SPA Route Testing ---
+                # Discover and test SPA hash routes (Angular/React/Vue).
+                # These use hash-based routing (/#/route?param=value) which the
+                # regular endpoint/hash tests above don't cover.
+                try:
+                    spa_base = endpoints[0].rstrip("/") if endpoints else ""
+                    if spa_base:
+                        spa_routes = await self._discover_spa_routes(browser, spa_base)
+                        if spa_routes:
+                            logger.info(
+                                f"[DOM-XSS] Testing {len(spa_routes)} SPA routes"
+                            )
+                            spa_findings = await self._test_spa_routes(
+                                browser, spa_base, spa_routes, rate_limiter, host
+                            )
+                            for f in spa_findings:
+                                findings.append(f.to_dict())
+                                stats["payloads_tested"] += 1
+                            stats["spa_routes_tested"] = len(spa_routes)
+                except Exception as e:
+                    logger.debug(f"[DOM-XSS] SPA route testing error: {e}")
 
                 # Analyze JavaScript files for potential DOM XSS
                 for js_url in js_files[:10]:
@@ -402,6 +450,11 @@ class DOMXSSScanner(ScanModule):
                     findings.append(finding)
                     # Found confirmed XSS, move to next vector
                     break
+
+        # Test postMessage vector
+        await rate_limiter.acquire(host)
+        pm_findings = await self._test_postmessage(browser, url, marker_id)
+        findings.extend(pm_findings)
 
         # Test query parameters
         for param in query_params[:5]:
@@ -496,6 +549,114 @@ class DOMXSSScanner(ScanModule):
 
         return None
 
+    async def _test_postmessage(
+        self,
+        browser: "HeadlessBrowserEngine",
+        url: str,
+        marker_id: str,
+    ) -> list[Finding]:
+        """Test for DOM XSS via postMessage handler vulnerabilities."""
+        findings = []
+
+        try:
+            # Navigate to the page first
+            await browser.navigate(url, wait_until="domcontentloaded")
+            await asyncio.sleep(0.5)
+
+            # Check if page has message event listeners
+            has_listener = await browser.evaluate("""
+                () => {
+                    // Check for addEventListener('message', ...)
+                    const listeners = window._phantom_pm_listeners || [];
+                    return listeners.length > 0 || document.querySelector('[onmessage]') !== null;
+                }
+            """)
+
+            # Inject listener detector first (for future page loads)
+            await browser.evaluate("""
+                () => {
+                    // Monkey-patch addEventListener to detect message handlers
+                    const orig = window.addEventListener;
+                    window._phantom_pm_listeners = [];
+                    window.addEventListener = function(type, fn, opts) {
+                        if (type === 'message') {
+                            window._phantom_pm_listeners.push(fn.toString().substring(0, 200));
+                        }
+                        return orig.call(this, type, fn, opts);
+                    };
+                }
+            """)
+
+            # Reload to capture listeners registered on load
+            await browser.navigate(url, wait_until="domcontentloaded")
+            await asyncio.sleep(0.5)
+
+            listener_info = await browser.evaluate("""
+                () => window._phantom_pm_listeners || []
+            """)
+
+            if not listener_info and not has_listener:
+                return findings  # No message handlers
+
+            logger.info(f"[DOM-XSS] Found {len(listener_info) if listener_info else '?'} postMessage listener(s) at {url}")
+
+            # Test XSS payloads via postMessage
+            xss_payloads = [
+                f'<img src=x onerror="console.log(\\\'PHANTOMXSS{marker_id}\\\')">',
+                f'<script>console.log("PHANTOMXSS{marker_id}")</script>',
+                f'{{"type":"xss","data":"<img src=x onerror=console.log(\\\'PHANTOMXSS{marker_id}\\\')>"}}',
+                f'{{"action":"update","html":"<img src=x onerror=console.log(\\\'PHANTOMXSS{marker_id}\\\')>"}}',
+                f'{{"__proto__":{{"innerHTML":"<img src=x onerror=console.log(\\\'PHANTOMXSS{marker_id}\\\')>"}}}}',
+            ]
+
+            for pm_payload in xss_payloads:
+                # Clear console
+                browser.clear_console()
+
+                # Send postMessage with XSS payload
+                await browser.evaluate(f"""
+                    () => {{
+                        window.postMessage({pm_payload!r}, '*');
+                    }}
+                """)
+
+                await asyncio.sleep(0.3)
+
+                # Check if our marker appeared in console
+                console_msgs = browser.get_console_messages()
+                marker_found = any(f"PHANTOMXSS{marker_id}" in msg for msg in console_msgs)
+
+                if marker_found:
+                    finding = self._create_finding(
+                        DOMXSSFinding(
+                            vulnerable=True,
+                            vector=DOMXSSVector.POSTMESSAGE,
+                            sink="postMessage handler",
+                            payload=pm_payload,
+                            url=url,
+                            evidence=[
+                                "postMessage handler executes untrusted data",
+                                f"Payload delivered via window.postMessage()",
+                                f"Console marker confirmed: PHANTOMXSS{marker_id}",
+                            ],
+                            console_messages=console_msgs,
+                            triggered_alerts=[],
+                            screenshot=None,
+                            confidence=90.0,
+                            execution_time_ms=0,
+                        ),
+                        url,
+                        DOMXSSVector.POSTMESSAGE,
+                    )
+                    findings.append(finding)
+                    logger.info(f"[DOM-XSS] postMessage XSS confirmed at {url}")
+                    break  # One confirmation is enough
+
+        except Exception as e:
+            logger.debug(f"[DOM-XSS] postMessage test error: {e}")
+
+        return findings
+
     def _build_test_url(self, url: str, vector: DOMXSSVector, payload: str) -> str:
         """Build test URL with payload injected."""
         parsed = urlparse(url)
@@ -512,6 +673,184 @@ class DOMXSSScanner(ScanModule):
             return f"{parsed.scheme}://{parsed.netloc}/{payload}"
 
         return url
+
+    # ------------------------------------------------------------------
+    # SPA Route Testing (Angular / React / Vue hash-based routing)
+    # ------------------------------------------------------------------
+
+    async def _discover_spa_routes(
+        self,
+        browser: "HeadlessBrowserEngine",
+        base_url: str,
+    ) -> list[dict[str, Any]]:
+        """Discover SPA hash routes by crawling anchor tags and routerLink attrs."""
+        routes: list[dict[str, Any]] = []
+
+        try:
+            await browser.navigate(base_url, wait_until="networkidle")
+            await asyncio.sleep(1.5)  # Let SPA framework initialize
+
+            raw_links = await browser.execute_js(
+                """() => {
+                    const hrefs = new Set();
+                    for (const a of document.querySelectorAll('a[href]')) {
+                        const h = a.getAttribute('href') || '';
+                        if (h.includes('#/')) hrefs.add(h);
+                    }
+                    for (const el of document.querySelectorAll('[routerLink]')) {
+                        const rl = el.getAttribute('routerLink') || '';
+                        if (rl.startsWith('/')) hrefs.add('#' + rl);
+                    }
+                    return Array.from(hrefs);
+                }"""
+            )
+
+            if raw_links:
+                for link in raw_links:
+                    route = link.split('#')[-1] if '#' in link else link
+                    route_path = route.split('?')[0].split(';')[0].strip('/')
+                    if route_path and route_path != '/':
+                        routes.append({"route": route_path, "source": "crawled"})
+
+            logger.info(f"[DOM-XSS] Discovered {len(routes)} SPA routes from page")
+
+        except Exception as e:
+            logger.debug(f"[DOM-XSS] SPA route discovery error: {e}")
+
+        # Add common fallback routes if discovery found very few
+        if len(routes) < 3:
+            for route_name in SPA_ROUTE_PARAMS:
+                if route_name != "__default__":
+                    routes.append({"route": route_name, "source": "fallback"})
+
+        # Deduplicate
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for r in routes:
+            key = r["route"].lower().strip('/')
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+
+        return unique
+
+    async def _test_spa_routes(
+        self,
+        browser: "HeadlessBrowserEngine",
+        base_url: str,
+        routes: list[dict[str, Any]],
+        rate_limiter: "RateLimiter",
+        host: str,
+    ) -> list[Finding]:
+        """Test SPA hash routes for DOM XSS by injecting payloads into route params."""
+        findings: list[Finding] = []
+
+        for route_info in routes[:15]:
+            route_path = route_info["route"]
+
+            # Determine params to test based on the route's last segment
+            route_base = route_path.rstrip('/').split('/')[-1].lower()
+            params_to_test = SPA_ROUTE_PARAMS.get(
+                route_base, SPA_ROUTE_PARAMS["__default__"]
+            )
+
+            for param in params_to_test[:3]:
+                await rate_limiter.acquire(host)
+
+                marker_id = hashlib.md5(
+                    f"spa_{route_path}_{param}_{time.time()}".encode()
+                ).hexdigest()[:8]
+
+                payloads = DOMXSSPayloads.get_payloads_for_vector(
+                    DOMXSSVector.URL_HASH, marker_id
+                )
+
+                found_xss = False
+                for payload in payloads[:5]:
+                    # Build SPA route URL: base/#/route?param=payload
+                    test_url = f"{base_url.rstrip('/')}/#/{route_path}?{param}={payload}"
+
+                    try:
+                        await browser.navigate(test_url, wait_until="domcontentloaded")
+                        await asyncio.sleep(1.0)  # SPA routes need render time
+
+                        console_messages = browser.get_console_messages()
+                        dialogs = browser.get_dialogs()
+
+                        marker_found = False
+                        evidence = []
+
+                        for msg in console_messages:
+                            if XSS_MARKERS["CONSOLE"] + marker_id in msg:
+                                marker_found = True
+                                evidence.append(f"Console: {msg}")
+
+                        for dialog in dialogs:
+                            if XSS_MARKERS["ALERT"] + marker_id in dialog:
+                                marker_found = True
+                                evidence.append(f"Dialog: {dialog}")
+
+                        if marker_found:
+                            screenshot = None
+                            try:
+                                screenshot = await browser.screenshot()
+                            except Exception:
+                                pass
+
+                            finding = Finding(
+                                type="dom_xss",
+                                name=f"DOM XSS via SPA Route /#/{route_path}?{param}=",
+                                severity="HIGH",
+                                description=(
+                                    f"DOM-based Cross-Site Scripting confirmed in SPA route "
+                                    f"`/#/{route_path}` via the `{param}` parameter. "
+                                    f"The application reads route parameters and renders them "
+                                    f"into the DOM without proper sanitization. "
+                                    f"Verified by actual JavaScript execution in a headless "
+                                    f"browser — zero false positive."
+                                ),
+                                host=host,
+                                matched_at=test_url,
+                                evidence=[
+                                    f"Vector: SPA hash route parameter",
+                                    f"Route: /#/{route_path}",
+                                    f"Parameter: {param}",
+                                    f"Payload: {payload}",
+                                    f"Confidence: 95%",
+                                    f"Execution verified: YES (real browser)",
+                                ] + evidence,
+                                cvss_score=7.1,
+                                cwe="CWE-79",
+                                confidence=95.0,
+                                remediation=(
+                                    "1. Sanitize all route parameters before rendering\n"
+                                    "2. Do not use bypassSecurityTrustHtml with user input\n"
+                                    "3. Use textContent instead of innerHTML\n"
+                                    "4. Implement Content-Security-Policy\n"
+                                    "5. Use DOMPurify for HTML sanitization"
+                                ),
+                                metadata={
+                                    "dom_xss_type": "spa_route",
+                                    "route": route_path,
+                                    "parameter": param,
+                                    "payload": payload,
+                                    "screenshot": screenshot is not None,
+                                },
+                            )
+                            findings.append(finding)
+                            logger.info(
+                                f"[DOM-XSS] CONFIRMED: DOM XSS in /#/{route_path}?{param}="
+                            )
+                            found_xss = True
+                            break  # Found XSS for this param
+
+                    except Exception as e:
+                        logger.debug(f"[DOM-XSS] SPA route test error: {e}")
+
+                if found_xss:
+                    break  # Found XSS for this route, move to next
+
+        return findings
 
     def _detect_sink(self, payload: str) -> Optional[DOMXSSSink]:
         """Detect likely sink based on payload structure."""

@@ -136,6 +136,7 @@ class XXEFinding:
     file_disclosed: Optional[str] = None
     waf_detected: Optional[WAFType] = None
     waf_bypassed: bool = False
+    file_content: Optional[str] = None  # Actual extracted file content
 
 
 class WAFDetector:
@@ -891,13 +892,13 @@ class XXEScanner(ScanModule):
                 }
             )
             
-            detected, evidence, file_disclosed = self._analyze_response(
+            detected, evidence, file_disclosed, file_content = self._analyze_response(
                 response, payload_name, baseline_text
             )
-            
+
             if detected:
                 confidence = self._calculate_confidence(evidence, response)
-                
+
                 return XXEFinding(
                     url=endpoint,
                     xxe_type=xxe_type,
@@ -910,6 +911,7 @@ class XXEScanner(ScanModule):
                     confidence=confidence,
                     file_disclosed=file_disclosed,
                     waf_detected=self.detected_waf,
+                    file_content=file_content,
                 )
                 
         except Exception as e:
@@ -943,7 +945,14 @@ class XXEScanner(ScanModule):
                 for indicator in indicators:
                     if indicator in content and indicator not in baseline_text:
                         evidence.append(f"File content in error: {indicator}")
-                        
+                        # Extract file content from error message
+                        idx = content.find(indicator)
+                        err_content = None
+                        if idx >= 0:
+                            line_start = content.rfind("\n", 0, idx)
+                            line_start = max(0, line_start)
+                            err_content = content[line_start:idx + 300].strip()[:500]
+
                         return XXEFinding(
                             url=endpoint,
                             xxe_type=XXEType.ERROR_BASED,
@@ -956,6 +965,7 @@ class XXEScanner(ScanModule):
                             confidence=80,
                             file_disclosed=file_type,
                             waf_detected=self.detected_waf,
+                            file_content=err_content,
                         )
             
             # Check for XXE-related errors
@@ -987,19 +997,34 @@ class XXEScanner(ScanModule):
         response: httpx.Response,
         payload_name: str,
         baseline_text: str,
-    ) -> tuple[bool, list[str], Optional[str]]:
-        """Analyze response for XXE indicators."""
+    ) -> tuple[bool, list[str], Optional[str], Optional[str]]:
+        """Analyze response for XXE indicators.
+
+        Returns: (detected, evidence_list, file_type, file_content)
+        """
         evidence = []
         content = response.text
         file_disclosed = None
-        
+        file_content = None
+
         # Check for file content
         for file_type, indicators in self.FILE_INDICATORS.items():
             for indicator in indicators:
                 if indicator in content and indicator not in baseline_text:
                     evidence.append(f"File content found: {indicator}")
                     file_disclosed = file_type
-        
+                    # Extract actual file content from response
+                    idx = content.find(indicator)
+                    if idx >= 0:
+                        # Find line boundaries around the indicator
+                        line_start = content.rfind("\n", 0, idx)
+                        line_start = max(0, line_start)
+                        end = min(len(content), idx + 500)
+                        line_end = content.find("</", idx)
+                        if line_end > 0 and line_end < end:
+                            end = line_end
+                        file_content = content[line_start:end].strip()[:500]
+
         # Check for base64 content (PHP filter)
         if "php_filter" in payload_name:
             base64_pattern = r'[A-Za-z0-9+/]{40,}={0,2}'
@@ -1011,22 +1036,33 @@ class XXEScanner(ScanModule):
                         if '<?php' in decoded or 'function' in decoded:
                             evidence.append(f"PHP source code disclosed via base64")
                             file_disclosed = "php_source"
+                            file_content = decoded[:500]
                     except Exception:
                         pass
-        
+
         # Check for expect:// RCE
         if "expect" in payload_name:
             if "uid=" in content and "gid=" in content:
                 evidence.append("RCE via expect:// - 'id' command executed")
                 file_disclosed = "rce_expect"
-        
+                # Extract command output
+                idx = content.find("uid=")
+                if idx >= 0:
+                    file_content = content[idx:idx + 200].strip()
+
         # Check for cloud metadata
         if any(x in payload_name for x in ["aws", "gcp", "azure"]):
             if any(ind in content for ind in ["ami-id", "instance-id", "compute", "vmId"]):
                 evidence.append("Cloud metadata disclosed via SSRF")
                 file_disclosed = "cloud_metadata"
-        
-        return len(evidence) > 0, evidence, file_disclosed
+                # Extract metadata content
+                for ind in ["ami-id", "instance-id", "compute", "vmId"]:
+                    idx = content.find(ind)
+                    if idx >= 0:
+                        file_content = content[max(0, idx - 50):idx + 300].strip()[:500]
+                        break
+
+        return len(evidence) > 0, evidence, file_disclosed, file_content
     
     def _calculate_confidence(
         self,
@@ -1114,10 +1150,10 @@ class XXEScanner(ScanModule):
                     )
                     
                     if "Envelope" in response.text or "soap:" in response.text.lower():
-                        detected, evidence, file_disclosed = self._analyze_response(
+                        detected, evidence, file_disclosed, file_content = self._analyze_response(
                             response, "soap", ""
                         )
-                        
+
                         if detected:
                             self.findings.append(XXEFinding(
                                 url=url,
@@ -1131,6 +1167,7 @@ class XXEScanner(ScanModule):
                                 confidence=90,
                                 file_disclosed=file_disclosed,
                                 waf_detected=self.detected_waf,
+                                file_content=file_content,
                             ))
                             return  # Found SOAP XXE
                             
@@ -1163,10 +1200,10 @@ class XXEScanner(ScanModule):
                         headers={"Content-Type": "image/svg+xml"}
                     )
                     
-                    detected, evidence, file_disclosed = self._analyze_response(
+                    detected, evidence, file_disclosed, file_content = self._analyze_response(
                         response, "svg", ""
                     )
-                    
+
                     if detected:
                         self.findings.append(XXEFinding(
                             url=endpoint,
@@ -1180,6 +1217,7 @@ class XXEScanner(ScanModule):
                             confidence=85,
                             file_disclosed=file_disclosed,
                             waf_detected=self.detected_waf,
+                            file_content=file_content,
                         ))
                         return
                         
@@ -1210,6 +1248,15 @@ class XXEScanner(ScanModule):
             XXEType.DOS: "DoS via XXE (Billion Laughs)",
         }.get(finding.xxe_type, "XXE")
         
+        # Build evidence with file content if available
+        evidence_list = finding.evidence + [
+            f"Detection method: {finding.detection_method}",
+            f"Confidence: {finding.confidence}%",
+            f"Scanner: XXE Scanner {XXE_SCANNER_VERSION}",
+        ]
+        if finding.file_content:
+            evidence_list.append(f"Extracted content: {finding.file_content[:200]}...")
+
         return Finding(
             type="xxe",
             name=f"XML External Entity (XXE) - {xxe_type_desc}",
@@ -1224,13 +1271,15 @@ class XXEScanner(ScanModule):
             ),
             host=finding.url,
             matched_at=finding.url,
-            evidence=finding.evidence + [
-                f"Detection method: {finding.detection_method}",
-                f"Confidence: {finding.confidence}%",
-                f"Scanner: XXE Scanner {XXE_SCANNER_VERSION}",
-            ],
+            evidence=evidence_list,
             cvss_score=cvss,
             cwe="CWE-611",
+            metadata={
+                "file_content": finding.file_content[:500] if finding.file_content else None,
+                "file_disclosed": finding.file_disclosed,
+                "xxe_type": finding.xxe_type.name,
+                "xml_parser": finding.parser.name if finding.parser else None,
+            },
             remediation=(
                 "1. Disable external entity processing in XML parser.\n"
                 "2. Use defusedxml library in Python.\n"

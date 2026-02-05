@@ -752,6 +752,33 @@ class SmartEndpointDiscovery:
     # PHASE 2: ACTIVE DISCOVERY
     # ========================================================================
 
+    # Common paths to probe on localhost/internal targets where passive
+    # discovery (sitemap, robots, wayback) typically returns nothing.
+    LOCALHOST_FALLBACK_PATHS = [
+        # API roots
+        "/api", "/rest", "/api/v1", "/api/v2", "/rest/api",
+        # Documentation / Swagger / OpenAPI
+        "/api-docs", "/swagger.json", "/swagger.yaml",
+        "/openapi.json", "/docs", "/redoc",
+        # GraphQL
+        "/graphql", "/graphiql",
+        # Admin / Monitoring
+        "/admin", "/administration", "/metrics", "/health",
+        "/healthz", "/status", "/info", "/version",
+        # Auth endpoints
+        "/login", "/register", "/auth", "/oauth",
+        "/rest/user/login", "/rest/user/whoami",
+        # Common CRUD
+        "/products", "/users", "/orders", "/api/products",
+        "/api/users", "/api/orders", "/api/Feedbacks",
+        "/rest/products/search",
+        # Dev / Debug
+        "/debug", "/actuator", "/actuator/health",
+        "/socket.io", "/ws", "/.well-known/security.txt",
+        # Common SPA paths
+        "/assets", "/main.js", "/runtime.js",
+    ]
+
     async def _phase2_active_discovery(
         self,
         base_url: str,
@@ -761,11 +788,67 @@ class SmartEndpointDiscovery:
         """Phase 2: Technology-based smart probing."""
         logger.info("[SmartDiscovery] Phase 2: Active Discovery")
 
+        # Probe common localhost paths when target is local/internal
+        await self._probe_localhost_defaults(base_url, rate_limiter)
+
         if self.config.tech_based_inference and detected_technologies:
             await self._probe_tech_specific_endpoints(base_url, rate_limiter, detected_technologies)
 
         if self.config.response_inference:
             await self._infer_from_existing_endpoints(base_url, rate_limiter)
+
+    async def _probe_localhost_defaults(
+        self,
+        base_url: str,
+        rate_limiter: Optional[RateLimiter],
+    ) -> None:
+        """Probe common paths on localhost/internal targets."""
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or "").lower()
+        is_local = host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or \
+                   host.startswith("192.168.") or host.startswith("10.")
+
+        if not is_local:
+            return
+
+        paths_to_check = set(self.LOCALHOST_FALLBACK_PATHS)
+        logger.info(f"[SmartDiscovery] Probing {len(paths_to_check)} localhost default paths")
+
+        semaphore = asyncio.Semaphore(self.config.max_concurrent)
+
+        async def probe_path(path: str) -> Optional[DiscoveredEndpoint]:
+            async with semaphore:
+                if rate_limiter:
+                    await rate_limiter.acquire()
+                url = urljoin(base_url, path)
+                try:
+                    response = await self._client.get(url, follow_redirects=False)
+                    if response.status_code not in (404, 502, 503, 504):
+                        return DiscoveredEndpoint(
+                            path=path,
+                            methods=infer_methods_from_path(path),
+                            source=EndpointSource.TECH_INFERENCE,
+                            confidence=0.75,
+                            verified=True,
+                            last_status_code=response.status_code,
+                            requires_auth=(response.status_code in (401, 403)),
+                            category=categorize_path(path),
+                        )
+                except Exception:
+                    pass
+                return None
+
+        tasks = [probe_path(p) for p in paths_to_check]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        found = 0
+        for r in results:
+            if isinstance(r, DiscoveredEndpoint):
+                self.endpoint_map.add_endpoint(r)
+                found += 1
+
+        logger.info(f"[SmartDiscovery] Localhost probing found {found} live endpoints")
 
     async def _probe_tech_specific_endpoints(
         self,

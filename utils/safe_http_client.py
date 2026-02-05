@@ -165,14 +165,35 @@ _BLOCKED_OPERATIONS_LOG: List[dict] = []
 _SAFETY_ENABLED = True
 _AGGRESSIVE_EXPLICITLY_ALLOWED = os.environ.get("PHANTOM_ALLOW_AGGRESSIVE", "").lower() in ("1", "true", "yes", "authorized")
 
+# UNRESTRICTED MODE: Bypasses ALL safety checks including ABSOLUTELY_BLOCKED_PATTERNS
+# This is for authorized penetration testing in controlled environments (labs, CTFs, etc.)
+# Requires: PHANTOM_UNRESTRICTED=i-understand-the-risks
+_UNRESTRICTED_MODE = os.environ.get("PHANTOM_UNRESTRICTED", "").lower() == "i-understand-the-risks"
+
+if _UNRESTRICTED_MODE:
+    logger.warning("⚠️ UNRESTRICTED MODE ENABLED - ALL SAFETY CHECKS BYPASSED")
+    logger.warning("⚠️ This mode sends REAL destructive payloads. Use only in authorized labs/CTFs.")
+
 
 def get_safety_mode() -> str:
     """
     Get current safety mode from environment variable.
 
+    Safety Modes:
+    - passive: GET/HEAD/OPTIONS only, no state changes
+    - safe: GET/HEAD/OPTIONS only, no state changes
+    - cautious: No DELETE/PUT/PATCH, payload checks
+    - standard: All methods, destructive patterns blocked
+    - aggressive: All methods, destructive patterns blocked (requires PHANTOM_ALLOW_AGGRESSIVE)
+    - unrestricted: NO SAFETY CHECKS AT ALL (requires PHANTOM_UNRESTRICTED=i-understand-the-risks)
+
     SECURITY: aggressive mode requires explicit authorization via
     PHANTOM_ALLOW_AGGRESSIVE=authorized environment variable.
     """
+    # Check for unrestricted mode first
+    if _UNRESTRICTED_MODE:
+        return "unrestricted"
+
     mode = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
 
     # SECURITY: Block aggressive mode unless explicitly authorized
@@ -182,6 +203,100 @@ def get_safety_mode() -> str:
         return "standard"
 
     return mode
+
+
+def is_unrestricted_mode() -> bool:
+    """Check if unrestricted mode is enabled (bypasses ALL safety checks)."""
+    return _UNRESTRICTED_MODE
+
+
+def set_unrestricted_mode(enabled: bool, confirmation: str = "") -> bool:
+    """
+    Dynamically enable or disable unrestricted mode.
+
+    SECURITY: Requires explicit confirmation string to enable.
+    This allows changing mode within the same process without restart.
+
+    Args:
+        enabled: True to enable unrestricted mode, False to disable
+        confirmation: Must be "i-understand-the-risks" to enable
+
+    Returns:
+        True if mode was changed successfully, False otherwise
+
+    Example:
+        # Enable unrestricted mode
+        set_unrestricted_mode(True, "i-understand-the-risks")
+
+        # Disable unrestricted mode (returns to normal operation)
+        set_unrestricted_mode(False)
+    """
+    global _UNRESTRICTED_MODE
+
+    if enabled:
+        if confirmation != "i-understand-the-risks":
+            logger.error("🛡️ SECURITY: Cannot enable unrestricted mode without confirmation")
+            logger.error("🛡️ Use: set_unrestricted_mode(True, 'i-understand-the-risks')")
+            return False
+
+        _UNRESTRICTED_MODE = True
+        logger.warning("⚠️ UNRESTRICTED MODE DYNAMICALLY ENABLED - ALL SAFETY CHECKS BYPASSED")
+        logger.warning("⚠️ This mode sends REAL destructive payloads. Use only in authorized labs/CTFs.")
+        return True
+    else:
+        _UNRESTRICTED_MODE = False
+        logger.info("✅ Unrestricted mode DISABLED - Safety checks restored")
+        return True
+
+
+def set_aggressive_mode(enabled: bool, confirmation: str = "") -> bool:
+    """
+    Dynamically enable or disable aggressive mode authorization.
+
+    SECURITY: Requires explicit confirmation string to enable.
+
+    Args:
+        enabled: True to authorize aggressive mode, False to revoke
+        confirmation: Must be "authorized" to enable
+
+    Returns:
+        True if changed successfully, False otherwise
+    """
+    global _AGGRESSIVE_EXPLICITLY_ALLOWED
+
+    if enabled:
+        if confirmation != "authorized":
+            logger.error("🛡️ SECURITY: Cannot enable aggressive mode without confirmation")
+            logger.error("🛡️ Use: set_aggressive_mode(True, 'authorized')")
+            return False
+
+        _AGGRESSIVE_EXPLICITLY_ALLOWED = True
+        logger.warning("⚠️ Aggressive mode AUTHORIZED dynamically")
+        return True
+    else:
+        _AGGRESSIVE_EXPLICITLY_ALLOWED = False
+        logger.info("✅ Aggressive mode authorization REVOKED")
+        return True
+
+
+def get_current_mode_status() -> dict:
+    """
+    Get current status of all safety modes.
+
+    Returns:
+        Dictionary with current mode configuration
+    """
+    return {
+        "safety_mode": get_safety_mode(),
+        "unrestricted_enabled": _UNRESTRICTED_MODE,
+        "aggressive_authorized": _AGGRESSIVE_EXPLICITLY_ALLOWED,
+        "safe_mode_active": is_safe_mode_active(),
+        "env_vars": {
+            "PHANTOM_SAFE_MODE": os.environ.get("PHANTOM_SAFE_MODE", "safe"),
+            "PHANTOM_UNRESTRICTED": "***SET***" if os.environ.get("PHANTOM_UNRESTRICTED") else "not set",
+            "PHANTOM_ALLOW_AGGRESSIVE": "***SET***" if os.environ.get("PHANTOM_ALLOW_AGGRESSIVE") else "not set",
+        }
+    }
 
 
 def get_custom_headers() -> dict:
@@ -472,6 +587,9 @@ def is_payload_safe(payload: str) -> bool:
     - Base64 decoding detection
     - Null byte removal
 
+    NOTE: In unrestricted mode (PHANTOM_UNRESTRICTED=i-understand-the-risks),
+    this function always returns True.
+
     Args:
         payload: The payload string to check
 
@@ -479,6 +597,10 @@ def is_payload_safe(payload: str) -> bool:
         True if the payload is safe (no blocked patterns matched)
         False if the payload matches any blocked pattern
     """
+    # Unrestricted mode bypasses ALL checks
+    if _UNRESTRICTED_MODE:
+        return True
+
     if not payload:
         return True
 
@@ -620,7 +742,13 @@ class SafeHttpClient:
         Check for patterns that are NEVER allowed (even in aggressive mode).
 
         SECURITY (v2.0): Uses normalization to defeat bypass attempts.
+
+        NOTE: In unrestricted mode, this check is bypassed.
         """
+        # UNRESTRICTED MODE: Allow ALL payloads
+        if _UNRESTRICTED_MODE:
+            return None
+
         # Check multiple versions to defeat encoding bypasses
         payloads_to_check = [
             payload,
@@ -656,9 +784,14 @@ class SafeHttpClient:
             Tuple of (allowed, reason)
         """
         mode = get_safety_mode()
+
+        # UNRESTRICTED MODE: Allow ALL methods
+        if mode == "unrestricted":
+            return True, ""
+
         method = method.upper()
 
-        # SECURITY: Block TRACE and CONNECT in ALL modes (XST attacks, proxy abuse)
+        # SECURITY: Block TRACE and CONNECT in ALL modes except unrestricted
         if method in ("TRACE", "CONNECT"):
             return False, f"Method {method} blocked for security (XST/proxy abuse prevention)"
 
@@ -835,8 +968,15 @@ class SafeAsyncClient(httpx.AsyncClient):
         - Base64 decoding to detect encoded commands
         - Null byte removal to prevent null byte injection
         - Files parameter checking for upload attacks
+
+        NOTE: In unrestricted mode, ALL checks are bypassed.
         """
         mode = get_safety_mode()
+
+        # UNRESTRICTED MODE: Bypass ALL safety checks
+        if mode == "unrestricted":
+            return True, ""
+
         method = method.upper()
 
         # ═══════════════════════════════════════════════════════════════════

@@ -120,6 +120,9 @@ class ScanModule(ABC):
 
     name: str = "base"
 
+    # Class-level flag: set by FullScanner when target is localhost
+    _target_is_local: bool = False
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._scope_guard: Any = None
@@ -130,17 +133,28 @@ class ScanModule(ABC):
                 # Get scope from settings if available
                 scope_config = getattr(settings, 'scope', None)
                 if scope_config:
+                    # Allow localhost if scan target IS localhost
+                    is_local = ScanModule._target_is_local
                     scope_def = ScopeDefinition(
                         allowed_domains=getattr(scope_config, 'allowed_domains', []),
                         allowed_ips=getattr(scope_config, 'allowed_ips', []),
-                        block_internal_ips=True,
+                        block_internal_ips=not is_local,
                         block_cloud_metadata=True,
-                        block_localhost=True,
+                        block_localhost=not is_local,
                     )
                     self._scope_guard = ScopeGuard(scope=scope_def, mode=ScopeMode.STRICT)
-                    logger.debug(f"ScopeGuard initialized for {self.name}")
+                    logger.debug(f"ScopeGuard initialized for {self.name} (localhost_allowed={is_local})")
             except Exception as e:
                 logger.debug(f"ScopeGuard initialization skipped: {e}")
+
+    @classmethod
+    def set_target_is_local(cls, target: str) -> None:
+        """Set class-level flag if scan target is localhost/internal."""
+        from urllib.parse import urlparse
+        host = urlparse(target).hostname or ""
+        cls._target_is_local = host.lower() in (
+            "localhost", "127.0.0.1", "::1", "0.0.0.0",
+        ) or host.startswith("192.168.") or host.startswith("10.")
 
     def is_url_in_scope(self, url: str) -> tuple[bool, str]:
         """
@@ -311,9 +325,9 @@ class VulnerabilityScanner:
             # === ADVANCED INJECTION MODULES ===
             ModuleConfig("ssti", SSTIScanner, ModuleCategory.ADVANCED, requires_urls=True),
             ModuleConfig("deserialization", DeserializationScanner, ModuleCategory.ADVANCED, requires_urls=True),
-            ModuleConfig("smuggling", HTTPSmugglingScanner, ModuleCategory.ADVANCED, min_safety_level="cautious"),
+            ModuleConfig("smuggling", HTTPSmugglingScanner, ModuleCategory.ADVANCED, min_safety_level="aggressive"),
             ModuleConfig("prototype_pollution", PrototypePollutionScanner, ModuleCategory.ADVANCED, requires_urls=True),
-            ModuleConfig("cache_poisoning", CachePoisoningScanner, ModuleCategory.ADVANCED, min_safety_level="cautious"),
+            ModuleConfig("cache_poisoning", CachePoisoningScanner, ModuleCategory.ADVANCED, min_safety_level="aggressive"),
             
             # === AUTHENTICATION MODULES ===
             ModuleConfig("auth", AuthScanner, ModuleCategory.AUTHENTICATION),
@@ -333,7 +347,7 @@ class VulnerabilityScanner:
             # === INFRASTRUCTURE MODULES ===
             ModuleConfig("cloud", CloudScanner, ModuleCategory.INFRASTRUCTURE),
             ModuleConfig("kubernetes", KubernetesContainerScanner, ModuleCategory.INFRASTRUCTURE),
-            ModuleConfig("dns_rebinding", DNSRebindingScanner, ModuleCategory.INFRASTRUCTURE),
+            ModuleConfig("dns_rebinding", DNSRebindingScanner, ModuleCategory.INFRASTRUCTURE, min_safety_level="standard"),
             ModuleConfig("dir_scanner", DirectoryScanner, ModuleCategory.INFRASTRUCTURE, requires_urls=True),
             ModuleConfig("cms", CMSScanner, ModuleCategory.INFRASTRUCTURE),
             

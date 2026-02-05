@@ -231,10 +231,13 @@ class RawFinding:
             "parameter": self.parameter,
             "method": self.method,
             "payload": self.payload,
+            "request": self.request,
+            "response": self.response,
             "evidence": self.evidence,
             "description": self.description,
             "module_name": self.module_name,
             "confidence": self.confidence,
+            "metadata": self.metadata,
             "timestamp": self.timestamp,
         }
 
@@ -1057,16 +1060,25 @@ class ValidationPipeline:
         start_time = time.time()
         stage_results: List[StageResult] = []
 
-        # Normalize confidence to float (handle string values like "90%" or "0.9")
+        # Normalize confidence to float (handle string values like "90%", "0.9", "high")
         raw_confidence = finding.confidence
         try:
             if isinstance(raw_confidence, str):
-                raw_confidence = float(raw_confidence.rstrip('%'))
-                if raw_confidence > 1:
-                    raw_confidence = raw_confidence / 100.0
+                # Map word-based confidence to numeric values
+                _WORD_CONFIDENCE = {
+                    "critical": 0.95, "high": 0.85, "medium": 0.65,
+                    "low": 0.4, "info": 0.2, "none": 0.0,
+                }
+                word_val = _WORD_CONFIDENCE.get(raw_confidence.strip().lower())
+                if word_val is not None:
+                    raw_confidence = word_val
+                else:
+                    raw_confidence = float(raw_confidence.strip().rstrip('%'))
+                    if raw_confidence > 1:
+                        raw_confidence = raw_confidence / 100.0
             confidence = float(raw_confidence)
         except (ValueError, TypeError):
-            confidence = 0.0
+            confidence = 0.5
 
         # Clamp to valid range
         confidence = max(0.0, min(1.0, confidence))

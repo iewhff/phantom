@@ -31,6 +31,7 @@ config/settingsBUGBOUNTY.yaml
 # SCAN RESULTS & REPORTS (Contains target data)
 # ============================================================================
 reports/
+evidence/
 ci-results/
 data/scans/
 data/reports/
@@ -48,6 +49,10 @@ pentest_*.log
 *_test.log
 *_output.log
 full_pentest_output.log
+
+# Reconnaissance output (contains real target data)
+*_recon.json
+*_recon.md
 
 # ============================================================================
 # CLIENT/TARGET DATA (Sensitive pentest data)
@@ -142,6 +147,7 @@ ehthumbs.db
 Thumbs.db
 *.bak
 *.tmp
+*.tmp.*
 *.temp
 
 # ============================================================================
@@ -162,6 +168,18 @@ docker-compose.override.yml
 *.db
 *.sqlite
 *.sqlite3
+
+# ============================================================================
+# OPERATIONAL / TARGET-SPECIFIC FILES (Never commit)
+# ============================================================================
+# Bug bounty operational notes (contain usernames, target-specific strategy)
+TWILIO_BOUNTY_COMMANDS.md
+# Target-specific command files and notes
+tapsi.md
+tapsi_recon.json
+# Compliance reports with real identities
+docs/TWILIO_COMPLIANCE_REPORT.md
+docs/HACKERONE_COMPLIANCE_ANALYSIS.md
 
 # ============================================================================
 # PHANTOM SPECIFIC

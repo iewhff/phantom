@@ -315,11 +315,30 @@ class CachePoisoningScanner(ScanModule):
     ) -> dict[str, Any]:
         """
         Enterprise: Comprehensive cache poisoning scan.
+
+        SAFETY: Cache poisoning can affect real users by injecting malicious
+        content into shared caches. Blocked in passive, safe, and cautious modes.
         """
         findings: list[dict[str, Any]] = []
-        
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # SAFETY CHECK: Cache poisoning tests can pollute production caches,
+        # affecting real users. Host header CRLF injection can inject arbitrary
+        # headers. Only allow in aggressive/unrestricted modes.
+        # ═══════════════════════════════════════════════════════════════════════
+        import os
+        safety_mode = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+        ALLOWED_MODES = {"aggressive", "unrestricted"}
+        if safety_mode not in ALLOWED_MODES:
+            logger.info(
+                f"Cache Poisoning scanner BLOCKED: safety_mode={safety_mode} "
+                f"(requires aggressive or unrestricted). "
+                f"Cache poisoning can affect real users via shared caches."
+            )
+            return {"findings": [], "skipped": True, "reason": f"Blocked by safety mode: {safety_mode}"}
+
         base_url = f"https://{host}" if not host.startswith("http") else host
-        
+
         async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
             # Phase 1: Detect caching and CDN
             cdn_info = await self._detect_cdn_enterprise(client, base_url, rate_limiter)

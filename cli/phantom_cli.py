@@ -137,6 +137,17 @@ except ImportError as e:
     PHANTOM_AVAILABLE = False
     PHANTOM_IMPORT_ERROR = str(e)
 
+# Import HackerOne Report Generator
+try:
+    from phantom.hackerone_report_generator import (
+        HackerOneReportGenerator,
+        generate_hackerone_report,
+        findings_to_hackerone_reports,
+    )
+    HACKERONE_REPORTER_AVAILABLE = True
+except ImportError:
+    HACKERONE_REPORTER_AVAILABLE = False
+
 console = Console()
 
 
@@ -904,11 +915,22 @@ async def _run_phantom_scan(
                 pentest_log.log_info(f"Scan category: {category}")
                 pentest_log.log_info(f"Modules to run: {module_list if module_list else 'all in category'}")
 
+                # Incremental state callback — save partial results after each module
+                def _on_module_progress(scan_result):
+                    scan_state["modules_run"] = scan_result.modules_run
+                    scan_state["findings"] = scan_result.findings or []
+                    scan_state["errors"] = [
+                        e if isinstance(e, dict) else {"error": str(e)}
+                        for e in (scan_result.errors or [])
+                    ]
+                    save_scan_state(scan_id, scan_state)
+
                 result = await scanner.scan(
                     target=target,
                     category=category,
                     modules=module_list,
                     concurrent=concurrent,
+                    on_progress=_on_module_progress,
                 )
 
                 all_findings = result.findings if result.findings else []
@@ -1016,9 +1038,10 @@ async def _run_phantom_scan(
                             parameter=finding.get("parameter"),
                             payload=finding.get("payload"),
                             evidence=evidence,  # RawFinding uses 'evidence' (str)
-                            module_name=finding.get("module", "unknown"),
-                            response=finding.get("raw_response", ""),  # RawFinding uses 'response'
-                            metadata=finding,  # RawFinding uses 'metadata' for extra data
+                            module_name=finding.get("module_name", finding.get("module", "unknown")),
+                            request=finding.get("raw_request", ""),
+                            response=finding.get("raw_response", ""),
+                            metadata=finding.get("metadata", {}),  # Preserve scanner metadata (e.g., http_evidence)
                             confidence=confidence,  # Pass normalized confidence
                             method=method,  # Ensure method is passed
                         )
@@ -1625,6 +1648,9 @@ def _get_severity(finding) -> str:
     if hasattr(finding, "severity"):
         return finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity)
     elif isinstance(finding, dict):
+        # Serialized ValidatedFinding: {"finding": {...}, "is_valid": true, ...}
+        if "finding" in finding and isinstance(finding["finding"], dict):
+            return finding["finding"].get("severity", "INFO")
         return finding.get("severity", "INFO")
     return "INFO"
 
@@ -2407,7 +2433,7 @@ def quick(ctx: click.Context, target: str, output: Optional[str], output_format:
               type=click.Choice(["pdf", "html", "json", "md", "sarif"]),
               default="html", help="Report format")
 @click.option("--safe-mode", "-s",
-              type=click.Choice(["safe", "cautious", "standard"]),
+              type=click.Choice(["passive", "safe", "cautious", "standard", "aggressive"]),
               default="safe", help="Safety level")
 @click.pass_context
 def full(ctx: click.Context, target: str, output: Optional[str], output_format: str, safe_mode: str):
@@ -2481,10 +2507,15 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
 @click.option("--estimate/--no-estimate", default=True, help="Show bounty estimates")
 @click.option("--header", "-H", multiple=True, help="Custom header (e.g., 'X-Bug-Bounty: username-twilio')")
 @click.option("--username", "-u", help="Bug bounty username (auto-generates X-Bug-Bounty header)")
+@click.option("--program", "-p", help="Program name for X-Bug-Bounty header suffix (e.g., 'twilio')")
+@click.option("--modules", "-m", help="Modules to run (comma-separated, e.g., 'cors' or 'cors,headers')")
+@click.option("--hackerone-report/--no-hackerone-report", default=True,
+              help="Generate HackerOne-quality reports for findings")
 @click.pass_context
 def bounty(ctx: click.Context, target: str, output: Optional[str], output_format: str,
            platform: str, program_tier: str, rate: float, estimate: bool,
-           header: tuple, username: Optional[str]):
+           header: tuple, username: Optional[str], program: Optional[str],
+           modules: Optional[str], hackerone_report: bool):
     """
     Bug bounty optimized PHANTOM AI scan.
 
@@ -2513,6 +2544,7 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
     console.print(Panel(
         "[bold yellow]💰 BOUNTY HUNTING MODE[/bold yellow]\n\n"
         f"Platform: {platform.upper()}\n"
+        f"Program: {program.upper() if program else 'N/A'}\n"
         f"Program Tier: {program_tier}\n"
         f"Rate Limit: {rate} req/sec\n"
         f"Bounty Estimates: {'Enabled' if estimate else 'Disabled'}\n\n"
@@ -2536,17 +2568,11 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
             key, value = h.split(":", 1)
             custom_headers[key.strip()] = value.strip()
 
-    # Auto-generate X-Bug-Bounty header from username
-    if username:
-        # Platform-specific header formats
-        if platform == "hackerone":
-            custom_headers["X-Bug-Bounty"] = f"{username}-hackerone"
-        elif platform == "bugcrowd":
-            custom_headers["X-Bug-Bounty"] = f"{username}-bugcrowd"
-        elif platform == "intigriti":
-            custom_headers["X-Bug-Bounty"] = f"{username}-intigriti"
-        else:
-            custom_headers["X-Bug-Bounty"] = username
+    # Auto-generate X-Bug-Bounty header from username (only if not already set via -H)
+    if username and "X-Bug-Bounty" not in custom_headers:
+        # Use --program name if provided (e.g., "twilio"), otherwise fall back to platform
+        suffix = program or platform
+        custom_headers["X-Bug-Bounty"] = f"{username}-{suffix}"
 
     # Display headers if set
     if custom_headers:
@@ -2585,6 +2611,9 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
         estimate=estimate,
         verbose=ctx.obj.get("verbose", False),
         custom_headers=custom_headers,
+        modules_override=modules,
+        hackerone_report=hackerone_report,
+        program=program,
     ))
 
 
@@ -2598,15 +2627,21 @@ async def _run_bounty_scan(
     estimate: bool,
     verbose: bool,
     custom_headers: Optional[Dict[str, str]] = None,
+    modules_override: Optional[str] = None,
+    hackerone_report: bool = True,
+    program: Optional[str] = None,
 ) -> None:
     """Execute bounty-optimized scan."""
+
+    # Use override modules if provided, otherwise default bounty set
+    scan_modules = modules_override or "sqli,xss,dom_xss,idor,auth,api,ssrf,xxe,csrf,cors"
 
     # Run the main scan with bounty-specific settings
     await _run_phantom_scan(
         target=target,
         output_dir=output_dir,
         output_format=output_format,
-        modules="sqli,xss,dom_xss,idor,auth,api,ssrf,xxe,csrf,cors",
+        modules=scan_modules,
         safe_mode="safe",
         rate=rate,
         concurrent=2,
@@ -2641,6 +2676,357 @@ async def _run_bounty_scan(
         console.print(f"   Platform: {platform.upper()}")
         console.print(f"   Program Tier: {program_tier}")
         console.print(f"   Typical Ranges: See full report for estimates")
+
+    # Generate HackerOne-quality reports for findings
+    if hackerone_report and HACKERONE_REPORTER_AVAILABLE:
+        await _generate_hackerone_reports(target, output_dir, custom_headers=custom_headers, program=program)
+
+
+async def _generate_hackerone_reports(
+    target: str,
+    output_dir: Optional[str] = None,
+    custom_headers: Optional[Dict[str, str]] = None,
+    program: Optional[str] = None,
+) -> None:
+    """Generate HackerOne-quality reports for scan findings."""
+    from pathlib import Path
+
+    console.print("\n[bold cyan]📄 Generating HackerOne Reports...[/bold cyan]")
+
+    # Get the most recent scan for this target
+    scans_dir = get_scans_dir()
+    domain = get_domain(target)
+
+    # Find relevant scan state
+    scan_files = sorted(scans_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    scan_state = None
+
+    for scan_file in scan_files:
+        try:
+            with open(scan_file) as f:
+                state = json.load(f)
+                if state.get("domain") == domain or domain in str(state.get("target", "")):
+                    scan_state = state
+                    break
+        except Exception:
+            continue
+
+    if not scan_state:
+        console.print("[yellow]⚠️ No scan state found for target[/yellow]")
+        return
+
+    findings = scan_state.get("validated_findings", scan_state.get("findings", []))
+
+    if not findings:
+        console.print("[yellow]⚠️ No findings to report[/yellow]")
+        return
+
+    # Filter for reportable findings (MEDIUM severity and above)
+    reportable = [
+        f for f in findings
+        if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+    ]
+
+    if not reportable:
+        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity)[/yellow]")
+        return
+
+    console.print(f"   Found {len(reportable)} reportable findings")
+
+    # Generate reports
+    bounty_header = (custom_headers or {}).get("X-Bug-Bounty")
+    generator = HackerOneReportGenerator(
+        output_dir=Path(output_dir) if output_dir else Path("evidence") / domain.replace(".", "_"),
+        bounty_header=bounty_header,
+        program=program,
+    )
+
+    generated_reports = []
+    for i, finding in enumerate(reportable, 1):
+        try:
+            # Unwrap serialized ValidatedFinding: {"finding": {...}, "is_valid": true, ...}
+            raw_finding = finding
+            if isinstance(finding, dict) and "finding" in finding and isinstance(finding["finding"], dict):
+                raw_finding = finding["finding"]
+
+            # Generate the report
+            report = generator.generate_report(raw_finding)
+
+            # Save in multiple formats
+            saved_files = generator.save_report(report, formats=["md", "json", "html"])
+
+            generated_reports.append({
+                "title": report.title,
+                "severity": report.severity,
+                "cwe": report.cwe,
+                "files": saved_files,
+            })
+
+            console.print(f"   [green]✓[/green] {i}. [{report.severity.upper()}] {report.title}")
+
+        except Exception as e:
+            console.print(f"   [red]✗[/red] {i}. Failed to generate report: {e}")
+
+    # Summary
+    if generated_reports:
+        output_path = generator.output_dir
+        console.print(Panel(
+            f"[bold green]✅ Generated {len(generated_reports)} HackerOne Reports[/bold green]\n\n"
+            f"Output Directory: {output_path}\n\n"
+            "[cyan]Each report includes:[/cyan]\n"
+            "  • Markdown report (hackerone_report.md)\n"
+            "  • JSON data (report_data.json)\n"
+            "  • HTML PoC (if applicable)\n"
+            "  • Reproducible curl commands\n"
+            "  • CWE/CVSS classification\n"
+            "  • Impact assessment\n"
+            "  • Remediation guidance",
+            title="📋 HackerOne Reports Generated",
+            border_style="green",
+        ))
+
+        # Generate handoff session document
+        try:
+            from phantom.handoff_generator import HandoffSessionGenerator
+
+            # Collect artifact paths from all generated reports
+            artifact_paths = []
+            for rpt in generated_reports:
+                for fmt, fpath in rpt.get("files", {}).items():
+                    artifact_paths.append({
+                        "name": f"{rpt['title']} ({fmt})",
+                        "path": fpath,
+                        "type": fmt,
+                    })
+
+            handoff_gen = HandoffSessionGenerator(output_dir=generator.output_dir)
+            session = handoff_gen.generate(
+                target=target,
+                scan_id=scan_state.get("scan_id", "unknown"),
+                findings=reportable,
+                scan_metadata={
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "safety_mode": scan_state.get("safety_mode", "safe"),
+                    "modules_run": len(scan_state.get("modules_executed", [])),
+                    "duration_seconds": scan_state.get("duration_seconds", 0),
+                    "operator": (custom_headers or {}).get("X-Bug-Bounty", "phantom-ai"),
+                },
+                artifact_paths=artifact_paths,
+            )
+            saved_handoff = handoff_gen.save(session)
+            console.print(f"\n   [cyan]📋 Handoff session:[/cyan] {saved_handoff.get('md', '')}")
+        except Exception as e:
+            console.print(f"\n   [yellow]⚠️ Handoff generation skipped: {e}[/yellow]")
+
+
+# =============================================================================
+# HACKERONE REPORT COMMAND
+# =============================================================================
+
+@cli.command("hackerone-report")
+@click.argument("scan_id")
+@click.option("--output", "-o", type=click.Path(), help="Output directory")
+@click.option("--finding-id", "-f", help="Specific finding ID to report (otherwise all MEDIUM+)")
+@click.option("--all-severities", is_flag=True, help="Include LOW and INFO findings")
+@click.option("--bounty-header", help="X-Bug-Bounty header value (e.g., 'youruser-twilio')")
+@click.pass_context
+def hackerone_report_cmd(ctx: click.Context, scan_id: str, output: Optional[str],
+                         finding_id: Optional[str], all_severities: bool,
+                         bounty_header: Optional[str]):
+    """
+    Generate HackerOne-quality reports from scan findings.
+
+    Creates professional bug bounty reports with:
+      - Proper CWE/CVSS classification
+      - Reproducible curl commands
+      - Impact assessment
+      - PoC files where applicable
+
+    \b
+    Examples:
+        phantom hackerone-report PHANTOM_20260205
+        phantom hackerone-report PHANTOM_20260205 -f FINDING_123
+        phantom hackerone-report PHANTOM_20260205 --all-severities
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    if not HACKERONE_REPORTER_AVAILABLE:
+        console.print("[red]❌ HackerOne Report Generator not available[/red]")
+        console.print("[dim]Make sure phantom/hackerone_report_generator.py exists[/dim]")
+        return
+
+    state = load_scan_state(scan_id)
+    if not state:
+        console.print(f"[red]❌ Scan not found: {scan_id}[/red]")
+        return
+
+    findings = state.get("validated_findings", state.get("findings", []))
+
+    if finding_id:
+        # Filter for specific finding
+        findings = [f for f in findings if f.get("id") == finding_id]
+        if not findings:
+            console.print(f"[red]❌ Finding not found: {finding_id}[/red]")
+            return
+    elif not all_severities:
+        # Filter for MEDIUM+ severity
+        findings = [
+            f for f in findings
+            if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+        ]
+
+    if not findings:
+        console.print("[yellow]⚠️ No findings to report[/yellow]")
+        return
+
+    console.print(Panel(
+        f"[bold cyan]📄 Generating HackerOne Reports[/bold cyan]\n\n"
+        f"Scan ID: {scan_id}\n"
+        f"Findings: {len(findings)}\n"
+        f"Severities: {'All' if all_severities else 'MEDIUM+'}",
+        title="HackerOne Report Generator",
+        border_style="cyan",
+    ))
+
+    # Generate reports
+    target = state.get("target", "unknown")
+    domain = state.get("domain", get_domain(target))
+
+    generator = HackerOneReportGenerator(
+        output_dir=Path(output) if output else Path("evidence") / f"{domain.replace('.', '_')}_{scan_id}",
+        bounty_header=bounty_header,
+    )
+
+    generated_reports = []
+    for i, finding in enumerate(findings, 1):
+        try:
+            report = generator.generate_report(finding)
+            saved_files = generator.save_report(report, formats=["md", "json", "html"])
+
+            generated_reports.append({
+                "title": report.title,
+                "severity": report.severity,
+                "cwe": report.cwe,
+                "files": saved_files,
+            })
+
+            console.print(f"   [green]✓[/green] {i}. [{report.severity.upper()}] {report.title}")
+            console.print(f"      [dim]→ {saved_files.get('md', 'N/A')}[/dim]")
+
+        except Exception as e:
+            console.print(f"   [red]✗[/red] {i}. Failed: {e}")
+
+    # Summary
+    if generated_reports:
+        console.print(Panel(
+            f"[bold green]✅ Generated {len(generated_reports)} HackerOne Reports[/bold green]\n\n"
+            f"Output: {generator.output_dir}\n\n"
+            "[cyan]Report Contents:[/cyan]\n"
+            "  • Summary with clear asset identification\n"
+            "  • CWE/CVSS vulnerability classification\n"
+            "  • Step-by-step reproduction with curl commands\n"
+            "  • Impact assessment with attack scenarios\n"
+            "  • Honest limitations/assumptions\n"
+            "  • Remediation recommendations\n"
+            "  • References and PoC files",
+            title="📋 Reports Ready for Submission",
+            border_style="green",
+        ))
+
+
+# =============================================================================
+# HANDOFF COMMAND
+# =============================================================================
+
+
+@cli.command()
+@click.argument("scan_id")
+@click.option("--output", "-o", type=click.Path(), help="Output directory")
+@click.option("--operator", help="Operator name / username")
+@click.pass_context
+def handoff(ctx, scan_id, output, operator):
+    """Generate a comprehensive handoff session document for a scan."""
+    from phantom.handoff_generator import HandoffSessionGenerator
+
+    console.print(Panel(
+        f"[bold cyan]📋 Generating Handoff Session[/bold cyan]\n\n"
+        f"Scan ID: {scan_id}",
+        title="Handoff Session Generator",
+        border_style="cyan",
+    ))
+
+    # Load scan state
+    scans_dir = get_scans_dir()
+    scan_files = sorted(scans_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    scan_state = None
+
+    for scan_file in scan_files:
+        try:
+            with open(scan_file) as f:
+                state = json.load(f)
+                if state.get("scan_id") == scan_id or scan_id in str(scan_file):
+                    scan_state = state
+                    break
+        except Exception:
+            continue
+
+    if not scan_state:
+        console.print(f"[red]Error:[/red] No scan found with ID '{scan_id}'")
+        console.print("[yellow]Tip:[/yellow] Run 'phantom list' to see available scans")
+        return
+
+    target = scan_state.get("target", "unknown")
+    domain = scan_state.get("domain", get_domain(target) if target != "unknown" else "unknown")
+    findings = scan_state.get("validated_findings", scan_state.get("findings", []))
+
+    if not findings:
+        console.print("[yellow]⚠️ No findings in this scan[/yellow]")
+        return
+
+    # Collect artifacts from evidence directory
+    artifact_paths = []
+    evidence_base = Path("evidence") / domain.replace(".", "_")
+    if evidence_base.exists():
+        for report_dir in evidence_base.iterdir():
+            if report_dir.is_dir():
+                for fpath in report_dir.iterdir():
+                    artifact_paths.append({
+                        "name": fpath.name,
+                        "path": str(fpath),
+                        "type": fpath.suffix.lstrip("."),
+                    })
+
+    output_dir = Path(output) if output else evidence_base
+    gen = HandoffSessionGenerator(output_dir=output_dir)
+
+    session = gen.generate(
+        target=target,
+        scan_id=scan_id,
+        findings=findings,
+        scan_metadata={
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "safety_mode": scan_state.get("safety_mode", "safe"),
+            "modules_run": len(scan_state.get("modules_executed", [])),
+            "duration_seconds": scan_state.get("duration_seconds", 0),
+            "operator": operator or "phantom-ai",
+        },
+        artifact_paths=artifact_paths,
+    )
+
+    saved = gen.save(session)
+
+    console.print(Panel(
+        f"[bold green]✅ Handoff Session Generated[/bold green]\n\n"
+        f"Target: {target}\n"
+        f"Findings: {len(findings)}\n\n"
+        "[cyan]Files generated:[/cyan]\n"
+        f"  • HANDOFF.md — {saved.get('md', '')}\n"
+        f"  • handoff_data.json — {saved.get('json', '')}\n"
+        f"  • MANIFEST.json — {saved.get('manifest', '')}",
+        title="📋 Handoff Ready",
+        border_style="green",
+    ))
 
 
 # =============================================================================
@@ -2709,9 +3095,40 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
             border_style="red",
         ))
 
-    safe_asyncio_run(_run_phantom_scan(
+    safe_asyncio_run(_run_client_scan(
         target=target,
         output_dir=output,
+        output_format=output_format,
+        safe_mode=safe_mode,
+        rate=rate,
+        concurrent=concurrent,
+        subdomains=subdomains,
+        verbose=ctx.obj.get("verbose", False),
+        client_name=client_name,
+        engagement_id=engagement_id,
+        compliance_frameworks=compliance_list,
+    ))
+
+
+async def _run_client_scan(
+    target: str,
+    output_dir: Optional[str],
+    output_format: str,
+    safe_mode: str,
+    rate: float,
+    concurrent: int,
+    subdomains: bool,
+    verbose: bool,
+    client_name: Optional[str] = None,
+    engagement_id: Optional[str] = None,
+    compliance_frameworks: Optional[List[str]] = None,
+) -> None:
+    """Execute client engagement scan with professional report generation."""
+
+    # Run the main scan
+    await _run_phantom_scan(
+        target=target,
+        output_dir=output_dir,
         output_format=output_format,
         modules=None,
         safe_mode=safe_mode,
@@ -2727,8 +3144,158 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
         no_auth=False,
         timeout=None,
         scan_mode=ScanMode.CLIENT if PHANTOM_AVAILABLE else "client",
-        verbose=ctx.obj.get("verbose", False),
-    ))
+        verbose=verbose,
+    )
+
+    # Generate professional client reports
+    await _generate_client_reports(
+        target=target,
+        output_dir=output_dir,
+        client_name=client_name,
+        engagement_id=engagement_id,
+        compliance_frameworks=compliance_frameworks or [],
+    )
+
+
+async def _generate_client_reports(
+    target: str,
+    output_dir: Optional[str] = None,
+    client_name: Optional[str] = None,
+    engagement_id: Optional[str] = None,
+    compliance_frameworks: Optional[List[str]] = None,
+) -> None:
+    """Generate professional client assessment reports for scan findings."""
+    from pathlib import Path
+
+    console.print("\n[bold cyan]📄 Generating Professional Client Reports...[/bold cyan]")
+
+    # Load scan state (same pattern as _generate_hackerone_reports)
+    scans_dir = get_scans_dir()
+    domain = get_domain(target)
+
+    scan_files = sorted(scans_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    scan_state = None
+
+    for scan_file in scan_files:
+        try:
+            with open(scan_file) as f:
+                state = json.load(f)
+                if state.get("domain") == domain or domain in str(state.get("target", "")):
+                    scan_state = state
+                    break
+        except Exception:
+            continue
+
+    if not scan_state:
+        console.print("[yellow]⚠️ No scan state found for target[/yellow]")
+        return
+
+    findings = scan_state.get("validated_findings", scan_state.get("findings", []))
+
+    if not findings:
+        console.print("[yellow]⚠️ No findings to report[/yellow]")
+        return
+
+    # Filter for reportable findings (MEDIUM+ severity)
+    reportable = [
+        f for f in findings
+        if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+    ]
+
+    if not reportable:
+        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity)[/yellow]")
+        return
+
+    console.print(f"   Found {len(reportable)} reportable findings")
+
+    # Generate client reports
+    try:
+        from phantom.client_report_generator import ClientReportGenerator
+
+        out_path = Path(output_dir) if output_dir else Path("evidence") / f"{domain.replace('.', '_')}_client"
+
+        generator = ClientReportGenerator(
+            output_dir=out_path,
+            client_name=client_name or "Client",
+            engagement_id=engagement_id or "",
+            compliance_frameworks=compliance_frameworks or [],
+        )
+
+        report = generator.generate(
+            findings=reportable,
+            scan_metadata={
+                "target": target,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "safety_mode": scan_state.get("safety_mode", "standard"),
+                "modules_run": len(scan_state.get("modules_executed", [])),
+                "duration_seconds": scan_state.get("duration_seconds", 0),
+                "scan_id": scan_state.get("scan_id", "unknown"),
+            },
+        )
+
+        saved = generator.save(report)
+
+        # Per-finding report summary
+        for fr in report.finding_reports:
+            sev = fr.get("severity", "").upper()
+            title = fr.get("title", "Unknown")
+            console.print(f"   [green]✓[/green] [{sev}] {title}")
+
+        console.print(Panel(
+            f"[bold green]✅ Client Assessment Report Generated[/bold green]\n\n"
+            f"Client: {report.client_name}\n"
+            f"Engagement: {report.engagement_id}\n"
+            f"Findings: {len(report.finding_reports)}\n"
+            f"Output: {out_path}\n\n"
+            "[cyan]Deliverables:[/cyan]\n"
+            f"  • CLIENT_REPORT.md — {saved.get('md', '')}\n"
+            f"  • executive_summary.md — {saved.get('executive_summary', '')}\n"
+            f"  • compliance_annex.md — {saved.get('compliance_annex', 'N/A')}\n"
+            "  • Per-finding reports with PoC files\n",
+            title="📋 Client Report Ready",
+            border_style="green",
+        ))
+
+    except ImportError:
+        console.print("[yellow]⚠️ ClientReportGenerator not available[/yellow]")
+        return
+    except Exception as e:
+        console.print(f"[red]✗ Client report generation failed: {e}[/red]")
+        return
+
+    # Generate handoff session
+    try:
+        from phantom.handoff_generator import HandoffSessionGenerator
+
+        artifact_paths = []
+        for fmt, fpath in saved.items():
+            artifact_paths.append({"name": f"Client Report ({fmt})", "path": fpath, "type": fmt})
+        for fr in report.finding_reports:
+            for fmt, fpath in fr.get("files", {}).items():
+                artifact_paths.append({
+                    "name": f"{fr['title']} ({fmt})",
+                    "path": fpath,
+                    "type": fmt,
+                })
+
+        handoff_gen = HandoffSessionGenerator(output_dir=out_path)
+        session = handoff_gen.generate(
+            target=target,
+            scan_id=scan_state.get("scan_id", "unknown"),
+            findings=reportable,
+            scan_metadata={
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "safety_mode": scan_state.get("safety_mode", "standard"),
+                "modules_run": len(scan_state.get("modules_executed", [])),
+                "duration_seconds": scan_state.get("duration_seconds", 0),
+                "operator": client_name or "phantom-ai",
+            },
+            artifact_paths=artifact_paths,
+        )
+        saved_handoff = handoff_gen.save(session)
+        console.print(f"\n   [cyan]📋 Handoff session:[/cyan] {saved_handoff.get('md', '')}")
+    except Exception as e:
+        console.print(f"\n   [yellow]⚠️ Handoff generation skipped: {e}[/yellow]")
 
 
 # =============================================================================
