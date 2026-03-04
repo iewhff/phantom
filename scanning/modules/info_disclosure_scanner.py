@@ -25,13 +25,12 @@ Author: PHANTOM AI Team
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse, quote
 
 logger = logging.getLogger(__name__)
@@ -283,6 +282,40 @@ DEBUG_ENDPOINTS = [
     "/diagnostics",
     "/debug/vars",
     "/debug/pprof/",
+
+    # API Debug Endpoints (GENERALIST — works for REST APIs)
+    # Pattern: /_debug at various path levels
+    "/_debug",
+    "/api/_debug",
+    "/v1/_debug",
+    "/v2/_debug",
+    "/api/v1/_debug",
+    "/api/v2/_debug",
+    # Common resource debug endpoints
+    "/users/_debug",
+    "/accounts/_debug",
+    "/admin/_debug",
+    "/system/_debug",
+    "/internal/_debug",
+    # Versioned resource debug (VAmPI pattern: /users/v1/_debug)
+    "/users/v1/_debug",
+    "/users/v2/_debug",
+    "/accounts/v1/_debug",
+    "/admin/v1/_debug",
+    # Alternative naming patterns
+    "/_internal",
+    "/api/_internal",
+    "/_admin",
+    "/api/_admin",
+    "/_system",
+    "/api/_system",
+    "/_dump",
+    "/api/_dump",
+    "/_export",
+    "/api/_export",
+    # Debug query patterns (will be probed with ?debug=1 etc.)
+    "/_test",
+    "/api/_test",
 ]
 
 # Backup file patterns
@@ -382,6 +415,208 @@ VCS_PATHS = [
     "CVS/",
     "CVS/Root",
 ]
+
+# =============================================================================
+# ERROR PAGE DETECTION (FP Reduction)
+# =============================================================================
+
+# Generic error page indicators - disclosures in these are usually FP
+GENERIC_ERROR_PAGE_PATTERNS = [
+    # HTTP status in title/body
+    r"<title>\s*404\s*(Not Found|Page Not Found|Error)?\s*</title>",
+    r"<title>\s*500\s*(Internal Server Error|Server Error)?\s*</title>",
+    r"<title>\s*403\s*(Forbidden|Access Denied)?\s*</title>",
+    r"<title>\s*(Error|Oops|Something went wrong)</title>",
+    r"<h1>\s*404\s*(Not Found)?\s*</h1>",
+    r"<h1>\s*500\s*(Internal Server Error)?\s*</h1>",
+    r"<h1>\s*(Error|Oops|Page Not Found)\s*</h1>",
+
+    # Framework default error pages
+    r"The page you are looking for could not be found",
+    r"The requested URL was not found on this server",
+    r"The server encountered an internal error",
+    r"We're sorry, but something went wrong",
+    r"This page doesn't exist",
+    r"Page you requested was not found",
+    r"Resource not found",
+
+    # Framework-specific generic error templates
+    r"<div class=\"error-page\">",
+    r"<div id=\"error-page\">",
+    r"class=\"error-template\"",
+    r"class=\"http-error\"",
+    r"<div class=\"exception\">",  # Generic exception div
+
+    # Django/Rails/Laravel default error pages
+    r"Django Debug Toolbar",  # Debug mode (different from production error)
+    r"You're seeing this error because you have <code>DEBUG = True</code>",
+    r"PrettyPrinted by BetterErrors",
+    r"Whoops! There was an error",  # Laravel Whoops
+    r"Laravel",  # Laravel error page
+]
+
+# Patterns that indicate legitimate disclosure (not just generic error page)
+# FIX 2026-02-19: Added Node.js, Ruby, Go patterns and unquoted credentials
+# Audit found: Node.js stack traces and unquoted credentials were being filtered
+LEGITIMATE_DISCLOSURE_PATTERNS = [
+    # Specific file paths in errors (not just generic message)
+    r"in\s+(/[^\s]+\.php)\s+on line\s+\d+",  # PHP with specific file
+    r"File\s+\"(/[^\"]+\.py)\",\s+line\s+\d+",  # Python with specific file (quotes)
+    r"File\s+(/[^\s]+\.py),\s+line\s+\d+",      # Python without quotes
+    r"at\s+[\w\.]+\((/[^\)]+\.java):\d+\)",     # Java with file path
+
+    # FIX: Node.js / JavaScript patterns (Audit: these were missing)
+    r"at\s+[\w\.]+\s+\(/[^\)]+\.js:\d+:\d+\)",  # Node.js: at function (/path/file.js:12:5)
+    r"at\s+/[^\s]+\.js:\d+:\d+",                # Node.js: at /path/file.js:12:5
+    r"(/[^\s]+\.ts):\d+:\d+",                   # TypeScript file path
+    r"node_modules/[^\s]+",                      # Node modules path
+    r"Error:\s+Cannot find module",              # Module error
+
+    # FIX: Ruby patterns
+    r"\.rb:\d+:in\s+`",                         # Ruby: file.rb:12:in `method'
+
+    # FIX: Go patterns
+    r"\.go:\d+",                                 # Go: file.go:123
+    r"goroutine\s+\d+\s+\[",                    # Go stack trace
+
+    # Actual database queries leaked
+    r"SELECT\s+.*\s+FROM\s+",
+    r"INSERT\s+INTO\s+",
+    r"UPDATE\s+.*\s+SET\s+",
+    r"DELETE\s+FROM\s+",
+    r"DROP\s+TABLE",
+
+    # Configuration values exposed (with quotes)
+    r"password\s*[=:]\s*['\"][^'\"]+['\"]",
+    r"api[_-]?key\s*[=:]\s*['\"][^'\"]+['\"]",
+    r"secret\s*[=:]\s*['\"][^'\"]+['\"]",
+
+    # FIX: Unquoted credentials (Audit: these were missing)
+    r"password\s*[=:]\s*\S+",                   # password=value (no quotes)
+    r"api[_-]?key\s*[=:]\s*\S+",                # api_key=value
+    r"secret\s*[=:]\s*\S+",                     # secret=value
+    r"token\s*[=:]\s*\S+",                      # token=value
+    r"auth\s*[=:]\s*\S+",                       # auth=value
+    r"(DB_PASSWORD|DATABASE_PASSWORD|MYSQL_PASSWORD|POSTGRES_PASSWORD)\s*[=:]\s*\S+",
+
+    # Actual internal IPs (not just localhost reference in error)
+    r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    r"\b192\.168\.\d{1,3}\.\d{1,3}\b",
+    r"\b172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}\b",  # 172.16-31.x.x
+
+    # FIX: Connection strings (often exposed in debug pages)
+    r"(mongodb|mysql|postgresql|redis)://[^\s]+",
+    r"Data Source=[^\s;]+",                     # .NET connection string
+    r"Server=[^\s;]+;\s*Database=",             # SQL Server connection string
+]
+
+
+def is_generic_error_page(response_body: str, status_code: int = 0) -> bool:
+    """
+    Detect if response is a generic error page.
+
+    Generic error pages (404, 500 templates) often contain stack traces
+    or path info as part of their default template, not as actual leaks.
+
+    Returns True if this looks like a generic error page.
+    """
+    if not response_body:
+        return False
+
+    # Check status code first (if provided)
+    if status_code in (404, 403, 500, 502, 503):
+        # Higher likelihood of being generic error page
+        pass
+
+    # Check for generic error page patterns
+    for pattern in GENERIC_ERROR_PAGE_PATTERNS:
+        if re.search(pattern, response_body, re.I | re.S):
+            return True
+
+    # Check for very short error responses (likely generic)
+    body_text = re.sub(r'<[^>]+>', '', response_body).strip()
+    if len(body_text) < 200 and status_code in (404, 403, 500):
+        # Short response with error status = likely generic
+        return True
+
+    return False
+
+
+def has_legitimate_disclosure(response_body: str) -> bool:
+    """
+    Check if response contains legitimate disclosure beyond generic error page.
+
+    Even if a page is an error page, it might still have legitimate disclosures
+    like actual database queries or credentials.
+    """
+    for pattern in LEGITIMATE_DISCLOSURE_PATTERNS:
+        if re.search(pattern, response_body, re.I | re.S):
+            return True
+    return False
+
+
+def filter_error_page_disclosures(
+    items: list,
+    response_body: str,
+    status_code: int = 0,
+) -> list:
+    """
+    Filter out disclosures that are part of generic error pages.
+
+    Args:
+        items: List of DisclosureItem objects
+        response_body: HTTP response body
+        status_code: HTTP status code
+
+    Returns:
+        Filtered list with error page FPs removed
+    """
+    if not items:
+        return items
+
+    # Check if this is a generic error page
+    if not is_generic_error_page(response_body, status_code):
+        return items  # Not an error page, keep all findings
+
+    # It's an error page - check if there's legitimate disclosure
+    if has_legitimate_disclosure(response_body):
+        return items  # Has real leak, keep all findings
+
+    # Filter out low-value disclosures from error pages
+    filtered = []
+    for item in items:
+        # Keep CRITICAL items even from error pages
+        if hasattr(item, 'severity') and item.severity == SeverityLevel.CRITICAL:
+            filtered.append(item)
+            continue
+
+        # Keep credential/sensitive data leaks
+        if item.disclosure_type in (
+            DisclosureType.CREDENTIAL_LEAK,
+            DisclosureType.CONFIG_FILE,
+            DisclosureType.GIT_EXPOSURE,
+            DisclosureType.SVN_EXPOSURE,
+        ):
+            filtered.append(item)
+            continue
+
+        # Skip version info, path disclosure, error messages from generic pages
+        if item.disclosure_type in (
+            DisclosureType.VERSION_INFO,
+            DisclosureType.PATH_DISCLOSURE,
+            DisclosureType.ERROR_MESSAGE,
+            DisclosureType.STACK_TRACE,
+            DisclosureType.INTERNAL_IP,
+        ):
+            # These are usually part of the error page template
+            logger.debug(f"[InfoDisclosure] Filtered FP from error page: {item.disclosure_type.name}")
+            continue
+
+        # Keep everything else
+        filtered.append(item)
+
+    return filtered
+
 
 # API documentation paths
 API_DOC_PATHS = [
@@ -732,19 +967,26 @@ class InfoDisclosureScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         **kwargs,
-    ) -> List[DisclosureFinding]:
+    ) -> Dict[str, Any]:
         """
         Scan for information disclosure vulnerabilities.
 
         Args:
             target_url: Target URL to scan
+            asset_data: Asset data with endpoints, forms (optional)
+            rate_limiter: Rate limiter (optional)
             **kwargs: Additional configuration
 
         Returns:
             List of discovered vulnerabilities
         """
         logger.info(f"[InfoDisclosure] Starting scan: {target_url}")
+
+        # FIX: Store rate limiter for use in HTTP requests
+        self._rate_limiter = rate_limiter
 
         # Create config if not provided
         if not self.config:
@@ -781,7 +1023,15 @@ class InfoDisclosureScanner:
             await self._test_error_triggers(target_url)
 
         logger.info(f"[InfoDisclosure] Scan complete. Found {len(self.findings)} vulnerabilities")
-        return self.findings
+        return {"findings": self.findings, "info": []}
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if hasattr(self, '_rate_limiter') and self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception:
+                pass  # Proceed if rate limiter fails
 
     async def _test_page(self, url: str) -> None:
         """Test a page for information disclosure."""
@@ -797,6 +1047,7 @@ class InfoDisclosureScanner:
 
         try:
             if self.http_client:
+                await self._acquire_rate_limit()  # FIX: Rate limit before request
                 response = await self.http_client.get(
                     url,
                     follow_redirects=self.config.follow_redirects if self.config else True,
@@ -836,6 +1087,12 @@ class InfoDisclosureScanner:
         if self.config and self.config.test_comments:
             all_items.extend(self.comment_detector.detect(response_body))
 
+        # FP REDUCTION: Filter out disclosures from generic error pages
+        original_count = len(all_items)
+        all_items = filter_error_page_disclosures(all_items, response_body, response_code)
+        if len(all_items) < original_count:
+            logger.debug(f"[InfoDisclosure] Filtered {original_count - len(all_items)} FPs from error page at {url}")
+
         # Create findings from items
         self._create_findings_from_items(url, all_items)
 
@@ -843,7 +1100,28 @@ class InfoDisclosureScanner:
         """Test for debug endpoint exposure."""
         logger.debug("[InfoDisclosure] Testing debug endpoints")
 
+        # FIX 2026-02-20: GENERALIST — Detect context path for apps like /WebGoat/
+        # Many Java apps run at a context path, not the root
+        context_paths = [""]  # Start with root
+        if hasattr(self, 'config') and self.config and self.config.target_url:
+            parsed_target = urlparse(self.config.target_url)
+            path_parts = parsed_target.path.strip("/").split("/")
+            if path_parts and path_parts[0]:
+                context_paths.append(f"/{path_parts[0]}")
+                logger.debug(f"[InfoDisclosure] Using context path: /{path_parts[0]}")
+
+        # Build paths to test: standard + context-prefixed
+        paths_to_test = set()
         for path in DEBUG_ENDPOINTS:
+            paths_to_test.add(path)
+            # Add context-prefixed versions for actuator endpoints
+            if "/actuator" in path:
+                for ctx in context_paths:
+                    if ctx:
+                        prefixed = f"{ctx}{path}"
+                        paths_to_test.add(prefixed)
+
+        for path in paths_to_test:
             url = urljoin(base_url, path)
             if url in self._tested_urls:
                 continue
@@ -851,6 +1129,7 @@ class InfoDisclosureScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(url, timeout=10.0)
 
                     if response.status_code == 200:
@@ -859,13 +1138,23 @@ class InfoDisclosureScanner:
                         # Check for specific debug indicators
                         is_debug = False
                         debug_type = None
+                        severity = "HIGH"
 
                         if "phpinfo()" in response_body or "PHP Version" in response_body:
                             is_debug = True
                             debug_type = "phpinfo"
-                        elif "Spring Boot Actuator" in response_body or "/actuator" in path:
+                        elif "_links" in response_body and "/actuator" in response_body:
+                            # Spring Boot actuator root endpoint (HAL+JSON format)
                             is_debug = True
                             debug_type = "actuator"
+                            # Check for sensitive sub-endpoints
+                            await self._check_actuator_sensitive_endpoints(url, response_body)
+                        elif "/actuator" in path:
+                            is_debug = True
+                            debug_type = "actuator"
+                            # Sensitive actuator endpoints get CRITICAL severity
+                            if any(s in path for s in ["/env", "/configprops", "/heapdump", "/jolokia"]):
+                                severity = "CRITICAL"
                         elif "server-status" in response_body or "Apache Status" in response_body:
                             is_debug = True
                             debug_type = "server-status"
@@ -873,25 +1162,188 @@ class InfoDisclosureScanner:
                             is_debug = True
                             debug_type = "django-debug"
 
+                        # FIX 2026-02-20: GENERALIST — Detect JSON credential exposure
+                        # API debug endpoints like VAmPI's /_debug often return passwords in JSON
+                        # This works for any API, not just specific debug types
+                        if not is_debug and "_debug" in path.lower() or "_internal" in path.lower() or "_dump" in path.lower():
+                            # Check if response looks like JSON with credentials
+                            credentials_found = await self._check_json_credential_exposure(url, response_body, path)
+                            if credentials_found:
+                                is_debug = True
+                                debug_type = "api-debug-credentials"
+                                severity = "CRITICAL"  # Always CRITICAL when passwords exposed
+
                         if is_debug:
                             self._create_finding(
                                 disclosure_type=DisclosureType.DEBUG_ENDPOINT,
-                                severity="HIGH",
+                                severity=severity,
                                 confidence=0.95,
                                 endpoint=url,
                                 description=f"Debug endpoint exposed: {path}",
-                                impact="Attackers can gather sensitive system information.",
+                                impact="Attackers can gather sensitive system information, credentials, and environment variables.",
                                 items=[DisclosureItem(
                                     disclosure_type=DisclosureType.DEBUG_ENDPOINT,
                                     content=f"Debug endpoint: {path}",
                                     location=url,
                                     context=f"{debug_type} endpoint",
-                                    severity=SeverityLevel.HIGH,
+                                    severity=SeverityLevel.CRITICAL if severity == "CRITICAL" else SeverityLevel.HIGH,
                                 )],
                             )
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
+
+    async def _check_actuator_sensitive_endpoints(self, actuator_url: str, response_body: str) -> None:
+        """
+        Check for sensitive actuator sub-endpoints when actuator root is found.
+
+        GENERALIST: Works on any Spring Boot app with exposed actuator.
+        """
+        import json
+        try:
+            data = json.loads(response_body)
+            links = data.get("_links", {})
+
+            # Sensitive endpoints that expose credentials/secrets
+            sensitive_endpoints = {
+                "env": ("CRITICAL", "Environment variables may contain credentials, API keys, database passwords"),
+                "configprops": ("CRITICAL", "Configuration properties may expose secrets and internal settings"),
+                "heapdump": ("CRITICAL", "Memory dump may contain credentials, session tokens, and sensitive data"),
+                "jolokia": ("CRITICAL", "JMX endpoint may allow remote code execution"),
+                "httptrace": ("HIGH", "HTTP traces may expose session tokens and request data"),
+                "trace": ("HIGH", "Traces may expose session tokens and request data"),
+                "mappings": ("MEDIUM", "Endpoint mappings reveal application structure"),
+                "beans": ("LOW", "Bean information reveals application components"),
+            }
+
+            for endpoint_name, (severity, impact) in sensitive_endpoints.items():
+                if endpoint_name in links:
+                    endpoint_data = links[endpoint_name]
+                    href = endpoint_data.get("href", "") if isinstance(endpoint_data, dict) else ""
+
+                    if href:
+                        # Test if endpoint is accessible
+                        try:
+                            await self._acquire_rate_limit()
+                            test_response = await self.http_client.get(href, timeout=10.0)
+
+                            if test_response.status_code == 200:
+                                self._create_finding(
+                                    disclosure_type=DisclosureType.DEBUG_ENDPOINT,
+                                    severity=severity,
+                                    confidence=0.98,
+                                    endpoint=href,
+                                    description=f"Spring Boot Actuator '{endpoint_name}' endpoint exposed",
+                                    impact=impact,
+                                    items=[DisclosureItem(
+                                        disclosure_type=DisclosureType.DEBUG_ENDPOINT,
+                                        content=f"Actuator {endpoint_name}: {href}",
+                                        location=href,
+                                        context=f"Spring Boot Actuator sensitive endpoint",
+                                        severity=SeverityLevel.CRITICAL if severity == "CRITICAL" else SeverityLevel.HIGH,
+                                    )],
+                                )
+                        except Exception:
+                            pass
+
+        except json.JSONDecodeError:
+            pass
+
+    async def _check_json_credential_exposure(self, url: str, response_body: str, path: str) -> bool:
+        """
+        Check if JSON response contains credential exposure (passwords, tokens, secrets).
+
+        GENERALIST: Works for any REST API debug endpoint, not just specific frameworks.
+        Pattern: VAmPI's /users/v1/_debug returns {"users": [{"username": "admin", "password": "..."}]}
+
+        Returns True if credentials found and a finding was created.
+        """
+        import json
+
+        # Only check JSON responses
+        if not response_body.strip().startswith(("{", "[")):
+            return False
+
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError:
+            return False
+
+        # Sensitive field patterns (lowercase for matching)
+        sensitive_fields = {
+            "password": "Password exposed in JSON response",
+            "passwd": "Password exposed in JSON response",
+            "pwd": "Password exposed in JSON response",
+            "secret": "Secret value exposed in JSON response",
+            "api_key": "API key exposed in JSON response",
+            "apikey": "API key exposed in JSON response",
+            "api-key": "API key exposed in JSON response",
+            "private_key": "Private key exposed in JSON response",
+            "privatekey": "Private key exposed in JSON response",
+            "access_token": "Access token exposed in JSON response",
+            "accesstoken": "Access token exposed in JSON response",
+            "refresh_token": "Refresh token exposed in JSON response",
+            "auth_token": "Auth token exposed in JSON response",
+            "bearer_token": "Bearer token exposed in JSON response",
+            "credentials": "Credentials exposed in JSON response",
+            "credit_card": "Credit card data exposed in JSON response",
+            "ssn": "Social Security Number exposed in JSON response",
+            "bank_account": "Bank account exposed in JSON response",
+        }
+
+        # Recursively search for sensitive fields with non-empty values
+        exposed_fields = []
+
+        def search_object(obj, parent_key=""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    full_key = f"{parent_key}.{key}" if parent_key else key
+                    key_lower = key.lower()
+
+                    # Check if key matches sensitive pattern
+                    for sensitive_key, description in sensitive_fields.items():
+                        if sensitive_key in key_lower:
+                            # Only flag if value is non-empty and not a placeholder
+                            if value and isinstance(value, str) and len(value) > 0:
+                                # Skip obvious placeholders
+                                if value.lower() not in {"null", "none", "", "*****", "***", "redacted", "[redacted]"}:
+                                    exposed_fields.append((full_key, sensitive_key, description))
+                            break
+
+                    # Recurse into nested objects
+                    search_object(value, full_key)
+
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    search_object(item, f"{parent_key}[{i}]")
+
+        search_object(data)
+
+        if exposed_fields:
+            # Create a finding for credential exposure
+            field_list = ", ".join([f[0] for f in exposed_fields[:5]])  # Limit to 5 examples
+            unique_types = set(f[1] for f in exposed_fields)
+
+            logger.info(f"[InfoDisclosure] CRITICAL: Credential exposure at {url} — fields: {field_list}")
+
+            self._create_finding(
+                disclosure_type=DisclosureType.DEBUG_ENDPOINT,
+                severity="CRITICAL",
+                confidence=0.98,
+                endpoint=url,
+                description=f"API debug endpoint exposes credentials: {', '.join(unique_types)}",
+                impact=f"Attackers can extract sensitive data including {', '.join(unique_types)}. Found in fields: {field_list}",
+                items=[DisclosureItem(
+                    disclosure_type=DisclosureType.DEBUG_ENDPOINT,
+                    content=f"Credential exposure: {field_list}",
+                    location=url,
+                    context=f"API debug endpoint with {len(exposed_fields)} exposed credential field(s)",
+                    severity=SeverityLevel.CRITICAL,
+                )],
+            )
+            return True
+
+        return False
 
     async def _test_backup_files(self, original_url: str) -> None:
         """Test for backup file exposure."""
@@ -921,6 +1373,7 @@ class InfoDisclosureScanner:
         for url in backup_urls:
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(url, timeout=10.0)
 
                     if response.status_code == 200:
@@ -947,8 +1400,8 @@ class InfoDisclosureScanner:
                                     )],
                                 )
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
 
     async def _test_vcs_exposure(self, base_url: str) -> None:
         """Test for version control system exposure."""
@@ -962,6 +1415,7 @@ class InfoDisclosureScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(url, timeout=10.0)
 
                     if response.status_code == 200:
@@ -1001,8 +1455,8 @@ class InfoDisclosureScanner:
                                 )],
                             )
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
 
     async def _test_config_files(self, base_url: str) -> None:
         """Test for configuration file exposure."""
@@ -1016,6 +1470,7 @@ class InfoDisclosureScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(url, timeout=10.0)
 
                     if response.status_code == 200:
@@ -1046,8 +1501,8 @@ class InfoDisclosureScanner:
                                 )],
                             )
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
 
     async def _test_api_docs(self, base_url: str) -> None:
         """Test for unprotected API documentation."""
@@ -1061,6 +1516,7 @@ class InfoDisclosureScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(url, timeout=10.0)
 
                     if response.status_code == 200:
@@ -1089,8 +1545,8 @@ class InfoDisclosureScanner:
                                 )],
                             )
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
 
     async def _test_error_triggers(self, target_url: str) -> None:
         """Test for error message disclosure by triggering errors."""
@@ -1113,20 +1569,26 @@ class InfoDisclosureScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(test_url, timeout=10.0)
                     response_body = response.text if hasattr(response, 'text') else ""
+                    response_code = response.status_code if hasattr(response, 'status_code') else 0
 
                     # Check for error disclosures
                     items = self.error_detector.detect(response_body)
                     items.extend(self.db_error_detector.detect(response_body))
                     items.extend(self.path_detector.detect(response_body))
 
+                    # FP REDUCTION: Filter out generic error page disclosures
+                    # Error trigger tests are especially prone to FPs
+                    items = filter_error_page_disclosures(items, response_body, response_code)
+
                     if items:
                         self._create_findings_from_items(test_url, items)
                         break  # One error is enough to confirm
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[InfoDisclosure] Request error: {e}")
 
     def _create_findings_from_items(self, url: str, items: List[DisclosureItem]) -> None:
         """Create findings from disclosure items."""

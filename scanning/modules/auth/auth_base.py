@@ -496,7 +496,6 @@ def check_successful_login(
     original_response: Any,
 ) -> bool:
     """Check if login was successful."""
-    import httpx
 
     # Check for redirect to different page
     if str(login_response.url) != str(original_response.url):

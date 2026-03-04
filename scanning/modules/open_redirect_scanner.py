@@ -22,14 +22,12 @@ Author: PHANTOM AI Team
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, quote
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +320,8 @@ class OpenRedirectScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         **kwargs,
     ) -> List[OpenRedirectFinding]:
         """
@@ -329,6 +329,8 @@ class OpenRedirectScanner:
 
         Args:
             target_url: Target URL to scan
+            asset_data: Asset data with endpoints (optional)
+            rate_limiter: Rate limiter (optional)
             **kwargs: Additional configuration
 
         Returns:
@@ -336,12 +338,45 @@ class OpenRedirectScanner:
         """
         logger.info(f"[OpenRedirect] Starting scan: {target_url}")
 
+        # FIX: Store rate limiter for use in HTTP requests
+        self._rate_limiter = rate_limiter
+
         # Create config if not provided
         if not self.config:
             self.config = ScanConfig(target_url=target_url)
 
         parsed = urlparse(target_url)
         original_host = parsed.netloc
+
+        # ENHANCEMENT 2026-02-20: Get metadata-discovered endpoints with redirect hints
+        vuln_type_hints = {}
+        endpoint_params = {}
+        metadata_endpoints = []
+
+        if isinstance(asset_data, dict):
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+            endpoint_params = asset_data.get("endpoint_params", {})
+
+        # Open redirect vulnerability type patterns
+        redirect_hint_types = {
+            "OPEN_REDIRECT_3XX_STATUS_CODE", "OPEN_REDIRECT", "REDIRECT",
+            "URL_REDIRECT", "UNVALIDATED_REDIRECT", "REDIRECT_MANIPULATION"
+        }
+
+        # Find endpoints with redirect hints
+        for ep_url, hints in vuln_type_hints.items():
+            if any(h in redirect_hint_types for h in hints):
+                metadata_endpoints.append(ep_url)
+                # Get params for this endpoint
+                params = endpoint_params.get(ep_url, [])
+                if params:
+                    # Add to custom params for this endpoint
+                    if not self.config.custom_params:
+                        self.config.custom_params = []
+                    self.config.custom_params.extend(params)
+
+        if metadata_endpoints:
+            logger.info(f"[OpenRedirect] Found {len(metadata_endpoints)} metadata-discovered redirect endpoints")
 
         # Initialize payload generator
         payload_gen = RedirectPayloadGenerator(self.config.evil_domain)
@@ -364,8 +399,33 @@ class OpenRedirectScanner:
         if self.config.test_path_based:
             await self._test_path_based(target_url, payloads, original_host)
 
+        # ENHANCEMENT 2026-02-20: Test metadata-discovered endpoints
+        if metadata_endpoints:
+            logger.info(f"[OpenRedirect] Testing {len(metadata_endpoints)} metadata-discovered endpoints")
+            for ep_url in metadata_endpoints:
+                # Normalize URL
+                if ep_url.startswith("/"):
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{ep_url}"
+                elif not ep_url.startswith("http"):
+                    full_url = f"{parsed.scheme}://{parsed.netloc}/{ep_url}"
+                else:
+                    full_url = ep_url
+
+                # Get params for this endpoint
+                params = endpoint_params.get(ep_url, REDIRECT_PARAMS[:10])
+                for param in params[:5]:  # Test top 5 params
+                    await self._test_parameter(full_url, param, payloads, original_host)
+
         logger.info(f"[OpenRedirect] Scan complete. Found {len(self.findings)} vulnerabilities")
         return self.findings
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if hasattr(self, '_rate_limiter') and self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception:
+                pass  # Proceed if rate limiter fails
 
     async def _discover_params(self, target_url: str) -> List[str]:
         """Discover redirect parameters from URL and response."""
@@ -455,6 +515,7 @@ class OpenRedirectScanner:
         """Send a test request and analyze the response."""
         try:
             if self.http_client:
+                await self._acquire_rate_limit()  # FIX: Rate limit before request
                 response = await self.http_client.get(
                     url,
                     follow_redirects=False,

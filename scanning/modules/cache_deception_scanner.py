@@ -28,15 +28,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import random
 import re
-import string
-import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, quote
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +296,8 @@ class CacheDeceptionScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         **kwargs,
     ) -> List[CacheDeceptionFinding]:
         """
@@ -306,12 +305,17 @@ class CacheDeceptionScanner:
 
         Args:
             target_url: Target URL to scan (should be authenticated endpoint)
+            asset_data: Asset data with endpoints (optional)
+            rate_limiter: Rate limiter (optional)
             **kwargs: Additional configuration
 
         Returns:
             List of discovered vulnerabilities
         """
         logger.info(f"[CacheDeception] Starting scan: {target_url}")
+
+        # FIX: Store rate limiter for use in HTTP requests
+        self._rate_limiter = rate_limiter
 
         # Create config if not provided
         if not self.config:
@@ -340,6 +344,14 @@ class CacheDeceptionScanner:
         logger.info(f"[CacheDeception] Scan complete. Found {len(self.findings)} vulnerabilities")
         return self.findings
 
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if hasattr(self, '_rate_limiter') and self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception:
+                pass  # Proceed if rate limiter fails
+
     async def _get_response(self, url: str, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
         """Get response from URL."""
         try:
@@ -353,6 +365,7 @@ class CacheDeceptionScanner:
                     all_headers[name] = value
 
             if self.http_client:
+                await self._acquire_rate_limit()  # FIX: Rate limit before request
                 response = await self.http_client.get(
                     url,
                     headers=all_headers,

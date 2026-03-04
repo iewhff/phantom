@@ -20,12 +20,38 @@ Features:
 from __future__ import annotations
 
 import logging
+import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# CONSTANTS (M1 FIX 2026-02-13)
+# =============================================================================
+
+MAX_CACHE_ENTRIES = 1000  # H3 FIX: Prevent unbounded cache growth
+
+# Financial calculation constants
+COST_PER_NOTIFICATION = 2.0
+MAX_NOTIFICATION_COST = 500_000
+COST_PER_CREDIT_MONITORING = 15.0
+MAX_CREDIT_MONITORING = 1_000_000
+IR_COST_MULTIPLIER = 0.15
+LEGAL_COST_MULTIPLIER = 0.10
+LEGAL_MULT_PII = 1.5
+LEGAL_MULT_HEALTH_FINANCIAL = 2.0
+BUSINESS_INTERRUPTION_HIGH = 0.30
+BUSINESS_INTERRUPTION_LOW = 0.10
+REPUTATIONAL_DAMAGE_PUBLIC = 0.40
+REPUTATIONAL_DAMAGE_PRIVATE = 0.10
+BASE_CHURN_RATE = 0.02
+CHURN_SEVERITY_FACTOR = 0.03
+REMEDIATION_MULTIPLIER = 0.05
+SECURITY_IMPROVEMENTS_MULTIPLIER = 0.10
 
 
 # =============================================================================
@@ -776,6 +802,182 @@ VULNERABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
         "scope": Scope.UNCHANGED,
         "data_risk": [],
     },
+    # ── Additional profiles for real module output types ──
+    "http_smuggling": {
+        "cia": CIATriad(ImpactLevel.HIGH, ImpactLevel.HIGH, ImpactLevel.LOW),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.CHANGED,
+        "data_risk": ["session_hijack", "cache_poisoning"],
+    },
+    "session_hijacking": {
+        "cia": CIATriad(ImpactLevel.HIGH, ImpactLevel.HIGH, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": ["credentials", "PII"],
+    },
+    "security_headers_missing": {
+        "cia": CIATriad(ImpactLevel.NONE, ImpactLevel.NONE, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "missing_hsts": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.NONE, ImpactLevel.NONE),
+        "attack_vector": AttackVector.ADJACENT,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "directory_listing": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.NONE, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "missing_spf": {
+        "cia": CIATriad(ImpactLevel.NONE, ImpactLevel.LOW, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "http_probe": {
+        "cia": CIATriad(ImpactLevel.NONE, ImpactLevel.NONE, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "rate_limit_missing": {
+        "cia": CIATriad(ImpactLevel.NONE, ImpactLevel.NONE, ImpactLevel.LOW),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "open_redirect": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.NONE, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.CHANGED,
+        "data_risk": [],
+    },
+    "race_condition": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.HIGH, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.LOW,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": ["financial"],
+    },
+    "mass_assignment": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.HIGH, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.LOW,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.UNCHANGED,
+        "data_risk": ["PII"],
+    },
+    "clickjacking": {
+        "cia": CIATriad(ImpactLevel.NONE, ImpactLevel.LOW, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.LOW,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.UNCHANGED,
+        "data_risk": [],
+    },
+    "dns_rebinding": {
+        "cia": CIATriad(ImpactLevel.HIGH, ImpactLevel.LOW, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.REQUIRED,
+        "scope": Scope.CHANGED,
+        "data_risk": ["internal_network"],
+    },
+    "prototype_pollution": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.HIGH, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.CHANGED,
+        "data_risk": [],
+    },
+    "cache_poisoning": {
+        "cia": CIATriad(ImpactLevel.LOW, ImpactLevel.HIGH, ImpactLevel.NONE),
+        "attack_vector": AttackVector.NETWORK,
+        "attack_complexity": AttackComplexity.HIGH,
+        "privileges_required": PrivilegesRequired.NONE,
+        "user_interaction": UserInteraction.NONE,
+        "scope": Scope.CHANGED,
+        "data_risk": ["session_hijack"],
+    },
+}
+
+# Aliases: map module output vuln_type → VULNERABILITY_PROFILES key
+_VULN_TYPE_ALIASES: Dict[str, str] = {
+    "sql_injection": "sqli",
+    "nosql_injection": "nosql",
+    "command_injection": "cmdi",
+    "os_command_injection": "cmdi",
+    "template_injection": "ssti",
+    "xml_external_entity": "xxe",
+    "path_traversal": "lfi",
+    "file_read": "lfi",
+    "server_side_request_forgery": "ssrf",
+    "broken_access_control": "idor",
+    "access_control": "idor",
+    "jwt_vulnerability": "jwt_vuln",
+    "jwt_weakness": "jwt_vuln",
+    "session_fixation": "session_fixation",
+    "session_abuse": "session_hijacking",
+    "reflected_xss": "xss",
+    "stored_xss": "xss",
+    "cors_misconfiguration": "cors",
+    "cors_wildcard": "cors",
+    "cors_null": "cors",
+    "ssl_vulnerability": "ssl_tls",
+    "ssl_tls_issue": "ssl_tls",
+    "insecure_deserialization": "insecure_deserialization",
+    "deserialization": "insecure_deserialization",
+    "http_request_smuggling": "http_smuggling",
+    "request_splitting": "http_smuggling",
+    "header_injection": "crlf",
+    "missing_header": "security_headers_missing",
+    "missing_security_header": "security_headers_missing",
+    "info_disclosure": "info_disclosure",
+    "information_disclosure": "info_disclosure",
+    "sensitive_data_exposure": "info_disclosure",
+    "config_exposure": "info_disclosure",
+    "default_credentials": "broken_auth",
+    "weak_credentials": "broken_auth",
+    "brute_force": "broken_auth",
 }
 
 
@@ -897,7 +1099,57 @@ class ImpactAssessmentEngine:
         self.business_context = business_context or BusinessContext()
         self._assessment_cache: Dict[str, ImpactAssessmentResult] = {}
 
+        # H2 FIX 2026-02-13: Thread safety
+        self._lock = threading.Lock()
+
+        # H1 FIX 2026-02-13: Initialize metrics
+        self._init_metrics()
+
         logger.info(f"ImpactAssessmentEngine v{self.VERSION} initialized")
+
+    def _init_metrics(self) -> None:
+        """Initialize metrics tracking. H1 FIX 2026-02-13."""
+        self._metrics = {
+            "assessments_performed": 0,
+            "chain_assessments": 0,
+            "cache_hits": 0,
+            "by_severity": defaultdict(int),
+            "by_vuln_type": defaultdict(int),
+            "total_financial_impact": 0.0,
+        }
+
+    def get_metrics(self) -> dict:
+        """Get current metrics. H1 FIX 2026-02-13.
+
+        Returns:
+            Dictionary with all tracked metrics.
+        """
+        with self._lock:
+            metrics = dict(self._metrics)
+            metrics["by_severity"] = dict(metrics["by_severity"])
+            metrics["by_vuln_type"] = dict(metrics["by_vuln_type"])
+            metrics["cache_size"] = len(self._assessment_cache)
+            return metrics
+
+    def reset_metrics(self) -> None:
+        """Reset all metrics to initial values. H1 FIX 2026-02-13."""
+        with self._lock:
+            self._init_metrics()
+
+    def _prune_cache_if_needed(self) -> None:
+        """Prune assessment cache if it exceeds limit. H3 FIX 2026-02-13."""
+        if len(self._assessment_cache) > MAX_CACHE_ENTRIES:
+            # Remove oldest entries (by timestamp)
+            entries = sorted(
+                self._assessment_cache.items(),
+                key=lambda x: x[1].timestamp
+            )
+            entries_to_remove = len(entries) - int(MAX_CACHE_ENTRIES * 0.8)
+
+            for key, _ in entries[:entries_to_remove]:
+                del self._assessment_cache[key]
+
+            logger.debug(f"[IMPACT] Pruned {entries_to_remove} cache entries")
 
     def assess_vulnerability(
         self,
@@ -923,9 +1175,19 @@ class ImpactAssessmentEngine:
 
         Returns:
             Complete impact assessment result
+
+        Raises:
+            ValueError: If vulnerability_id or vulnerability_type is empty
         """
-        # Get vulnerability profile
+        # M2 FIX 2026-02-13: Input validation
+        if not vulnerability_id:
+            raise ValueError("vulnerability_id is required")
+        if not vulnerability_type:
+            raise ValueError("vulnerability_type is required")
+
+        # Get vulnerability profile — resolve aliases first
         vuln_type_lower = vulnerability_type.lower()
+        vuln_type_lower = _VULN_TYPE_ALIASES.get(vuln_type_lower, vuln_type_lower)
         profile = VULNERABILITY_PROFILES.get(
             vuln_type_lower,
             VULNERABILITY_PROFILES["unknown"]
@@ -987,8 +1249,11 @@ class ImpactAssessmentEngine:
             regulatory_impact=regulatory_impact,
         )
 
-        # Determine remediation priority
-        remediation_priority = self._determine_priority(overall_risk_score)
+        # Determine remediation priority — use the higher of blended risk
+        # and raw CVSS to prevent high-severity vulns from being diluted
+        # by low business context
+        priority_score = max(overall_risk_score, cvss.base_score)
+        remediation_priority = self._determine_priority(priority_score)
 
         result = ImpactAssessmentResult(
             vulnerability_id=vulnerability_id,
@@ -1007,8 +1272,16 @@ class ImpactAssessmentEngine:
             remediation_priority=remediation_priority,
         )
 
-        # Cache result
-        self._assessment_cache[vulnerability_id] = result
+        # H2 FIX: Thread-safe cache update + H1 FIX: Track metrics
+        with self._lock:
+            self._assessment_cache[vulnerability_id] = result
+            self._prune_cache_if_needed()  # H3 FIX
+
+            # Track metrics
+            self._metrics["assessments_performed"] += 1
+            self._metrics["by_severity"][cvss.severity.value] += 1
+            self._metrics["by_vuln_type"][vuln_type_lower] += 1
+            self._metrics["total_financial_impact"] += financial_impact.total_impact
 
         logger.debug(
             f"Assessed {vulnerability_type}: "
@@ -1155,50 +1428,50 @@ class ImpactAssessmentEngine:
         # Calculate costs
         impact = FinancialImpact()
 
-        # Records-based costs
+        # Records-based costs (M1 FIX: use constants)
         if affected_records > 0:
             record_cost = affected_records * cost_per_record * data_mult
-            impact.notification_costs = min(affected_records * 2.0, 500_000)  # $2/notification
-            impact.credit_monitoring = min(affected_records * 15.0, 1_000_000)  # $15/person/year
+            impact.notification_costs = min(affected_records * COST_PER_NOTIFICATION, MAX_NOTIFICATION_COST)
+            impact.credit_monitoring = min(affected_records * COST_PER_CREDIT_MONITORING, MAX_CREDIT_MONITORING)
         else:
             # Estimate based on user base
             estimated_records = ctx.user_base_size * 0.1 * severity_mult
             record_cost = estimated_records * cost_per_record * data_mult
-            impact.notification_costs = min(estimated_records * 2.0, 200_000)
-            impact.credit_monitoring = min(estimated_records * 15.0, 500_000)
+            impact.notification_costs = min(estimated_records * COST_PER_NOTIFICATION, MAX_NOTIFICATION_COST * 0.4)
+            impact.credit_monitoring = min(estimated_records * COST_PER_CREDIT_MONITORING, MAX_CREDIT_MONITORING * 0.5)
 
-        # Incident response (scales with severity)
-        impact.incident_response = base_cost * 0.15 * severity_mult * asset_mult
+        # Incident response (scales with severity) - M1 FIX: use constant
+        impact.incident_response = base_cost * IR_COST_MULTIPLIER * severity_mult * asset_mult
 
-        # Legal fees (higher for certain data types)
+        # Legal fees (higher for certain data types) - M1 FIX: use constants
         legal_mult = 1.0
         if "PII" in data_risk or "credentials" in data_risk:
-            legal_mult = 1.5
+            legal_mult = LEGAL_MULT_PII
         if "health_data" in data_risk or "financial" in data_risk:
-            legal_mult = 2.0
-        impact.legal_fees = base_cost * 0.1 * legal_mult * severity_mult
+            legal_mult = LEGAL_MULT_HEALTH_FINANCIAL
+        impact.legal_fees = base_cost * LEGAL_COST_MULTIPLIER * legal_mult * severity_mult
 
-        # Business interruption
+        # Business interruption - M1 FIX: use constants
         if cvss_score >= 7.0:
             # High severity - significant downtime
-            impact.business_interruption = base_cost * 0.3 * severity_mult
+            impact.business_interruption = base_cost * BUSINESS_INTERRUPTION_HIGH * severity_mult
         else:
-            impact.business_interruption = base_cost * 0.1 * severity_mult
+            impact.business_interruption = base_cost * BUSINESS_INTERRUPTION_LOW * severity_mult
 
-        # Reputational damage (harder to quantify)
+        # Reputational damage (harder to quantify) - M1 FIX: use constants
         if ctx.public_facing:
-            impact.reputational_damage = base_cost * 0.4 * severity_mult * data_mult
+            impact.reputational_damage = base_cost * REPUTATIONAL_DAMAGE_PUBLIC * severity_mult * data_mult
         else:
-            impact.reputational_damage = base_cost * 0.1 * severity_mult
+            impact.reputational_damage = base_cost * REPUTATIONAL_DAMAGE_PRIVATE * severity_mult
 
-        # Customer churn (estimate 2-5% based on severity)
-        churn_rate = 0.02 + (0.03 * severity_mult)
+        # Customer churn (estimate 2-5% based on severity) - M1 FIX: use constants
+        churn_rate = BASE_CHURN_RATE + (CHURN_SEVERITY_FACTOR * severity_mult)
         if ctx.annual_revenue > 0:
             impact.customer_churn = ctx.annual_revenue * churn_rate * severity_mult
 
-        # Remediation costs
-        impact.remediation = base_cost * 0.05 * asset_mult
-        impact.security_improvements = base_cost * 0.1
+        # Remediation costs - M1 FIX: use constants
+        impact.remediation = base_cost * REMEDIATION_MULTIPLIER * asset_mult
+        impact.security_improvements = base_cost * SECURITY_IMPROVEMENTS_MULTIPLIER
 
         return impact
 
@@ -1494,6 +1767,36 @@ class ImpactAssessmentEngine:
 
 
 # =============================================================================
+# SINGLETON AND FACTORY (M3 FIX 2026-02-13)
+# =============================================================================
+
+_engine_instance: Optional[ImpactAssessmentEngine] = None
+_engine_lock = threading.Lock()
+
+
+def get_impact_assessment_engine(
+    business_context: Optional[BusinessContext] = None
+) -> ImpactAssessmentEngine:
+    """
+    Get singleton ImpactAssessmentEngine instance.
+
+    M3 FIX 2026-02-13: Reuse engine instance to preserve cache.
+
+    Args:
+        business_context: Optional business context (only used on first call)
+
+    Returns:
+        ImpactAssessmentEngine instance
+    """
+    global _engine_instance
+    with _engine_lock:
+        if _engine_instance is None:
+            _engine_instance = ImpactAssessmentEngine(business_context)
+            logger.debug("[IMPACT] Engine singleton created")
+        return _engine_instance
+
+
+# =============================================================================
 # CONVENIENCE FUNCTIONS
 # =============================================================================
 
@@ -1507,6 +1810,8 @@ def assess_vulnerability(
     """
     Convenience function to assess a single vulnerability.
 
+    M3 FIX 2026-02-13: Uses singleton engine to preserve cache.
+
     Args:
         vulnerability_id: Unique identifier
         vulnerability_type: Type of vulnerability
@@ -1516,7 +1821,7 @@ def assess_vulnerability(
     Returns:
         Impact assessment result
     """
-    engine = ImpactAssessmentEngine(business_context=business_context)
+    engine = get_impact_assessment_engine(business_context)
     return engine.assess_vulnerability(
         vulnerability_id=vulnerability_id,
         vulnerability_type=vulnerability_type,
@@ -1620,4 +1925,5 @@ __all__ = [
     "assess_vulnerability",
     "get_vulnerability_profile",
     "calculate_cvss_score",
+    "get_impact_assessment_engine",  # M3 FIX 2026-02-13
 ]

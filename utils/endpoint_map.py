@@ -34,10 +34,10 @@ Usage:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse
 
 from utils.logger import get_logger
 
@@ -59,6 +59,7 @@ class EndpointSource(Enum):
     USER_PROVIDED = auto()          # Manually provided (1.0 confidence)
     FORM_DISCOVERY = auto()         # HTML form action (0.9 confidence)
     API_PROBE = auto()              # Active probing verification (0.95 confidence)
+    CUSTOM_METADATA = auto()        # Custom metadata endpoints like /scanner (0.99 confidence)
 
 
 class HTTPMethod(Enum):
@@ -85,6 +86,8 @@ class EndpointCategory(Enum):
     PUBLIC = auto()         # Public content
     STATIC = auto()         # Static resources (JS, CSS, images)
     WEBSOCKET = auto()      # WebSocket endpoints
+    MONITORING = auto()     # Health, metrics, actuator, monitoring endpoints
+    DEBUG = auto()          # Debug, trace, dump endpoints
     UNKNOWN = auto()        # Uncategorized
 
 
@@ -145,10 +148,11 @@ class DiscoveredEndpoint:
     raw_evidence: Optional[str] = None           # Evidence of discovery
     operation_id: Optional[str] = None           # OpenAPI operationId
     description: Optional[str] = None            # Endpoint description
+    metadata: Optional[Dict[str, Any]] = None    # Additional metadata (vuln types, etc.)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             "path": self.path,
             "methods": [m.value for m in self.methods],
             "source": self.source.name,
@@ -161,6 +165,9 @@ class DiscoveredEndpoint:
             "last_status_code": self.last_status_code,
             "technology_hint": self.technology_hint,
         }
+        if self.metadata:
+            result["metadata"] = self.metadata
+        return result
 
     def get_full_url(self, host: str, scheme: str = "https") -> str:
         """Construct full URL from path and host."""
@@ -301,6 +308,10 @@ class EndpointMap:
         self._by_method: Dict[HTTPMethod, Set[str]] = {}
         self._verified_paths: Set[str] = set()
         self._host: str = ""
+        # Metadata storage for discovery results (API specs, security schemes, etc.)
+        self._metadata: Dict[str, Any] = {}
+        # RLock for thread-safety when multiple scanners access concurrently
+        self._lock = threading.RLock()
 
     @classmethod
     def get_instance(cls) -> EndpointMap:
@@ -316,49 +327,89 @@ class EndpointMap:
         logger.debug("[EndpointMap] Reset - cleared all endpoints")
 
     def set_host(self, host: str) -> None:
-        """Set target host for this map."""
-        self._host = host
-        logger.debug(f"[EndpointMap] Host set to: {host}")
+        """Set target host for this map (thread-safe)."""
+        with self._lock:
+            self._host = host
+            logger.debug(f"[EndpointMap] Host set to: {host}")
 
     def get_host(self) -> str:
-        """Get target host."""
-        return self._host
+        """Get target host (thread-safe)."""
+        with self._lock:
+            return self._host
+
+    def set_metadata(self, key: str, value: Any) -> None:
+        """
+        Store discovery metadata (thread-safe).
+
+        Used by discovery phases to store additional information:
+        - api_spec: OpenAPI specification details
+        - security_schemes: OAuth, API keys, JWT configs
+        - injectable_endpoints: High-priority injection targets
+        - auth_bypass_candidates: Endpoints for auth testing
+
+        Args:
+            key: Metadata key (e.g., "api_spec", "security_schemes")
+            value: Metadata value (dict, list, etc.)
+        """
+        with self._lock:
+            self._metadata[key] = value
+            logger.debug(f"[EndpointMap] Metadata set: {key}")
+
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """
+        Retrieve discovery metadata (thread-safe).
+
+        Args:
+            key: Metadata key
+            default: Default value if key not found
+
+        Returns:
+            Metadata value or default
+        """
+        with self._lock:
+            return self._metadata.get(key, default)
+
+    def get_all_metadata(self) -> Dict[str, Any]:
+        """Get all metadata (thread-safe)."""
+        with self._lock:
+            return dict(self._metadata)
 
     def add_endpoint(self, endpoint: DiscoveredEndpoint) -> None:
-        """Add or merge endpoint."""
+        """Add or merge endpoint (thread-safe)."""
         path = self._normalize_path(endpoint.path)
 
-        if path in self._endpoints:
-            # Merge with existing
-            existing = self._endpoints[path]
-            existing.merge_with(endpoint)
-            logger.debug(f"[EndpointMap] Merged endpoint: {path}")
-        else:
-            # Add new endpoint
-            endpoint.path = path  # Use normalized path
-            self._endpoints[path] = endpoint
+        with self._lock:
+            if path in self._endpoints:
+                # Merge with existing
+                existing = self._endpoints[path]
+                existing.merge_with(endpoint)
+                logger.debug(f"[EndpointMap] Merged endpoint: {path}")
+            else:
+                # Add new endpoint
+                endpoint.path = path  # Use normalized path
+                self._endpoints[path] = endpoint
 
-            # Index by category
-            if endpoint.category not in self._by_category:
-                self._by_category[endpoint.category] = []
-            self._by_category[endpoint.category].append(path)
+                # Index by category
+                if endpoint.category not in self._by_category:
+                    self._by_category[endpoint.category] = []
+                self._by_category[endpoint.category].append(path)
 
-            # Index by source
-            if endpoint.source not in self._by_source:
-                self._by_source[endpoint.source] = []
-            self._by_source[endpoint.source].append(path)
+                # Index by source
+                if endpoint.source not in self._by_source:
+                    self._by_source[endpoint.source] = []
+                self._by_source[endpoint.source].append(path)
 
-            # Index by methods
-            for method in endpoint.methods:
-                if method not in self._by_method:
-                    self._by_method[method] = set()
-                self._by_method[method].add(path)
+                # Index by methods
+                for method in endpoint.methods:
+                    if method not in self._by_method:
+                        self._by_method[method] = set()
+                    self._by_method[method].add(path)
 
-            logger.debug(f"[EndpointMap] Added endpoint: {path} ({endpoint.source.name})")
+                logger.debug(f"[EndpointMap] Added endpoint: {path} ({endpoint.source.name})")
 
-        # Track verified
-        if endpoint.verified:
-            self._verified_paths.add(path)
+            # Track verified
+            if endpoint.verified:
+                self._verified_paths.add(path)
 
     def _normalize_path(self, path: str) -> str:
         """Normalize path for consistent storage."""
@@ -377,43 +428,52 @@ class EndpointMap:
         return path
 
     def get_by_category(self, category: EndpointCategory) -> List[DiscoveredEndpoint]:
-        """Get endpoints by category."""
-        paths = self._by_category.get(category, [])
-        return [self._endpoints[p] for p in paths if p in self._endpoints]
+        """Get endpoints by category (thread-safe)."""
+        with self._lock:
+            paths = self._by_category.get(category, [])
+            return [self._endpoints[p] for p in paths if p in self._endpoints]
 
     def get_by_source(self, source: EndpointSource) -> List[DiscoveredEndpoint]:
-        """Get endpoints by discovery source."""
-        paths = self._by_source.get(source, [])
-        return [self._endpoints[p] for p in paths if p in self._endpoints]
+        """Get endpoints by discovery source (thread-safe)."""
+        with self._lock:
+            paths = self._by_source.get(source, [])
+            return [self._endpoints[p] for p in paths if p in self._endpoints]
 
     def get_by_method(self, method: HTTPMethod) -> List[DiscoveredEndpoint]:
-        """Get endpoints supporting a specific method."""
-        paths = self._by_method.get(method, set())
-        return [self._endpoints[p] for p in paths if p in self._endpoints]
+        """Get endpoints supporting a specific method (thread-safe)."""
+        with self._lock:
+            paths = self._by_method.get(method, set())
+            return [self._endpoints[p] for p in paths if p in self._endpoints]
 
     def get_auth_endpoints(self) -> List[DiscoveredEndpoint]:
-        """Get endpoints requiring authentication."""
-        return [ep for ep in self._endpoints.values() if ep.requires_auth]
+        """Get endpoints requiring authentication (thread-safe)."""
+        with self._lock:
+            return [ep for ep in self._endpoints.values() if ep.requires_auth]
 
     def get_verified(self) -> List[DiscoveredEndpoint]:
-        """Get verified endpoints only."""
-        return [self._endpoints[p] for p in self._verified_paths if p in self._endpoints]
+        """Get verified endpoints only (thread-safe)."""
+        with self._lock:
+            return [self._endpoints[p] for p in self._verified_paths if p in self._endpoints]
 
     def get_unverified(self) -> List[DiscoveredEndpoint]:
-        """Get unverified endpoints."""
-        return [ep for ep in self._endpoints.values() if not ep.verified]
+        """Get unverified endpoints (thread-safe)."""
+        with self._lock:
+            return [ep for ep in self._endpoints.values() if not ep.verified]
 
     def get_high_confidence(self, min_confidence: float = 0.8) -> List[DiscoveredEndpoint]:
-        """Get endpoints with high confidence score."""
-        return [ep for ep in self._endpoints.values() if ep.confidence >= min_confidence]
+        """Get endpoints with high confidence score (thread-safe)."""
+        with self._lock:
+            return [ep for ep in self._endpoints.values() if ep.confidence >= min_confidence]
 
     def get_all(self) -> List[DiscoveredEndpoint]:
-        """Get all endpoints."""
-        return list(self._endpoints.values())
+        """Get all endpoints (thread-safe)."""
+        with self._lock:
+            return list(self._endpoints.values())
 
     def get_paths(self) -> List[str]:
-        """Get all paths."""
-        return list(self._endpoints.keys())
+        """Get all paths (thread-safe)."""
+        with self._lock:
+            return list(self._endpoints.keys())
 
     def get_for_scanner(self, scanner_name: str) -> List[DiscoveredEndpoint]:
         """Get endpoints relevant to a specific scanner."""
@@ -437,80 +497,86 @@ class EndpointMap:
         return result
 
     def get_for_testing(self, min_confidence: float = 0.6) -> List[DiscoveredEndpoint]:
-        """Get endpoints suitable for testing (verified or high confidence)."""
-        return [
-            ep for ep in self._endpoints.values()
-            if ep.verified or ep.confidence >= min_confidence
-        ]
+        """Get endpoints suitable for testing (verified or high confidence, thread-safe)."""
+        with self._lock:
+            return [
+                ep for ep in self._endpoints.values()
+                if ep.verified or ep.confidence >= min_confidence
+            ]
 
     def mark_verified(self, path: str, status_code: int) -> None:
-        """Mark an endpoint as verified."""
+        """Mark an endpoint as verified (thread-safe)."""
         normalized = self._normalize_path(path)
-        if normalized in self._endpoints:
-            self._endpoints[normalized].verified = True
-            self._endpoints[normalized].last_status_code = status_code
-            self._verified_paths.add(normalized)
+        with self._lock:
+            if normalized in self._endpoints:
+                self._endpoints[normalized].verified = True
+                self._endpoints[normalized].last_status_code = status_code
+                self._verified_paths.add(normalized)
 
     def mark_nonexistent(self, path: str) -> None:
-        """Mark an endpoint as non-existent (remove from map)."""
+        """Mark an endpoint as non-existent (remove from map, thread-safe)."""
         normalized = self._normalize_path(path)
-        if normalized in self._endpoints:
-            endpoint = self._endpoints[normalized]
+        with self._lock:
+            if normalized in self._endpoints:
+                endpoint = self._endpoints[normalized]
 
-            # Remove from all indexes
-            if endpoint.category in self._by_category:
-                try:
-                    self._by_category[endpoint.category].remove(normalized)
-                except ValueError:
-                    pass
+                # Remove from all indexes
+                if endpoint.category in self._by_category:
+                    try:
+                        self._by_category[endpoint.category].remove(normalized)
+                    except ValueError:
+                        pass
 
-            if endpoint.source in self._by_source:
-                try:
-                    self._by_source[endpoint.source].remove(normalized)
-                except ValueError:
-                    pass
+                if endpoint.source in self._by_source:
+                    try:
+                        self._by_source[endpoint.source].remove(normalized)
+                    except ValueError:
+                        pass
 
-            for method in endpoint.methods:
-                if method in self._by_method:
-                    self._by_method[method].discard(normalized)
+                for method in endpoint.methods:
+                    if method in self._by_method:
+                        self._by_method[method].discard(normalized)
 
-            self._verified_paths.discard(normalized)
+                self._verified_paths.discard(normalized)
 
-            del self._endpoints[normalized]
-            logger.debug(f"[EndpointMap] Removed non-existent: {normalized}")
+                del self._endpoints[normalized]
+                logger.debug(f"[EndpointMap] Removed non-existent: {normalized}")
 
     def has_endpoint(self, path: str) -> bool:
-        """Check if path exists in map."""
-        return self._normalize_path(path) in self._endpoints
+        """Check if path exists in map (thread-safe)."""
+        with self._lock:
+            return self._normalize_path(path) in self._endpoints
 
     def get_endpoint(self, path: str) -> Optional[DiscoveredEndpoint]:
-        """Get specific endpoint by path."""
-        return self._endpoints.get(self._normalize_path(path))
+        """Get specific endpoint by path (thread-safe)."""
+        with self._lock:
+            return self._endpoints.get(self._normalize_path(path))
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get discovery statistics."""
-        return {
-            "total_endpoints": len(self._endpoints),
-            "verified": len(self._verified_paths),
-            "unverified": len(self._endpoints) - len(self._verified_paths),
-            "by_category": {
-                cat.name: len(paths)
-                for cat, paths in self._by_category.items()
-            },
-            "by_source": {
-                src.name: len(paths)
-                for src, paths in self._by_source.items()
-            },
-            "by_method": {
-                method.value: len(paths)
-                for method, paths in self._by_method.items()
-            },
-            "avg_confidence": (
-                sum(ep.confidence for ep in self._endpoints.values()) / len(self._endpoints)
-                if self._endpoints else 0
-            ),
-            "auth_required": len([ep for ep in self._endpoints.values() if ep.requires_auth]),
-        }
+        """Get discovery statistics (thread-safe)."""
+        with self._lock:
+            return {
+                "total_endpoints": len(self._endpoints),
+                "verified": len(self._verified_paths),
+                "unverified": len(self._endpoints) - len(self._verified_paths),
+                "by_category": {
+                    cat.name: len(paths)
+                    for cat, paths in self._by_category.items()
+                },
+                "by_source": {
+                    src.name: len(paths)
+                    for src, paths in self._by_source.items()
+                },
+                "by_method": {
+                    method.value: len(paths)
+                    for method, paths in self._by_method.items()
+                },
+                "avg_confidence": (
+                    sum(ep.confidence for ep in self._endpoints.values()) / len(self._endpoints)
+                    if self._endpoints else 0
+                ),
+                "auth_required": len([ep for ep in self._endpoints.values() if ep.requires_auth]),
+            }
 
     # =========================================================================
     # PHANTOM AI ENHANCEMENTS
@@ -518,7 +584,7 @@ class EndpointMap:
 
     def get_attack_surface_score(self) -> Dict[str, Any]:
         """
-        Calculate attack surface score based on discovered endpoints.
+        Calculate attack surface score based on discovered endpoints (thread-safe).
 
         Returns:
             Dictionary with:
@@ -527,122 +593,123 @@ class EndpointMap:
             - risk_factors: identified risk factors
             - recommendations: security recommendations
         """
-        if not self._endpoints:
-            return {
-                "overall_score": 0.0,
-                "category_scores": {},
-                "risk_factors": [],
-                "recommendations": ["No endpoints discovered yet"],
+        with self._lock:
+            if not self._endpoints:
+                return {
+                    "overall_score": 0.0,
+                    "category_scores": {},
+                    "risk_factors": [],
+                    "recommendations": ["No endpoints discovered yet"],
+                }
+
+            # Category weights for attack surface calculation
+            category_weights = {
+                EndpointCategory.AUTH: 2.0,        # Authentication is high value
+                EndpointCategory.ADMIN: 2.5,       # Admin access is critical
+                EndpointCategory.API_REST: 1.5,    # APIs often have vulnerabilities
+                EndpointCategory.API_GRAPHQL: 1.8, # GraphQL has specific attack vectors
+                EndpointCategory.FILE_UPLOAD: 2.0, # File upload is risky
+                EndpointCategory.PAYMENT: 2.2,     # Payment is sensitive
+                EndpointCategory.USER_DATA: 1.7,   # User data needs protection
+                EndpointCategory.SEARCH: 1.3,      # Search often vulnerable to injection
+                EndpointCategory.WEBSOCKET: 1.4,   # WebSockets can be tricky
+                EndpointCategory.PUBLIC: 0.5,      # Public content is lower risk
+                EndpointCategory.STATIC: 0.2,      # Static files are low risk
+                EndpointCategory.UNKNOWN: 1.0,     # Unknown is neutral
             }
 
-        # Category weights for attack surface calculation
-        category_weights = {
-            EndpointCategory.AUTH: 2.0,        # Authentication is high value
-            EndpointCategory.ADMIN: 2.5,       # Admin access is critical
-            EndpointCategory.API_REST: 1.5,    # APIs often have vulnerabilities
-            EndpointCategory.API_GRAPHQL: 1.8, # GraphQL has specific attack vectors
-            EndpointCategory.FILE_UPLOAD: 2.0, # File upload is risky
-            EndpointCategory.PAYMENT: 2.2,     # Payment is sensitive
-            EndpointCategory.USER_DATA: 1.7,   # User data needs protection
-            EndpointCategory.SEARCH: 1.3,      # Search often vulnerable to injection
-            EndpointCategory.WEBSOCKET: 1.4,   # WebSockets can be tricky
-            EndpointCategory.PUBLIC: 0.5,      # Public content is lower risk
-            EndpointCategory.STATIC: 0.2,      # Static files are low risk
-            EndpointCategory.UNKNOWN: 1.0,     # Unknown is neutral
-        }
+            # Calculate category scores
+            category_counts: Dict[EndpointCategory, int] = {}
+            category_scores: Dict[str, float] = {}
 
-        # Calculate category scores
-        category_counts: Dict[EndpointCategory, int] = {}
-        category_scores: Dict[str, float] = {}
+            for ep in self._endpoints.values():
+                cat = ep.category
+                category_counts[cat] = category_counts.get(cat, 0) + 1
 
-        for ep in self._endpoints.values():
-            cat = ep.category
-            category_counts[cat] = category_counts.get(cat, 0) + 1
+            # Calculate weighted scores
+            total_weight = 0.0
+            for cat, count in category_counts.items():
+                weight = category_weights.get(cat, 1.0)
+                score = min(10.0, count * weight * 0.5)  # Cap at 10
+                category_scores[cat.name] = round(score, 2)
+                total_weight += score
 
-        # Calculate weighted scores
-        total_weight = 0.0
-        for cat, count in category_counts.items():
-            weight = category_weights.get(cat, 1.0)
-            score = min(10.0, count * weight * 0.5)  # Cap at 10
-            category_scores[cat.name] = round(score, 2)
-            total_weight += score
+            # Overall score (normalized to 0-10)
+            num_categories = len(category_counts) or 1
+            overall_score = min(10.0, total_weight / num_categories)
 
-        # Overall score (normalized to 0-10)
-        num_categories = len(category_counts) or 1
-        overall_score = min(10.0, total_weight / num_categories)
+            # Identify risk factors
+            risk_factors = []
 
-        # Identify risk factors
-        risk_factors = []
+            if category_counts.get(EndpointCategory.ADMIN, 0) > 0:
+                risk_factors.append({
+                    "factor": "Admin endpoints exposed",
+                    "severity": "high",
+                    "count": category_counts[EndpointCategory.ADMIN],
+                })
 
-        if category_counts.get(EndpointCategory.ADMIN, 0) > 0:
-            risk_factors.append({
-                "factor": "Admin endpoints exposed",
-                "severity": "high",
-                "count": category_counts[EndpointCategory.ADMIN],
-            })
+            if category_counts.get(EndpointCategory.FILE_UPLOAD, 0) > 0:
+                risk_factors.append({
+                    "factor": "File upload functionality present",
+                    "severity": "high",
+                    "count": category_counts[EndpointCategory.FILE_UPLOAD],
+                })
 
-        if category_counts.get(EndpointCategory.FILE_UPLOAD, 0) > 0:
-            risk_factors.append({
-                "factor": "File upload functionality present",
-                "severity": "high",
-                "count": category_counts[EndpointCategory.FILE_UPLOAD],
-            })
+            auth_count = category_counts.get(EndpointCategory.AUTH, 0)
+            if auth_count > 5:
+                risk_factors.append({
+                    "factor": "Multiple authentication endpoints",
+                    "severity": "medium",
+                    "count": auth_count,
+                })
 
-        auth_count = category_counts.get(EndpointCategory.AUTH, 0)
-        if auth_count > 5:
-            risk_factors.append({
-                "factor": "Multiple authentication endpoints",
-                "severity": "medium",
-                "count": auth_count,
-            })
+            # Check for unverified endpoints
+            unverified = len([ep for ep in self._endpoints.values() if not ep.verified])
+            if unverified > len(self._endpoints) * 0.5:
+                risk_factors.append({
+                    "factor": "Many unverified endpoints",
+                    "severity": "info",
+                    "count": unverified,
+                })
 
-        # Check for unverified endpoints
-        unverified = len([ep for ep in self._endpoints.values() if not ep.verified])
-        if unverified > len(self._endpoints) * 0.5:
-            risk_factors.append({
-                "factor": "Many unverified endpoints",
-                "severity": "info",
-                "count": unverified,
-            })
+            # Check for low confidence endpoints
+            low_confidence = len([ep for ep in self._endpoints.values() if ep.confidence < 0.5])
+            if low_confidence > 0:
+                risk_factors.append({
+                    "factor": "Low confidence endpoints present",
+                    "severity": "info",
+                    "count": low_confidence,
+                })
 
-        # Check for low confidence endpoints
-        low_confidence = len([ep for ep in self._endpoints.values() if ep.confidence < 0.5])
-        if low_confidence > 0:
-            risk_factors.append({
-                "factor": "Low confidence endpoints present",
-                "severity": "info",
-                "count": low_confidence,
-            })
+            # Generate recommendations
+            recommendations = []
 
-        # Generate recommendations
-        recommendations = []
+            if EndpointCategory.ADMIN in category_counts:
+                recommendations.append("Verify admin endpoints are properly protected")
 
-        if EndpointCategory.ADMIN in category_counts:
-            recommendations.append("Verify admin endpoints are properly protected")
+            if EndpointCategory.AUTH in category_counts:
+                recommendations.append("Test authentication mechanisms thoroughly")
 
-        if EndpointCategory.AUTH in category_counts:
-            recommendations.append("Test authentication mechanisms thoroughly")
+            if EndpointCategory.FILE_UPLOAD in category_counts:
+                recommendations.append("Check file upload for bypass vulnerabilities")
 
-        if EndpointCategory.FILE_UPLOAD in category_counts:
-            recommendations.append("Check file upload for bypass vulnerabilities")
+            if EndpointCategory.API_GRAPHQL in category_counts:
+                recommendations.append("Test GraphQL for introspection and injection")
 
-        if EndpointCategory.API_GRAPHQL in category_counts:
-            recommendations.append("Test GraphQL for introspection and injection")
+            if EndpointCategory.PAYMENT in category_counts:
+                recommendations.append("Audit payment flow for business logic flaws")
 
-        if EndpointCategory.PAYMENT in category_counts:
-            recommendations.append("Audit payment flow for business logic flaws")
+            if not recommendations:
+                recommendations.append("Perform comprehensive security scan")
 
-        if not recommendations:
-            recommendations.append("Perform comprehensive security scan")
-
-        return {
-            "overall_score": round(overall_score, 2),
-            "category_scores": category_scores,
-            "risk_factors": risk_factors,
-            "recommendations": recommendations,
-            "endpoint_count": len(self._endpoints),
-            "verified_count": len(self._verified_paths),
-        }
+            return {
+                "overall_score": round(overall_score, 2),
+                "category_scores": category_scores,
+                "risk_factors": risk_factors,
+                "recommendations": recommendations,
+                "endpoint_count": len(self._endpoints),
+                "verified_count": len(self._verified_paths),
+            }
 
     def get_priority_endpoints(
         self,
@@ -722,22 +789,23 @@ class EndpointMap:
 
             return score
 
-        # Filter endpoints
-        filtered = []
-        for ep in self._endpoints.values():
-            # Confidence filter
-            if ep.confidence < min_confidence:
-                continue
+        # Filter endpoints (thread-safe)
+        with self._lock:
+            filtered = []
+            for ep in self._endpoints.values():
+                # Confidence filter
+                if ep.confidence < min_confidence:
+                    continue
 
-            # Category filters
-            if include_categories and ep.category not in include_categories:
-                continue
-            if exclude_categories and ep.category in exclude_categories:
-                continue
+                # Category filters
+                if include_categories and ep.category not in include_categories:
+                    continue
+                if exclude_categories and ep.category in exclude_categories:
+                    continue
 
-            filtered.append(ep)
+                filtered.append(ep)
 
-        # Sort by priority (descending)
+        # Sort by priority (descending) - outside lock as it's a local copy
         filtered.sort(key=calculate_priority, reverse=True)
 
         return filtered[:limit]
@@ -758,37 +826,41 @@ class EndpointMap:
         import xml.etree.ElementTree as ET
         from xml.dom import minidom
 
-        # Create root element
-        root = ET.Element("items", burpVersion="2023.1", exportTime=str(__import__('time').time()))
+        # Thread-safe access to endpoints
+        with self._lock:
+            # Create root element
+            root = ET.Element("items", burpVersion="2023.1", exportTime=str(__import__('time').time()))
 
-        for ep in self._endpoints.values():
-            for method in ep.methods:
-                item = ET.SubElement(root, "item")
+            for ep in self._endpoints.values():
+                for method in ep.methods:
+                    item = ET.SubElement(root, "item")
 
-                # Build full URL
-                scheme = "https"
-                host = self._host or "target.com"
-                port = "443" if scheme == "https" else "80"
-                path = ep.path
+                    # Build full URL
+                    scheme = "https"
+                    host = self._host or "target.com"
+                    port = "443" if scheme == "https" else "80"
+                    path = ep.path
 
-                ET.SubElement(item, "time").text = ""
-                ET.SubElement(item, "url").text = f"{scheme}://{host}{path}"
-                ET.SubElement(item, "host", ip="").text = host
-                ET.SubElement(item, "port").text = port
-                ET.SubElement(item, "protocol").text = scheme
-                ET.SubElement(item, "method").text = method.value
-                ET.SubElement(item, "path").text = path
-                ET.SubElement(item, "extension").text = ""
-                ET.SubElement(item, "request", base64="false").text = self._build_request(
-                    method.value, path, host, ep
-                )
-                ET.SubElement(item, "status").text = str(ep.last_status_code or 200)
-                ET.SubElement(item, "responselength").text = "0"
-                ET.SubElement(item, "mimetype").text = ""
-                ET.SubElement(item, "response", base64="false").text = ""
-                ET.SubElement(item, "comment").text = f"Category: {ep.category.name}, Confidence: {ep.confidence}"
+                    ET.SubElement(item, "time").text = ""
+                    ET.SubElement(item, "url").text = f"{scheme}://{host}{path}"
+                    ET.SubElement(item, "host", ip="").text = host
+                    ET.SubElement(item, "port").text = port
+                    ET.SubElement(item, "protocol").text = scheme
+                    ET.SubElement(item, "method").text = method.value
+                    ET.SubElement(item, "path").text = path
+                    ET.SubElement(item, "extension").text = ""
+                    ET.SubElement(item, "request", base64="false").text = self._build_request(
+                        method.value, path, host, ep
+                    )
+                    ET.SubElement(item, "status").text = str(ep.last_status_code or 200)
+                    ET.SubElement(item, "responselength").text = "0"
+                    ET.SubElement(item, "mimetype").text = ""
+                    ET.SubElement(item, "response", base64="false").text = ""
+                    ET.SubElement(item, "comment").text = f"Category: {ep.category.name}, Confidence: {ep.confidence}"
 
-        # Convert to string with pretty printing
+            endpoint_count = len(self._endpoints)
+
+        # Convert to string with pretty printing (outside lock)
         xml_str = ET.tostring(root, encoding='unicode')
         pretty_xml = minidom.parseString(xml_str).toprettyxml(indent="  ")
 
@@ -798,7 +870,7 @@ class EndpointMap:
         if output_path:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(pretty_xml)
-            logger.info(f"[EndpointMap] Exported {len(self._endpoints)} endpoints to {output_path}")
+            logger.info(f"[EndpointMap] Exported {endpoint_count} endpoints to {output_path}")
 
         return pretty_xml
 
@@ -930,6 +1002,380 @@ class EndpointMap:
 
     def __iter__(self):
         return iter(self._endpoints.values())
+
+    # =========================================================================
+    # STATEFUL CHAIN DISCOVERY - Find related endpoints for multi-step flows
+    # =========================================================================
+
+    # Relationship patterns: source_pattern -> [related_patterns]
+    _FLOW_RELATIONSHIPS: Dict[str, List[str]] = {
+        # E-commerce flow
+        "product": ["cart", "basket", "add", "wishlist"],
+        "cart": ["checkout", "order", "coupon", "promo", "discount"],
+        "basket": ["checkout", "order", "coupon", "promo", "discount"],
+        "checkout": ["payment", "pay", "order", "confirm", "complete"],
+        "payment": ["order", "confirm", "receipt", "invoice", "complete"],
+        "order": ["status", "tracking", "cancel", "refund", "history"],
+        # Auth flow
+        "login": ["register", "logout", "session", "token", "password", "profile"],
+        "register": ["login", "verify", "activate", "confirm", "profile"],
+        "session": ["logout", "token", "refresh", "user", "profile"],
+        "token": ["refresh", "revoke", "validate", "session"],
+        "oauth": ["authorize", "token", "consent", "callback", "revoke"],
+        "mfa": ["verify", "totp", "otp", "backup-codes", "enroll"],
+        # User flow
+        "user": ["profile", "settings", "account", "preferences", "password"],
+        "profile": ["settings", "avatar", "update", "account", "preferences"],
+        "account": ["settings", "password", "delete", "deactivate", "billing"],
+        # Admin flow
+        "admin": ["users", "settings", "dashboard", "reports", "logs", "config"],
+        "dashboard": ["reports", "analytics", "stats", "metrics", "users"],
+        # SaaS flow
+        "subscription": ["plan", "billing", "upgrade", "cancel", "usage"],
+        "plan": ["subscription", "upgrade", "downgrade", "billing", "feature"],
+        "tenant": ["workspace", "organization", "team", "settings", "users"],
+        "workspace": ["tenant", "team", "invite", "settings", "members"],
+        "invite": ["team", "workspace", "user", "accept", "revoke"],
+        "seat": ["team", "user", "invite", "billing", "limit"],
+        # Fintech flow
+        "transfer": ["wallet", "balance", "verify", "confirm", "execute", "history"],
+        "wallet": ["balance", "transfer", "deposit", "withdraw", "history"],
+        "balance": ["transfer", "withdraw", "deposit", "statement"],
+        "withdraw": ["balance", "verify", "confirm", "2fa", "history"],
+        "deposit": ["balance", "wallet", "verify", "complete"],
+        "transaction": ["history", "status", "receipt", "refund"],
+        # Marketplace flow
+        "listing": ["seller", "product", "create", "edit", "publish", "deactivate"],
+        "seller": ["listing", "payout", "dashboard", "reviews", "verification"],
+        "buyer": ["order", "review", "dispute", "history", "wishlist"],
+        "escrow": ["release", "dispute", "order", "payment", "refund"],
+        "dispute": ["escrow", "order", "resolution", "evidence", "refund"],
+        "commission": ["payout", "seller", "billing", "settings"],
+        # Content/CMS flow
+        "post": ["draft", "publish", "edit", "delete", "comment", "tag"],
+        "article": ["draft", "publish", "edit", "delete", "comment", "tag"],
+        "draft": ["publish", "preview", "autosave", "discard"],
+        "publish": ["unpublish", "schedule", "edit", "analytics"],
+        "comment": ["reply", "moderate", "delete", "report", "like"],
+        "media": ["upload", "library", "delete", "edit", "crop"],
+        # API resource patterns
+        "list": ["create", "search", "filter", "export"],
+        "create": ["list", "view", "update", "delete"],
+        "view": ["update", "delete", "edit"],
+        "update": ["view", "delete", "history"],
+    }
+
+    def get_related_endpoints(
+        self,
+        endpoint: DiscoveredEndpoint,
+        max_related: int = 10,
+    ) -> List[DiscoveredEndpoint]:
+        """
+        Find endpoints semantically related to the given endpoint.
+
+        This helps stateful scanners find other endpoints in the same flow.
+        For example, given /api/cart, find /api/checkout, /api/coupon, etc.
+
+        Args:
+            endpoint: The reference endpoint
+            max_related: Maximum number of related endpoints to return
+
+        Returns:
+            List of related endpoints sorted by relevance
+        """
+        with self._lock:
+            if not self._endpoints:
+                return []
+
+            path_lower = endpoint.path.lower()
+            related: List[tuple[DiscoveredEndpoint, float]] = []
+
+            # Extract keywords from path
+            path_keywords = self._extract_path_keywords(path_lower)
+
+            # Find matching relationship patterns
+            related_keywords: set[str] = set()
+            for keyword in path_keywords:
+                for pattern, relations in self._FLOW_RELATIONSHIPS.items():
+                    if pattern in keyword:
+                        related_keywords.update(relations)
+                        break
+
+            # Score all other endpoints
+            for ep in self._endpoints.values():
+                if ep.path == endpoint.path:
+                    continue
+
+                score = self._calculate_relation_score(
+                    endpoint, ep, path_keywords, related_keywords
+                )
+
+                if score > 0:
+                    related.append((ep, score))
+
+            # Sort by score and return top matches
+            related.sort(key=lambda x: x[1], reverse=True)
+            return [ep for ep, _ in related[:max_related]]
+
+    def _extract_path_keywords(self, path: str) -> List[str]:
+        """Extract keywords from a path for relationship matching."""
+        # Remove common prefixes and split
+        for prefix in ["/api/", "/rest/", "/v1/", "/v2/", "/v3/"]:
+            path = path.replace(prefix, "/")
+
+        # Split on common delimiters
+        import re
+        parts = re.split(r'[/\-_]', path)
+
+        # Filter and normalize
+        keywords = []
+        for part in parts:
+            part = part.strip().lower()
+            # Skip IDs, numbers, and short parts
+            if part and len(part) > 2 and not part.isdigit() and not re.match(r'^\{.*\}$', part):
+                keywords.append(part)
+
+        return keywords
+
+    def _calculate_relation_score(
+        self,
+        source: DiscoveredEndpoint,
+        candidate: DiscoveredEndpoint,
+        source_keywords: List[str],
+        related_keywords: set[str],
+    ) -> float:
+        """Calculate how related two endpoints are."""
+        score = 0.0
+        candidate_path = candidate.path.lower()
+
+        # Check for related keywords
+        for keyword in related_keywords:
+            if keyword in candidate_path:
+                score += 3.0
+
+        # Same category bonus
+        if source.category == candidate.category:
+            score += 1.0
+
+        # Same base path bonus (e.g., /api/users/* and /api/users/profile)
+        source_base = "/".join(source.path.split("/")[:3])
+        candidate_base = "/".join(candidate.path.split("/")[:3])
+        if source_base == candidate_base:
+            score += 2.0
+
+        # Auth-related bonus if source needs auth
+        if source.requires_auth and candidate.requires_auth:
+            score += 0.5
+
+        # Overlapping keywords
+        candidate_keywords = self._extract_path_keywords(candidate_path)
+        overlap = set(source_keywords) & set(candidate_keywords)
+        score += len(overlap) * 0.5
+
+        return score
+
+    def get_flow_endpoints(
+        self,
+        flow_type: str = "ecommerce",
+        min_confidence: float = 0.5,
+    ) -> Dict[str, List[DiscoveredEndpoint]]:
+        """
+        Get endpoints organized by flow steps.
+
+        Useful for stateful testing where you need to know the full flow.
+
+        Args:
+            flow_type: Type of flow to find ("ecommerce", "auth", "user", "admin")
+            min_confidence: Minimum confidence for endpoint inclusion
+
+        Returns:
+            Dict mapping flow step names to list of endpoints
+        """
+        # Flow definitions: step_name -> patterns to match
+        FLOWS = {
+            "ecommerce": {
+                "browse": ["product", "catalog", "item", "search"],
+                "cart": ["cart", "basket", "add-to-cart", "basketitem"],
+                "coupon": ["coupon", "promo", "discount", "code"],
+                "checkout": ["checkout", "order", "confirm"],
+                "payment": ["payment", "pay", "stripe", "paypal", "billing"],
+                "complete": ["complete", "success", "receipt", "confirmation"],
+            },
+            "auth": {
+                "register": ["register", "signup", "create-account"],
+                "login": ["login", "signin", "authenticate"],
+                "verify": ["verify", "activate", "confirm", "otp", "2fa"],
+                "session": ["session", "token", "jwt", "refresh"],
+                "logout": ["logout", "signout", "revoke"],
+            },
+            "auth_centric": {
+                "oauth_authorize": ["oauth/authorize", "authorize", "auth/authorize"],
+                "consent": ["consent", "approve", "allow", "grant"],
+                "callback": ["callback", "redirect", "oauth/callback"],
+                "token": ["oauth/token", "token", "access_token"],
+                "mfa": ["mfa", "2fa", "totp", "otp", "verify"],
+                "enroll": ["enroll", "setup-2fa", "register-mfa"],
+            },
+            "user": {
+                "profile": ["profile", "me", "account", "user"],
+                "settings": ["settings", "preferences", "config"],
+                "password": ["password", "credential", "change-password"],
+                "data": ["export", "download", "data"],
+            },
+            "admin": {
+                "dashboard": ["dashboard", "admin", "panel"],
+                "users": ["users", "accounts", "members"],
+                "settings": ["settings", "config", "system"],
+                "reports": ["reports", "analytics", "logs", "audit"],
+            },
+            "saas": {
+                "trial": ["trial", "free-trial", "start-trial"],
+                "subscribe": ["subscribe", "subscription", "signup"],
+                "plan": ["plan", "pricing", "tier", "upgrade"],
+                "billing": ["billing", "payment", "invoice", "card"],
+                "workspace": ["workspace", "tenant", "organization", "org"],
+                "team": ["team", "invite", "member", "seat"],
+                "feature": ["feature", "limit", "usage", "quota"],
+            },
+            "fintech": {
+                "wallet": ["wallet", "account", "balance"],
+                "transfer": ["transfer", "send", "pay", "remit"],
+                "verify_2fa": ["verify", "2fa", "otp", "confirm"],
+                "execute": ["execute", "process", "submit", "complete"],
+                "deposit": ["deposit", "add-funds", "top-up"],
+                "withdraw": ["withdraw", "cashout", "payout"],
+                "history": ["history", "transactions", "statement"],
+            },
+            "marketplace": {
+                "listing": ["listing", "product", "item", "sell"],
+                "offer": ["offer", "bid", "buy", "purchase"],
+                "escrow": ["escrow", "hold", "secure-pay"],
+                "deliver": ["deliver", "ship", "tracking", "fulfill"],
+                "release": ["release", "confirm-delivery", "complete"],
+                "review": ["review", "rating", "feedback"],
+                "dispute": ["dispute", "claim", "refund", "resolution"],
+            },
+            "content": {
+                "draft": ["draft", "new", "create", "compose"],
+                "edit": ["edit", "update", "modify"],
+                "submit": ["submit", "review", "pending"],
+                "moderate": ["moderate", "approve", "reject"],
+                "publish": ["publish", "live", "public"],
+                "media": ["media", "upload", "image", "file"],
+            },
+        }
+
+        flow_steps = FLOWS.get(flow_type, {})
+        if not flow_steps:
+            return {}
+
+        with self._lock:
+            result: Dict[str, List[DiscoveredEndpoint]] = {}
+
+            for step_name, patterns in flow_steps.items():
+                matching = []
+                for ep in self._endpoints.values():
+                    if ep.confidence < min_confidence:
+                        continue
+
+                    path_lower = ep.path.lower()
+                    if any(pattern in path_lower for pattern in patterns):
+                        matching.append(ep)
+
+                if matching:
+                    result[step_name] = matching
+
+            return result
+
+    def get_chain_candidates(
+        self,
+        finding_endpoint: str,
+        finding_type: str,
+    ) -> List[DiscoveredEndpoint]:
+        """
+        Get endpoints that might be part of an attack chain with the given finding.
+
+        Args:
+            finding_endpoint: The endpoint where a vulnerability was found
+            finding_type: Type of vulnerability (sqli, xss, idor, etc.)
+
+        Returns:
+            List of endpoints that could be chained with this finding
+        """
+        # Chain patterns: vuln_type -> interesting endpoint categories/patterns
+        CHAIN_INTERESTS = {
+            "sql_injection": {
+                "categories": [EndpointCategory.AUTH, EndpointCategory.ADMIN, EndpointCategory.USER_DATA],
+                "patterns": ["login", "admin", "user", "profile", "password"],
+            },
+            "sqli": {
+                "categories": [EndpointCategory.AUTH, EndpointCategory.ADMIN, EndpointCategory.USER_DATA],
+                "patterns": ["login", "admin", "user", "profile", "password"],
+            },
+            "xss": {
+                "categories": [EndpointCategory.USER_DATA, EndpointCategory.ADMIN],
+                "patterns": ["profile", "comment", "post", "admin", "session"],
+            },
+            "cors": {
+                "categories": [EndpointCategory.USER_DATA, EndpointCategory.PAYMENT, EndpointCategory.AUTH],
+                "patterns": ["user", "profile", "account", "token", "payment"],
+            },
+            "idor": {
+                "categories": [EndpointCategory.PAYMENT, EndpointCategory.ADMIN, EndpointCategory.USER_DATA],
+                "patterns": ["order", "payment", "user", "admin", "document"],
+            },
+            "ssrf": {
+                "categories": [EndpointCategory.ADMIN, EndpointCategory.API_REST],
+                "patterns": ["admin", "internal", "metadata", "config", "cloud"],
+            },
+            "session_abuse": {
+                "categories": [EndpointCategory.ADMIN, EndpointCategory.PAYMENT, EndpointCategory.USER_DATA],
+                "patterns": ["admin", "payment", "transfer", "profile", "settings"],
+            },
+            "business_logic": {
+                "categories": [EndpointCategory.PAYMENT, EndpointCategory.USER_DATA],
+                "patterns": ["checkout", "payment", "order", "transfer", "balance"],
+            },
+        }
+
+        interests = CHAIN_INTERESTS.get(finding_type.lower(), {
+            "categories": [EndpointCategory.AUTH, EndpointCategory.ADMIN],
+            "patterns": ["admin", "user", "auth"],
+        })
+
+        with self._lock:
+            candidates: List[tuple[DiscoveredEndpoint, float]] = []
+
+            for ep in self._endpoints.values():
+                if ep.path == finding_endpoint:
+                    continue
+
+                score = 0.0
+
+                # Category match
+                if ep.category in interests.get("categories", []):
+                    score += 3.0
+
+                # Pattern match
+                path_lower = ep.path.lower()
+                for pattern in interests.get("patterns", []):
+                    if pattern in path_lower:
+                        score += 2.0
+                        break
+
+                # Auth required is interesting for privilege escalation
+                if ep.requires_auth:
+                    score += 1.0
+
+                # High confidence endpoints are better targets
+                score += ep.confidence
+
+                if score > 1.0:
+                    candidates.append((ep, score))
+
+            # Sort by score
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return [ep for ep, _ in candidates[:15]]
 
 
 # Utility functions for categorization

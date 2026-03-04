@@ -7,7 +7,8 @@ Classifies a target into a business domain archetype using 3 signal sources:
 3. Response content analysis (weight 0.2) — quick keyword scan
 
 Called once per scan, before module execution.
-Result is passed to business_logic_scanner via asset_data["domain_classification"].
+if isinstance(data, dict):
+    Result is passed to business_logic_scanner via asset_data["domain_classification"].
 """
 
 from __future__ import annotations

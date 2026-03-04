@@ -22,11 +22,9 @@ Sem isto → finding é LIXO → DISCARDED
 """
 
 import json
-import hashlib
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum, auto
+from enum import Enum
 from typing import Optional, List, Dict, Any, Set
 from uuid import uuid4
 

@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -63,7 +62,7 @@ from utils.http_client import (
 )
 
 if TYPE_CHECKING:
-    from utils.network_protection import NetworkProtection
+    pass
 
 logger = get_logger(__name__)
 
@@ -238,8 +237,8 @@ class PhantomNetworkConfig:
     max_records_per_domain: int = 1000         # Rolling window
 
     # Target verification
-    verification_timeout_seconds: float = 30.0
-    verification_retries: int = 3
+    verification_timeout_seconds: float = 10.0
+    verification_retries: int = 2
 
     # Audit logging
     enable_audit_logging: bool = True
@@ -249,7 +248,7 @@ class PhantomNetworkConfig:
     def from_yaml(cls, config_path: str = "config/phantom_config.yaml") -> "PhantomNetworkConfig":
         """Load configuration from YAML file."""
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
 
             network_config = config.get("network_protection", {})
@@ -488,7 +487,7 @@ class PhantomNetworkProtection:
             event["timestamp"] = datetime.now().isoformat()
             event["source"] = "phantom_network_protection"
 
-            with open(self._audit_log_file, 'a') as f:
+            with open(self._audit_log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(event) + "\n")
         except Exception as e:
             logger.warning(f"Failed to write audit log: {e}")
@@ -1107,17 +1106,27 @@ async def verify_target_and_protection(target_url: str) -> bool:
     Returns:
         bool: True if both checks pass
     """
+    from urllib.parse import urlparse
+
     protection = get_phantom_protection()
 
     # Initialize if needed
     if not protection._initialized:
         await protection.initialize()
 
-    # Verify protection first
-    if not await protection.verify_protection_working():
-        return False
+    # Skip proxy/Tor verification for localhost targets — anonymizing
+    # traffic to your own machine is nonsensical and causes hangs when
+    # Tor/proxy is configured but not running.
+    parsed = urlparse(target_url)
+    hostname = (parsed.hostname or "").lower()
+    is_local = hostname in ("localhost", "127.0.0.1", "::1") or hostname.startswith("192.168.") or hostname.startswith("10.")
 
-    # Verify target
+    if not is_local:
+        # Verify protection first (proxy/Tor)
+        if not await protection.verify_protection_working():
+            return False
+
+    # Verify target accessibility (quick HEAD request)
     if not await protection.verify_target_accessible(target_url):
         return False
 

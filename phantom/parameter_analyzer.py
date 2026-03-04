@@ -33,14 +33,12 @@ Version: 3.0.0 Enterprise
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import secrets
-import string
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Pattern
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
@@ -458,6 +456,8 @@ class ParameterAnalyzer:
                 verify=False,
                 follow_redirects=True,
             )
+            # Ensure at least one await for async compliance
+            await asyncio.sleep(0)
         return self._client
 
     async def close(self) -> None:
@@ -671,8 +671,9 @@ class ParameterAnalyzer:
             try:
                 json.loads(value)
                 return InferredType.JSON, 0.85
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                import logging
+                logging.debug(f"Failed to decode JSON value '{value}': {e}")
 
         # Check if it looks like base64
         if len(value) >= 4 and len(value) % 4 == 0:
@@ -881,8 +882,9 @@ class ParameterAnalyzer:
         try:
             json.loads(body)
             return ReflectionType.JSON_RESPONSE
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            import logging
+            logging.debug(f"Failed to decode JSON body '{body}': {e}")
 
         # Default to HTML body
         return ReflectionType.HTML_BODY
@@ -962,7 +964,7 @@ class ParameterAnalyzer:
     def _calculate_summary(self, result: AnalysisResult) -> None:
         """Calculate summary statistics for the analysis result."""
         if not result.parameters:
-            return
+            return None
 
         # Total injection potential (average)
         result.total_injection_potential = sum(

@@ -23,17 +23,13 @@ Author: PHANTOM AI Team
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
-import random
 import re
-import string
-import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, urlunparse, quote
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -417,9 +413,9 @@ class PasswordResetPoisoner:
                 )
                 for bypass in bypass_hosts[:5]:
                     headers_copy = dict(headers)
-                    for key in headers_copy:
-                        if headers_copy[key] == evil_host:
-                            headers_copy[key] = bypass
+                    for i_key, key in enumerate(headers_copy):
+                        if headers_copy[i_key] == evil_host:
+                            headers_copy[i_key] = bypass
                     bypass_result = await self._send_test_request(
                         endpoint, vector, bypass, headers_copy, body, content_type
                     )
@@ -1052,6 +1048,8 @@ class HostHeaderScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         endpoints: Optional[List[HostEndpoint]] = None,
         **kwargs,
     ) -> List[HostFinding]:
@@ -1060,6 +1058,8 @@ class HostHeaderScanner:
 
         Args:
             target_url: Target URL to scan
+            asset_data: Asset data with endpoints (optional)
+            rate_limiter: Rate limiter (optional)
             endpoints: Pre-configured endpoints (optional)
             **kwargs: Additional configuration
 
@@ -1067,6 +1067,9 @@ class HostHeaderScanner:
             List of discovered vulnerabilities
         """
         logger.info(f"[HostHeader] Starting scan: {target_url}")
+
+        # FIX: Store rate limiter for use in HTTP requests
+        self._rate_limiter = rate_limiter
 
         # Create config if not provided
         if not self.config:
@@ -1113,6 +1116,14 @@ class HostHeaderScanner:
 
         logger.info(f"[HostHeader] Scan complete. Found {len(self.findings)} vulnerabilities")
         return self.findings
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if hasattr(self, '_rate_limiter') and self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception:
+                pass  # Proceed if rate limiter fails
 
     async def _test_password_reset(self, base_host: str, evil_host: str) -> None:
         """Test for password reset poisoning."""
@@ -1208,6 +1219,7 @@ class HostHeaderScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.get(
                         endpoint.url,
                         headers=headers,
@@ -1271,6 +1283,7 @@ class HostHeaderScanner:
 
             try:
                 if self.http_client:
+                    await self._acquire_rate_limit()  # FIX: Rate limit before request
                     response = await self.http_client.request(
                         method=endpoint.method,
                         url=endpoint.url,

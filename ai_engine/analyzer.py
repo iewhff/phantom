@@ -338,12 +338,12 @@ Provide analysis in JSON format with:
                 "data_at_risk": [],
             },
             "attack_scenario": {
-                "steps": ["Manual verification required"],
+                "steps": ["Use ProofEngine for automated verification"],
                 "tools_needed": [],
             },
             "confidence": 0.3,
             "recommended_actions": {
-                "immediate": ["Verify vulnerability manually"],
+                "immediate": ["Run aggressive scan for full verification"],
                 "long_term": ["Apply vendor patches"],
                 "detection": ["Monitor for exploitation attempts"],
             },

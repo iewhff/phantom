@@ -13,12 +13,13 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -301,10 +302,10 @@ class BackendDetector:
             target = f"https://{target}"
         
         try:
-            async with httpx.AsyncClient(
+            async with get_scan_client(
                 timeout=self.timeout,
                 follow_redirects=True,
-                verify=False,
+                verify_ssl=False,
             ) as client:
                 # Fetch main page
                 response = await client.get(target)
@@ -444,8 +445,9 @@ class BackendDetector:
             response = await client.get(url)
             if response.status_code == 200:
                 return response.text
-        except Exception:
-            pass
+        except Exception as e:
+            # FIX 2026-02-12: Log script fetch error (DEBUG - expected for 404s)
+            logger.debug(f"[BackendDetector] Script fetch error for {url}: {e}")
         return ""
     
     def _detect_supabase(self, content: str) -> SupabaseConfig | None:
@@ -562,9 +564,10 @@ class BackendDetector:
                         )
                         if response.status_code == 200:
                             return url
-                    except Exception:
-                        pass
-        
+                    except Exception as e:
+                        # FIX 2026-02-12: Log GraphQL probe error (DEBUG - expected)
+                        logger.debug(f"[BackendDetector] GraphQL probe error for {url}: {e}")
+
         return ""
     
     def _detect_third_party(self, content: str) -> ThirdPartyKeys:

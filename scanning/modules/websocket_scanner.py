@@ -20,23 +20,23 @@ CWE Coverage: CWE-346, CWE-306, CWE-287, CWE-319, CWE-94, CWE-770, CWE-400, CWE-
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import json
 import os
 import secrets
 import struct
 import time
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -140,7 +140,7 @@ WS_INJECTION_PAYLOADS = {
     ],
     "sqli": [
         "' OR '1'='1",
-        "1; DROP TABLE users--",
+        "1; SELECT version()--",  # Non-destructive stacked query test
         "' UNION SELECT NULL,NULL--",
         "1' AND '1'='1",
         "admin'--",
@@ -295,7 +295,7 @@ class WebSocketScanner(ScanModule):
         "<img src=x onerror=alert(1)>",
         "javascript:alert(1)",
         "' OR '1'='1",
-        "1; DROP TABLE users--",
+        "1; SELECT @@version--",  # Non-destructive stacked query
         "; id",
         "| id",
         "`id`",
@@ -305,9 +305,15 @@ class WebSocketScanner(ScanModule):
         "${7*7}",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.ws_timeout = 10
         self.max_connections = 50  # For DoS testing
         self.frame_flood_count = 100
@@ -319,12 +325,17 @@ class WebSocketScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for WebSocket vulnerabilities - ENTERPRISE EDITION."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Discover WebSocket endpoints
             ws_endpoints = await self._discover_ws_endpoints(
                 client, base_url, rate_limiter
@@ -504,32 +515,36 @@ class WebSocketScanner(ScanModule):
             if response.status_code == 101:
                 findings.append(Finding(
                     name="Cross-Site WebSocket Hijacking (CSWSH)",
-                    severity="CRITICAL",
-                    confidence="HIGH",
+                    severity=Severity.CRITICAL,
+                    confidence_score=85.0,
                     description="WebSocket accepts connections from arbitrary origins, "
                                "allowing attackers to hijack authenticated sessions",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=[
                         "Connection accepted from evil.com origin",
                         "No Origin validation in WebSocket handshake",
                     ],
-                    cwe="CWE-346",
+                    cwe_id="CWE-346",
                     cvss_score=8.8,
                     remediation="Validate Origin header in WebSocket handshake. "
                                "Only accept connections from trusted origins.",
+                    vuln_type=VulnType.CORS_MISCONFIGURATION,
+                    scanner="websocket_scanner",
                 ))
             
             # Check if CORS headers reveal issue
             if response.headers.get("Access-Control-Allow-Origin") == "*":
                 findings.append(Finding(
                     name="WebSocket CORS Misconfiguration",
-                    severity="HIGH",
-                    confidence="HIGH",
+                    severity=Severity.HIGH,
+                    confidence_score=85.0,
                     description="WebSocket endpoint allows any origin",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=["Access-Control-Allow-Origin: *"],
-                    cwe="CWE-346",
+                    cwe_id="CWE-346",
                     remediation="Restrict CORS to specific trusted origins.",
+                    vuln_type=VulnType.CORS_MISCONFIGURATION,
+                    scanner="websocket_scanner",
                 ))
                 
         except Exception as e:
@@ -580,16 +595,18 @@ class WebSocketScanner(ScanModule):
                 if response.status_code == 101:
                     findings.append(Finding(
                         name="WebSocket Origin Validation Bypass",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description="WebSocket origin validation can be bypassed",
-                        matched_at=ws_url,
+                        endpoint=ws_url,
                         evidence=[
                             f"Bypass origin accepted: {origin}",
                         ],
-                        cwe="CWE-346",
+                        cwe_id="CWE-346",
                         cvss_score=7.5,
                         remediation="Implement strict origin validation with exact matching.",
+                        vuln_type=VulnType.CORS_MISCONFIGURATION,
+                        scanner="websocket_scanner",
                     ))
                     break
                     
@@ -626,15 +643,17 @@ class WebSocketScanner(ScanModule):
             if response.status_code == 101:
                 findings.append(Finding(
                     name="WebSocket Missing Authentication",
-                    severity="HIGH",
-                    confidence="MEDIUM",
+                    severity=Severity.HIGH,
+                    confidence_score=65.0,
                     description="WebSocket endpoint does not require authentication",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=["Connection established without credentials"],
-                    cwe="CWE-306",
+                    cwe_id="CWE-306",
                     cvss_score=7.5,
                     remediation="Require authentication for WebSocket connections. "
                                "Validate session tokens during handshake.",
+                    vuln_type=VulnType.AUTH_BYPASS,
+                    scanner="websocket_scanner",
                 ))
             
             # Test with expired/invalid token
@@ -646,14 +665,16 @@ class WebSocketScanner(ScanModule):
             if response.status_code == 101:
                 findings.append(Finding(
                     name="WebSocket Weak Token Validation",
-                    severity="HIGH",
-                    confidence="MEDIUM",
+                    severity=Severity.HIGH,
+                    confidence_score=65.0,
                     description="WebSocket accepts invalid authentication tokens",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=["Invalid Bearer token was accepted"],
-                    cwe="CWE-287",
+                    cwe_id="CWE-287",
                     cvss_score=8.1,
                     remediation="Validate authentication tokens properly.",
+                    vuln_type=VulnType.AUTH_BYPASS,
+                    scanner="websocket_scanner",
                 ))
                 
         except Exception as e:
@@ -668,14 +689,16 @@ class WebSocketScanner(ScanModule):
         if ws_url.startswith("ws://"):
             findings.append(Finding(
                 name="Insecure WebSocket (No TLS)",
-                severity="HIGH",
-                confidence="HIGH",
+                severity=Severity.HIGH,
+                confidence_score=85.0,
                 description="WebSocket connection uses unencrypted ws:// protocol",
-                matched_at=ws_url,
+                endpoint=ws_url,
                 evidence=["ws:// protocol detected instead of wss://"],
-                cwe="CWE-319",
+                cwe_id="CWE-319",
                 cvss_score=7.5,
                 remediation="Use secure WebSocket (wss://) with TLS encryption.",
+                vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                scanner="websocket_scanner",
             ))
         
         return findings
@@ -701,20 +724,22 @@ class WebSocketScanner(ScanModule):
         # Log recommendation for manual testing
         findings.append(Finding(
             name="WebSocket Endpoint Detected - Manual Testing Required",
-            severity="INFO",
-            confidence="HIGH",
+            severity=Severity.INFO,
+            confidence_score=85.0,
             description="WebSocket endpoint found. Manual testing recommended for: "
                        "XSS via WS messages, SQL injection, command injection, "
                        "prototype pollution, and authentication bypass.",
-            matched_at=ws_url,
+            endpoint=ws_url,
             evidence=[
                 "WebSocket endpoint discovered",
                 "Automated injection testing limited",
             ],
-            cwe="CWE-94",
+            cwe_id="CWE-94",
             remediation="Perform manual WebSocket security testing. "
                        "Validate and sanitize all messages. "
                        "Implement rate limiting on WebSocket connections.",
+            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+            scanner="websocket_scanner",
         ))
         
         return findings
@@ -732,13 +757,15 @@ class WebSocketScanner(ScanModule):
         
         findings.append(Finding(
             name="WebSocket Rate Limiting Check Required",
-            severity="LOW",
-            confidence="LOW",
+            severity=Severity.LOW,
+            confidence_score=40.0,
             description="Verify rate limiting is implemented on WebSocket endpoint",
-            matched_at=ws_url,
-            evidence=["Manual verification required"],
-            cwe="CWE-770",
+            endpoint=ws_url,
+            evidence=["Rate limiting not detected - flood test sent without throttling"],
+            cwe_id="CWE-770",
             remediation="Implement connection and message rate limiting for WebSocket.",
+            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+            scanner="websocket_scanner",
         ))
         
         return findings
@@ -836,19 +863,21 @@ class WebSocketScanner(ScanModule):
                     
                     findings.append(Finding(
                         name=f"Advanced WebSocket Origin Bypass ({bypass_type})",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"WebSocket origin validation bypassed using {bypass_type} technique",
-                        matched_at=ws_url,
+                        endpoint=ws_url,
                         evidence=[
                             f"Bypass origin: {origin}",
                             f"Technique: {bypass_type}",
                         ],
-                        cwe="CWE-346",
+                        cwe_id="CWE-346",
                         cvss_score=8.8,
                         remediation="Implement strict origin validation. "
                                    "Normalize and canonicalize origins before comparison. "
                                    "Use allowlist with exact matching.",
+                        vuln_type=VulnType.CORS_MISCONFIGURATION,
+                        scanner="websocket_scanner",
                     ))
                     break
                     
@@ -913,29 +942,33 @@ class WebSocketScanner(ScanModule):
                     if accepted_proto in ["admin", "debug", "internal", "privileged"]:
                         findings.append(Finding(
                             name="WebSocket Privileged Protocol Accepted",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description=f"WebSocket accepts privileged subprotocol: {accepted_proto}",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[
                                 f"Requested: {protocol}",
                                 f"Accepted: {accepted_proto}",
                             ],
-                            cwe="CWE-287",
+                            cwe_id="CWE-287",
                             cvss_score=9.1,
                             remediation="Restrict accepted subprotocols to a strict allowlist.",
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="websocket_scanner",
                         ))
                     elif "<script>" in protocol.lower() or "'" in protocol:
                         findings.append(Finding(
                             name="WebSocket Subprotocol Injection",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="WebSocket accepts potentially malicious subprotocol values",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[f"Payload accepted: {protocol}"],
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             cvss_score=5.3,
                             remediation="Validate and sanitize subprotocol values.",
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="websocket_scanner",
                         ))
                     
             except Exception as e:
@@ -984,18 +1017,20 @@ class WebSocketScanner(ScanModule):
                     if payload in response.text:
                         findings.append(Finding(
                             name=f"WebSocket {category.upper()} Injection (Header Reflection)",
-                            severity="HIGH" if category in ["xss", "sqli", "command"] else "MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.HIGH if category in ["xss", "sqli", "command"] else "MEDIUM",
+                            confidence_score=85.0,
                             description=f"WebSocket reflects {category} payload from headers",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[
                                 f"Category: {category}",
                                 f"Payload: {payload[:100]}",
                                 "Reflected in response",
                             ],
-                            cwe=self._get_cwe_for_category(category),
+                            cwe_id=self._get_cwe_for_category(category),
                             cvss_score=7.5 if category in ["xss", "sqli", "command"] else 5.3,
                             remediation=f"Sanitize all input. Implement {category.upper()} prevention.",
+                            vuln_type=self._get_vuln_type_for_category(category),
+                            scanner="websocket_scanner",
                         ))
                         break
                         
@@ -1015,6 +1050,13 @@ class WebSocketScanner(ScanModule):
             "path_traversal": "CWE-22",
             "ssti": "CWE-1336",
         }.get(category, "CWE-94")
+
+    def _get_vuln_type_for_category(self, category: str) -> VulnType:
+        """Map injection category to VulnType."""
+        return {
+            "xss": VulnType.XSS_REFLECTED,
+            "sqli": VulnType.SQLI,
+        }.get(category, VulnType.WEBSOCKET_VULNERABILITY)
 
     # ========================================================================
     # ENTERPRISE METHODS - Binary Frame Attacks
@@ -1074,16 +1116,18 @@ class WebSocketScanner(ScanModule):
                 if "permessage-deflate" in extensions:
                     findings.append(Finding(
                         name="WebSocket Compression Enabled (Potential CRIME/BREACH)",
-                        severity="LOW",
-                        confidence="MEDIUM",
+                        severity=Severity.LOW,
+                        confidence_score=65.0,
                         description="WebSocket uses compression which may be vulnerable to "
                                    "compression-based attacks like CRIME/BREACH variants",
-                        matched_at=ws_url,
+                        endpoint=ws_url,
                         evidence=[f"Extensions: {extensions}"],
-                        cwe="CWE-310",
+                        cwe_id="CWE-310",
                         cvss_score=3.7,
                         remediation="Consider disabling compression for sensitive data "
                                    "or implementing countermeasures.",
+                        vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                        scanner="websocket_scanner",
                     ))
                     
         except Exception as e:
@@ -1110,14 +1154,16 @@ class WebSocketScanner(ScanModule):
                 if "client_max_window_bits=15" in accepted_extensions:
                     findings.append(Finding(
                         name="WebSocket Large Frame Window Accepted",
-                        severity="INFO",
-                        confidence="HIGH",
+                        severity=Severity.INFO,
+                        confidence_score=85.0,
                         description="WebSocket accepts large compression window which may "
                                    "increase memory usage and DoS potential",
-                        matched_at=ws_url,
+                        endpoint=ws_url,
                         evidence=[f"Accepted extensions: {accepted_extensions}"],
-                        cwe="CWE-400",
+                        cwe_id="CWE-400",
                         remediation="Limit compression window size to reduce memory usage.",
+                        vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                        scanner="websocket_scanner",
                     ))
                     
         except Exception as e:
@@ -1175,7 +1221,9 @@ class WebSocketScanner(ScanModule):
             # Attempt multiple rapid connections
             start_time = time.time()
             tasks = [attempt_connection() for _ in range(max_test_connections)]
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Filter out exceptions - treat them as failed connections
+            results = [r if isinstance(r, bool) else False for r in results]
             elapsed = time.time() - start_time
             
             successful = sum(1 for r in results if r)
@@ -1184,20 +1232,22 @@ class WebSocketScanner(ScanModule):
             if successful >= max_test_connections * 0.9 and elapsed < 5:
                 findings.append(Finding(
                     name="WebSocket Connection Flood Vulnerability",
-                    severity="MEDIUM",
-                    confidence="MEDIUM",
+                    severity=Severity.MEDIUM,
+                    confidence_score=65.0,
                     description=f"WebSocket accepts rapid connections without rate limiting. "
                                f"{successful}/{max_test_connections} connections in {elapsed:.2f}s",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=[
                         f"Connections attempted: {max_test_connections}",
                         f"Successful: {successful}",
                         f"Time: {elapsed:.2f}s",
                     ],
-                    cwe="CWE-770",
+                    cwe_id="CWE-770",
                     cvss_score=5.3,
                     remediation="Implement connection rate limiting per IP/client. "
                                "Set maximum concurrent connections per client.",
+                    vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                    scanner="websocket_scanner",
                 ))
                 
         except Exception as e:
@@ -1220,14 +1270,16 @@ class WebSocketScanner(ScanModule):
             if response.status_code not in [400, 426]:
                 findings.append(Finding(
                     name="WebSocket Slowloris Potential",
-                    severity="LOW",
-                    confidence="LOW",
+                    severity=Severity.LOW,
+                    confidence_score=40.0,
                     description="Server may be vulnerable to slow handshake attacks",
-                    matched_at=ws_url,
+                    endpoint=ws_url,
                     evidence=[f"Response to incomplete handshake: {response.status_code}"],
-                    cwe="CWE-400",
+                    cwe_id="CWE-400",
                     remediation="Implement handshake timeouts. "
                                "Reject incomplete handshakes quickly.",
+                    vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                    scanner="websocket_scanner",
                 ))
                 
         except asyncio.TimeoutError:
@@ -1281,15 +1333,17 @@ class WebSocketScanner(ScanModule):
                     if f"40{namespace}" in response.text or "\"sid\"" in response.text:
                         findings.append(Finding(
                             name=f"Socket.IO Unauthorized Namespace Access: {namespace}",
-                            severity="HIGH",
-                            confidence="MEDIUM",
+                            severity=Severity.HIGH,
+                            confidence_score=65.0,
                             description=f"Socket.IO allows connection to {namespace} namespace without auth",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[f"Namespace: {namespace}"],
-                            cwe="CWE-284",
+                            cwe_id="CWE-284",
                             cvss_score=7.5,
                             remediation="Implement authentication for all namespaces. "
                                        "Use middleware to verify access rights.",
+                            vuln_type=VulnType.AUTH_BYPASS,
+                            scanner="websocket_scanner",
                         ))
                         
             except Exception as e:
@@ -1310,15 +1364,17 @@ class WebSocketScanner(ScanModule):
                     if "__proto__" in payload or "admin" in payload:
                         findings.append(Finding(
                             name="Socket.IO Event Injection",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="Socket.IO may accept malicious event payloads",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[f"Payload: {payload}"],
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             cvss_score=5.3,
                             remediation="Validate all incoming Socket.IO events. "
                                        "Implement event allowlisting.",
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="websocket_scanner",
                         ))
                         break
                         
@@ -1382,30 +1438,34 @@ class WebSocketScanner(ScanModule):
                     if any(x in extension.lower() for x in ["debug", "admin", "bypass"]):
                         findings.append(Finding(
                             name="WebSocket Dangerous Extension Accepted",
-                            severity="HIGH",
-                            confidence="MEDIUM",
+                            severity=Severity.HIGH,
+                            confidence_score=65.0,
                             description=f"WebSocket accepts potentially dangerous extension",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[
                                 f"Requested: {extension}",
                                 f"Accepted: {accepted_ext}",
                             ],
-                            cwe="CWE-1188",
+                            cwe_id="CWE-1188",
                             cvss_score=7.5,
                             remediation="Only accept known, required extensions. "
                                        "Implement extension allowlist.",
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="websocket_scanner",
                         ))
                     elif "<script>" in extension or "'" in extension:
                         findings.append(Finding(
                             name="WebSocket Extension Parameter Injection",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="WebSocket accepts injection payloads in extension params",
-                            matched_at=ws_url,
+                            endpoint=ws_url,
                             evidence=[f"Payload: {extension}"],
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             cvss_score=5.3,
                             remediation="Sanitize extension parameters.",
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="websocket_scanner",
                         ))
                     break
                     
@@ -1481,20 +1541,24 @@ class WebSocketScanner(ScanModule):
                     timing_evidence = [
                         f"{name}: {data['time_ms']:.2f}ms (status: {data['status']})"
                         for name, data in timings.items()
+                        if isinstance(data, dict)
                     ]
+
                     
                     findings.append(Finding(
                         name="WebSocket Authentication Timing Leak",
-                        severity="LOW",
-                        confidence="MEDIUM",
+                        severity=Severity.LOW,
+                        confidence_score=65.0,
                         description=f"WebSocket handshake timing varies by {max_diff:.2f}ms based on credentials, "
                                    "potentially leaking authentication information",
-                        matched_at=ws_url,
+                        endpoint=ws_url,
                         evidence=timing_evidence,
-                        cwe="CWE-208",
+                        cwe_id="CWE-208",
                         cvss_score=3.7,
                         remediation="Implement constant-time authentication checks. "
                                    "Normalize response times regardless of credential validity.",
+                        vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                        scanner="websocket_scanner",
                     ))
         
         return findings

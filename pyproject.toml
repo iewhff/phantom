@@ -3,14 +3,14 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "phantom-ai"
+name = "pathfinder-ai"
 version = "3.0.0"
-description = "PHANTOM AI - Professional Heuristic Automated Network Threat Operations Module"
+description = "PATHFINDER AI - Your Friendly Neighborhood Security Scout (Apex Edition)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
-    {name = "PenTest AI Team", email = "security@example.com"}
+    {name = "PATHFINDER AI Team", email = "security@example.com"}
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Security",
 ]
-keywords = ["pentesting", "security", "ai", "vulnerability-scanner"]
+keywords = ["pentesting", "security", "ai", "vulnerability-scanner", "pathfinder", "apex"]
 
 dependencies = [
     # Core
@@ -97,6 +97,12 @@ full = [
 ]
 
 [project.scripts]
+# PATHFINDER AI - Primary entry points 🤖
+pathfinder = "cli.pathfinder_cli:main"
+pathfinder-ai = "cli.pathfinder_cli:main"
+pf = "cli.pathfinder_cli:main"
+
+# Legacy aliases (for backwards compatibility)
 phantom = "cli.phantom_cli:main"
 phantom-ai = "cli.phantom_cli:main"
 pentest = "cli.simple_cli:main"
@@ -108,7 +114,7 @@ Documentation = "https://ai-pentest.readthedocs.io"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["phantom*", "core*", "reconnaissance*", "scanning*", "ai_engine*", "reporting*", "storage*", "utils*", "cli*", "threat_modeling*", "safe_mode*", "analysis*", "compliance*", "interactive*", "retest*", "validation*"]
+include = ["pathfinder*", "phantom*", "core*", "reconnaissance*", "scanning*", "ai_engine*", "reporting*", "storage*", "utils*", "cli*", "threat_modeling*", "safe_mode*", "analysis*", "compliance*", "interactive*", "retest*", "validation*"]
 
 [tool.ruff]
 line-length = 100
@@ -124,7 +130,32 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --cov=. --cov-report=term-missing"
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+[tool.coverage.run]
+source = ["scanning", "phantom", "utils"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*.bak*",
+]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+fail_under = 15
+show_missing = true
+skip_covered = false
 
 [tool.black]
 line-length = 100

@@ -67,8 +67,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IntelligentScanConfig:
     """Configuration for intelligent scanning"""
-    # Scope settings
-    include_subdomains: bool = True
+    # Scope settings (default: False for safety - only scan exact target domain)
+    include_subdomains: bool = False
     scope_mode: ScopeMode = ScopeMode.STRICT
     
     # Method discovery
@@ -236,7 +236,8 @@ class IntelligentScanner:
                     logger.info(f"   🔑 {len(spa_result['auth_tokens'])} auth tokens found in storage")
 
             except Exception as e:
-                logger.debug(f"SPA crawl skipped: {e}")
+                # FIX 2026-02-12: Promote to INFO - SPA crawl failure affects scan coverage
+                logger.info(f"[AUDIT] SPA crawl skipped: {e}")
 
             logger.info(f"Discovered {len(ctx.endpoints_discovered)} endpoints via IntelligentScanner")
 
@@ -274,7 +275,8 @@ class IntelligentScanner:
                     logger.info(f"   ✓ Merged {len(new_from_map)} endpoints from SmartEndpointDiscovery")
                     logger.info(f"   Total endpoints after merge: {len(ctx.endpoints_discovered)}")
         except Exception as e:
-            logger.debug(f"EndpointMap merge skipped: {e}")
+            # FIX 2026-02-12: Promote to INFO - merge failure affects scan coverage
+            logger.info(f"[AUDIT] EndpointMap merge skipped: {e}")
 
         # 6. Analyze parameters for the main target
         if self.config.analyze_parameters:
@@ -301,36 +303,44 @@ class IntelligentScanner:
         self,
         target: str,
         initial_endpoints: List[str],
-        max_depth: int = 2
+        max_depth: int = 2,
+        auth_context: Any = None,
     ) -> List[str]:
         """
         Deep crawl to discover more endpoints with parameters.
-        
+
         Follows links from discovered pages to find URLs with query parameters.
+        Supports authenticated crawling via auth_context.
         """
         import httpx
         import re
         from urllib.parse import urljoin, urlparse
-        
+
         all_endpoints = set(initial_endpoints)
         visited = set()
         to_visit = set()
-        
+
         # Parse target to get base URL
         parsed_target = urlparse(target)
         base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
-        
+
         # Add target and initial endpoints to visit queue
         to_visit.add(target)
         for ep in initial_endpoints:
             if self._is_same_domain(target, ep):
                 to_visit.add(ep)
-        
+
+        # Build headers with auth if available
+        headers = {"User-Agent": "PenTestAI-Crawler/1.0"}
+        if auth_context and hasattr(auth_context, 'auth_headers'):
+            headers.update(auth_context.auth_headers)
+            logger.debug(f"Deep crawl using authenticated session")
+
         async with httpx.AsyncClient(
-            timeout=10.0, 
-            follow_redirects=True, 
+            timeout=10.0,
+            follow_redirects=True,
             verify=False,
-            headers={"User-Agent": "PenTestAI-Crawler/1.0"}
+            headers=headers
         ) as client:
             for depth in range(max_depth):
                 if not to_visit:
@@ -544,8 +554,11 @@ class IntelligentScanner:
                     return { local, session };
                 }''')
 
-                result["local_storage"] = storage_data.get("local", {})
-                result["session_storage"] = storage_data.get("session", {})
+                # BUG-FIX: Was using undefined 'data' instead of 'storage_data'
+                if isinstance(storage_data, dict):
+                    result["local_storage"] = storage_data.get("local", {})
+                if isinstance(storage_data, dict):
+                    result["session_storage"] = storage_data.get("session", {})
 
                 # Analyze storage for auth tokens
                 token_patterns = ["token", "jwt", "auth", "session", "bearer", "api_key", "apikey"]
@@ -762,8 +775,8 @@ class IntelligentScanner:
         Create a properly managed finding with evidence
         """
         finding = Finding(
-            vulnerability_type=vuln_type,
-            url=url,
+            vuln_type=vuln_type,
+            endpoint=url,
             parameter=param,
             severity=severity,
             confidence_score=confidence

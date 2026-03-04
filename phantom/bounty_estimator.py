@@ -44,6 +44,7 @@ class BountyPlatform(Enum):
     COBALT = "cobalt"
     PRIVATE = "private"
     CUSTOM = "custom"
+    OTHER = "other"
 
 
 class ProgramTier(Enum):

@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +22,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
-from rich import print as rprint
 
 console = Console()
 
@@ -621,7 +619,7 @@ def baas(target: str, safe_mode: str):
 @click.option("--client-name", default=None, help="Client name for report header")
 @click.option("--no-tor", is_flag=True, help="Disable Tor (use direct connection)")
 @click.option("--no-recon", is_flag=True, help="Skip reconnaissance (subdomains, crawling)")
-@click.option("--subdomains/--no-subdomains", default=True, help="Enable/disable subdomain enumeration")
+@click.option("--subdomains/--no-subdomains", default=False, help="Enable subdomain enumeration (default: OFF, requires explicit --subdomains)")
 def client(target: str, safe_mode: str, format: str, rate: float, concurrent: int, client_name: str, no_tor: bool, no_recon: bool, subdomains: bool):
     """
     PROFESSIONAL CLIENT PENTEST - Full security assessment.

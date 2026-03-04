@@ -2,12 +2,10 @@
 Analysis Module - Attack Chain Analysis and Visualization.
 
 This module provides:
-- Attack chain detection and analysis
-- Visual representation of attack paths
-- Business impact assessment
-- Executive reporting
-- Interactive dashboards
-- Advanced graph visualizations
+- Attack chain detection and analysis (AttackChainEngine)
+- Visual representation of attack paths (ChainVisualizer, AttackChainDashboard)
+- Neural attack planning (NeuralAttackPlanner)
+- Vulnerability chain exploitation LOW->HIGH (VulnChainEngine)
 """
 
 from analysis.attack_chain_engine import (
@@ -18,13 +16,15 @@ from analysis.attack_chain_engine import (
     AttackChainEngine,
 )
 
-from analysis.chain_visualizer import ChainVisualizer
+from analysis.chain_rendering import (
+    ChainVisualizer,
+    AttackChainDashboard,
+    SEVERITY_COLORS,
+    PHASE_ICONS,
+)
 
-from analysis.chain_dashboard import AttackChainDashboard
-
-from analysis.chain_integration import AttackChainIntegration
-
-from analysis.chain_graph_generator import ChainGraphGenerator
+from analysis.neural_attack_planner import NeuralAttackPlanner
+from analysis.vuln_chain_engine import VulnChainEngine
 
 __all__ = [
     # Core Engine
@@ -33,16 +33,16 @@ __all__ = [
     "ChainNode",
     "AttackChain",
     "AttackChainEngine",
-    
-    # Visualizer
+
+    # Rendering
     "ChainVisualizer",
-    
-    # Dashboard
     "AttackChainDashboard",
-    
-    # Integration
-    "AttackChainIntegration",
-    
-    # Graph Generator
-    "ChainGraphGenerator",
+    "SEVERITY_COLORS",
+    "PHASE_ICONS",
+
+    # Neural Planner
+    "NeuralAttackPlanner",
+
+    # Vuln Chain Engine (LOW->HIGH)
+    "VulnChainEngine",
 ]

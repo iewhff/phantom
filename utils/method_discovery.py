@@ -16,16 +16,16 @@ Features:
 Princípio: NÃO TESTES O QUE NÃO EXISTE
 """
 
-import asyncio
 import re
-import json
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, List, Dict, Set, Any, Tuple
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urljoin, urlparse, parse_qs
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+from utils.endpoint_map import DiscoveredParameter
 
 # Suppress XML parsed as HTML warnings - we handle both formats
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -424,8 +424,8 @@ class MethodDiscoveryEngine:
                                 allowed_methods.add(HTTPMethod(method))
                             except ValueError:
                                 pass
-                                
-        except Exception:
+
+        except (httpx.RequestError, httpx.TimeoutException):
             pass  # OPTIONS may not be supported
         
         return allowed_methods, cors_config
@@ -484,10 +484,10 @@ class MethodDiscoveryEngine:
                         allowed_methods.add(HTTPMethod(method))
                     except ValueError:
                         pass
-                        
-        except Exception:
-            pass
-        
+
+        except (httpx.RequestError, httpx.TimeoutException):
+            pass  # HEAD may not be supported
+
         return server_info, allowed_methods
     
     def _get_parser(self, content: str) -> str:
@@ -585,27 +585,60 @@ class MethodDiscoveryEngine:
                     http_method = HTTPMethod(method)
                 except ValueError:
                     http_method = HTTPMethod.GET
-                
-                # Create parameters dict
-                params = {inp["name"]: inp["type"] for inp in inputs if inp["name"]}
-                
+
+                # Determine parameter location based on method and enctype
+                # GET forms send params in query string, POST in body
+                param_location = "query" if method == "GET" else "body"
+
+                # Create proper DiscoveredParameter objects
+                params: List[DiscoveredParameter] = []
+                for inp in inputs:
+                    if inp["name"]:
+                        # Infer type from HTML input type
+                        html_type = inp["type"]
+                        param_type = "string"  # Default
+                        if html_type in ("number", "range"):
+                            param_type = "integer"
+                        elif html_type == "email":
+                            param_type = "email"
+                        elif html_type == "url":
+                            param_type = "url"
+                        elif html_type == "checkbox":
+                            param_type = "boolean"
+                        elif html_type == "file":
+                            param_type = "file"
+
+                        params.append(DiscoveredParameter(
+                            name=inp["name"],
+                            location=param_location,
+                            param_type=param_type,
+                            required=inp["required"],
+                            example_value=inp["value"] if inp["value"] else None,
+                        ))
+
+                # Add Content-Type header hint based on enctype
+                content_types = [enctype]
+                if has_file_upload and enctype != "multipart/form-data":
+                    # File uploads should use multipart even if not specified
+                    content_types.append("multipart/form-data")
+
                 endpoint = DiscoveredEndpoint(
                     url=action,
                     methods={http_method},
                     source=EndpointSource.HTML_FORM,
                     confidence=0.95,  # Forms are highly reliable
                     parameters=params,
-                    content_type=enctype,
+                    content_types=content_types,
                     form_info=form_info
                 )
                 
                 endpoints.append(endpoint)
-                
-        except Exception as e:
+
+        except (AttributeError, TypeError, ValueError):
             pass  # Continue on parse errors
-        
+
         return endpoints
-    
+
     def _discover_links(self, base_url: str, html: str) -> List[DiscoveredEndpoint]:
         """
         Parse HTML to discover links (potential GET endpoints)
@@ -655,12 +688,12 @@ class MethodDiscoveryEngine:
                         parameters=params
                     )
                     endpoints.append(endpoint)
-                    
-        except Exception:
-            pass
-        
+
+        except (AttributeError, TypeError, ValueError):
+            pass  # Continue on parse errors
+
         return endpoints
-    
+
     async def _parse_javascript(self, base_url: str, html: str) -> List[DiscoveredEndpoint]:
         """
         Parse JavaScript for API endpoints and AJAX calls
@@ -691,13 +724,13 @@ class MethodDiscoveryEngine:
                         response = await self._client.get(src)
                         if response.status_code == 200:
                             js_content += response.text + "\n"
-                    except Exception:
-                        pass
+                    except (httpx.RequestError, httpx.TimeoutException):
+                        pass  # Skip inaccessible JS files
             
             # Extract endpoints from JS
             for pattern in self.JS_ENDPOINT_PATTERNS:
                 matches = re.findall(pattern, js_content, re.IGNORECASE)
-                
+
                 for match in matches:
                     # Handle tuple matches (method, url)
                     if isinstance(match, tuple):
@@ -711,25 +744,25 @@ class MethodDiscoveryEngine:
                     else:
                         url = match
                         method_str = "GET"
-                    
+
                     # Skip non-URLs
                     if not url or not isinstance(url, str):
                         continue
                     if url.startswith(("data:", "blob:", "javascript:")):
                         continue
-                    
+
                     # Resolve URL
                     if not url.startswith(("http://", "https://")):
                         if url.startswith("/"):
                             url = urljoin(base_url, url)
                         else:
                             continue  # Skip relative without /
-                    
+
                     # Skip duplicates
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)
-                    
+
                     # Determine method
                     methods = {HTTPMethod.GET}  # Default
                     if isinstance(method_str, str):
@@ -739,21 +772,85 @@ class MethodDiscoveryEngine:
                                 methods = {HTTPMethod(method_upper)}
                             except ValueError:
                                 pass
-                    
+
+                    # Extract body parameters from fetch/axios calls
+                    body_params = self._extract_js_body_params(js_content, url)
+
                     endpoint = DiscoveredEndpoint(
                         url=url,
                         methods=methods,
                         source=EndpointSource.JAVASCRIPT,
                         confidence=0.6,  # JS parsing is less reliable
+                        parameters=body_params,
                         raw_evidence=f"Pattern match: {pattern}"
                     )
                     endpoints.append(endpoint)
-                    
-        except Exception:
-            pass
-        
+
+        except (AttributeError, TypeError, ValueError, re.error):
+            pass  # Continue on parse/regex errors
+
         return endpoints
-    
+
+    def _extract_js_body_params(self, js_content: str, url: str) -> List[DiscoveredParameter]:
+        """
+        Extract body parameters from fetch/axios calls that target this URL.
+
+        Looks for patterns like:
+        - fetch('/api/login', {body: JSON.stringify({email, password})})
+        - axios.post('/api/users', {name: '...', email: '...'})
+        - $.ajax({url: '/api/data', data: {param1: val1, param2: val2}})
+        """
+        params: List[DiscoveredParameter] = []
+        seen_params: set = set()
+
+        # Escape URL for regex
+        escaped_url = re.escape(url.split('?')[0])  # Remove query string
+        # Also try with just the path
+        parsed = urlparse(url)
+        escaped_path = re.escape(parsed.path)
+
+        # Patterns to find body content near the URL
+        body_patterns = [
+            # fetch with body: JSON.stringify({key: val, ...})
+            rf'fetch\s*\(\s*[\'"`]{escaped_path}[\'"`][^)]*body\s*:\s*JSON\.stringify\s*\(\s*\{{([^}}]+)\}}',
+            rf'fetch\s*\(\s*[\'"`]{escaped_url}[\'"`][^)]*body\s*:\s*JSON\.stringify\s*\(\s*\{{([^}}]+)\}}',
+            # fetch with body: {key: val}
+            rf'fetch\s*\(\s*[\'"`]{escaped_path}[\'"`][^)]*body\s*:\s*\{{([^}}]+)\}}',
+            # axios.post(url, {data})
+            rf'axios\s*\.\s*post\s*\(\s*[\'"`]{escaped_path}[\'"`]\s*,\s*\{{([^}}]+)\}}',
+            rf'axios\s*\.\s*put\s*\(\s*[\'"`]{escaped_path}[\'"`]\s*,\s*\{{([^}}]+)\}}',
+            # $.ajax with data
+            rf'\$\.ajax\s*\([^)]*url\s*:\s*[\'"`]{escaped_path}[\'"`][^)]*data\s*:\s*\{{([^}}]+)\}}',
+            # Generic object assignment before fetch
+            rf'(?:data|body|payload)\s*=\s*\{{([^}}]+)\}}[^;]*{escaped_path}',
+        ]
+
+        for pattern in body_patterns:
+            try:
+                matches = re.findall(pattern, js_content, re.IGNORECASE | re.DOTALL)
+                for match in matches:
+                    # Extract parameter names from object literal
+                    # Patterns: {key: val}, {key}, {"key": val}, {key: "val"}
+                    param_patterns = [
+                        r'[\'"]?(\w+)[\'"]?\s*:',  # key: or "key":
+                        r'\{\s*(\w+)\s*[,}]',       # { key } or { key,
+                    ]
+                    for pp in param_patterns:
+                        param_names = re.findall(pp, match)
+                        for pname in param_names:
+                            if pname and pname not in seen_params:
+                                seen_params.add(pname)
+                                params.append(DiscoveredParameter(
+                                    name=pname,
+                                    location="body",
+                                    param_type="string",  # Default type
+                                    required=False,  # Cannot determine from JS
+                                ))
+            except re.error:
+                continue
+
+        return params
+
     async def _discover_api_specs(self, base_url: str) -> List[str]:
         """
         Check for OpenAPI/Swagger specifications

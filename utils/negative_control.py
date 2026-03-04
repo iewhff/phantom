@@ -17,12 +17,11 @@ Se ambos dão a mesma resposta → ruído (WAF, app behavior)
 Se diferem → SINAL (Boolean-blind SQLi confirmado!)
 """
 
-import asyncio
 import hashlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, List, Dict, Any, Tuple, Callable
+from typing import Optional, List, Dict, Any, Tuple
 import httpx
 
 
@@ -577,7 +576,7 @@ class NegativeControlEngine:
     
     # Thresholds
     LENGTH_DIFF_THRESHOLD = 0.1      # 10% length difference = significant
-    TIME_DIFF_THRESHOLD_MS = 4000    # 4 second time difference = significant
+    TIME_DIFF_THRESHOLD_MS = 2500    # 2.5 second time difference = significant (lowered from 4s for better timing detection)
     STATUS_DIFF_SIGNIFICANT = True   # Any status difference is significant
     
     def __init__(

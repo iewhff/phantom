@@ -29,7 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from scanning.vuln_scanner import Finding
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.exploitation_helper import ExploitationHelper
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
@@ -51,7 +52,7 @@ class JWTScanner:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
 
     async def scan(
         self,
@@ -70,7 +71,7 @@ class JWTScanner:
         await rate_limiter.acquire()
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 response = await client.get(base_url)
 
                 # Collect JWTs from various locations
@@ -83,12 +84,14 @@ class JWTScanner:
 
                 # Check response body
                 jwt_pattern = r'eyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+'
-                for jwt in re.findall(jwt_pattern, response.text)[:3]:
+                # FN-FIX 2026-02-08: Increased from [:3] to [:10] - test more JWTs
+                for jwt in re.findall(jwt_pattern, response.text)[:10]:
                     jwts_found.append((jwt, "Response body"))
 
                 # Check endpoints for Authorization headers
-                endpoints = asset_data.get("endpoints", [])
-                for endpoint in endpoints[:3]:
+                endpoints = asset_data.get("endpoints", []) if isinstance(asset_data, dict) else []
+                # FN-FIX 2026-02-08: Increased from [:3] to [:15] - check more endpoints
+                for endpoint in endpoints[:15]:
                     await rate_limiter.acquire()
                     try:
                         resp = await client.get(endpoint)
@@ -153,15 +156,15 @@ class JWTScanner:
                     forged_token=f"{parts[0]}.{parts[1]}.",  # Remove signature
                 )
                 findings.append(Finding(
-                    type="authentication",
+                    vuln_type=VulnType.AUTH_BYPASS,
                     name="JWT with 'none' Algorithm",
-                    severity="CRITICAL",
+                    severity=Severity.CRITICAL,
                     description="JWT uses 'none' algorithm, allowing signature bypass.",
                     host=base_url,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"Location: {location}", f"Algorithm: {alg}"],
                     cvss_score=9.8,
-                    cwe="CWE-327",
+                    cwe_id="CWE-327",
                     remediation="Use strong algorithms (RS256, ES256). Never accept 'none' algorithm.",
                     metadata={"poc": poc.to_dict()},
                 ).to_dict())
@@ -169,16 +172,16 @@ class JWTScanner:
             # Check for weak algorithm
             if alg in ["HS256", "HS384", "HS512"]:
                 findings.append(Finding(
-                    type="authentication",
+                    vuln_type=VulnType.AUTH_BYPASS,
                     name="JWT with Symmetric Algorithm",
-                    severity="LOW",
+                    severity=Severity.LOW,
                     description=f"JWT uses symmetric algorithm ({alg}). If the secret is weak, "
                                f"it may be brute-forced.",
                     host=base_url,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"Location: {location}", f"Algorithm: {alg}"],
                     cvss_score=3.7,
-                    cwe="CWE-327",
+                    cwe_id="CWE-327",
                     remediation="Consider using asymmetric algorithms (RS256, ES256) for better security.",
                 ).to_dict())
 
@@ -192,15 +195,15 @@ class JWTScanner:
 
             if found_sensitive:
                 findings.append(Finding(
-                    type="authentication",
+                    vuln_type=VulnType.AUTH_BYPASS,
                     name="Sensitive Data in JWT Payload",
-                    severity="MEDIUM",
+                    severity=Severity.MEDIUM,
                     description="JWT payload contains potentially sensitive data.",
                     host=base_url,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"Sensitive keys found: {found_sensitive}"],
                     cvss_score=5.3,
-                    cwe="CWE-200",
+                    cwe_id="CWE-200",
                     remediation="Do not store sensitive data in JWT payload. Use encrypted JWTs (JWE) if needed.",
                 ).to_dict())
 
@@ -239,21 +242,21 @@ class JWTScanner:
                     forged_token="[forge with HS256 using public key as secret]",
                 )
                 findings.append(Finding(
-                    type="authentication",
+                    vuln_type=VulnType.AUTH_BYPASS,
                     name="JWT Algorithm Confusion Risk",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     description=f"JWT uses {alg} algorithm. If the server doesn't strictly "
                                f"validate the algorithm, an attacker could switch to HS256 "
                                f"and sign with the public key.",
                     host=base_url,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[
                         f"Location: {location}",
                         f"Algorithm: {alg}",
                         "Potential RS256->HS256 confusion attack",
                     ],
                     cvss_score=8.1,
-                    cwe="CWE-327",
+                    cwe_id="CWE-327",
                     remediation="Explicitly verify the expected algorithm. "
                                "Never allow algorithm switching. "
                                "Use a JWT library that prevents algorithm confusion.",
@@ -319,20 +322,20 @@ class JWTScanner:
                             secret=secret,
                         )
                         findings.append(Finding(
-                            type="authentication",
+                            vuln_type=VulnType.AUTH_BYPASS,
                             name="JWT Weak Secret Detected",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description="JWT is signed with a weak/common secret. "
                                        "Attackers can forge valid tokens.",
                             host=base_url,
-                            matched_at=base_url,
+                            endpoint=base_url,
                             evidence=[
                                 f"Location: {location}",
                                 f"Algorithm: {alg}",
                                 f"Secret found: {secret}",
                             ],
                             cvss_score=9.8,
-                            cwe="CWE-798",
+                            cwe_id="CWE-798",
                             remediation="Use a strong, randomly generated secret (256+ bits). "
                                        "Consider using asymmetric algorithms (RS256, ES256).",
                             metadata={"poc": poc.to_dict()},
@@ -370,35 +373,35 @@ class JWTScanner:
             if exp:
                 if exp < time.time():
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="Expired JWT Still Valid",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description="An expired JWT was found in the response. "
                                    "The server may not be validating expiration.",
                         host=base_url,
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"Location: {location}",
                             f"Expiration: {exp} ({time.ctime(exp)})",
                             f"Current time: {int(time.time())}",
                         ],
                         cvss_score=7.5,
-                        cwe="CWE-613",
+                        cwe_id="CWE-613",
                         remediation="Validate JWT expiration on every request. "
                                    "Implement token refresh mechanism.",
                     ).to_dict())
             else:
                 findings.append(Finding(
-                    type="authentication",
+                    vuln_type=VulnType.AUTH_BYPASS,
                     name="JWT Missing Expiration",
-                    severity="MEDIUM",
+                    severity=Severity.MEDIUM,
                     description="JWT does not contain an expiration claim (exp). "
                                "Tokens may be valid indefinitely.",
                     host=base_url,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"Location: {location}", "No 'exp' claim found"],
                     cvss_score=5.3,
-                    cwe="CWE-613",
+                    cwe_id="CWE-613",
                     remediation="Always include 'exp' claim with reasonable expiration time.",
                 ).to_dict())
 
@@ -407,19 +410,19 @@ class JWTScanner:
             for claim in priv_claims:
                 if claim in payload:
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="JWT Contains Privilege Claims",
-                        severity="INFO",
+                        severity=Severity.INFO,
                         description=f"JWT contains privilege-related claim '{claim}'. "
                                    f"Ensure this cannot be tampered with.",
                         host=base_url,
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"Location: {location}",
                             f"Claim: {claim}={payload[claim]}",
                         ],
                         cvss_score=0.0,
-                        cwe="CWE-269",
+                        cwe_id="CWE-269",
                         remediation="Verify privilege claims against server-side records. "
                                    "Never trust client-provided role information.",
                     ).to_dict())

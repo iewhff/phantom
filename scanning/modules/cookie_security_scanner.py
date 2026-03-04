@@ -34,19 +34,17 @@ Version: 3.0.0
 from __future__ import annotations
 
 import re
-import json
-import hashlib
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, List, Dict, Set
+from typing import TYPE_CHECKING, Optional, List, Set
 from urllib.parse import urljoin, urlparse
 from enum import Enum
-from http.cookies import SimpleCookie
-import time
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
@@ -344,10 +342,12 @@ class CookieSecurityScanner(ScanModule):
     def __init__(
         self,
         settings: Optional["Settings"] = None,
-        rate_limiter: Optional[RateLimiter] = None,
-    ):
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
         """Initialize the cookie scanner."""
-        self.settings = settings
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
         self.rate_limiter = rate_limiter or RateLimiter(default_rate=10.0)
         self.client: Optional[httpx.AsyncClient] = None
         self.findings: List[Finding] = []
@@ -378,10 +378,10 @@ class CookieSecurityScanner(ScanModule):
 
         logger.info(f"[Cookie Scanner] Starting scan of {target}")
 
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=30.0,
             follow_redirects=True,
-            verify=False,
+            verify_ssl=False,
         ) as self.client:
 
             # Phase 1: Cookie Discovery
@@ -451,7 +451,7 @@ class CookieSecurityScanner(ScanModule):
 
         # 1. Check Secure flag (for HTTPS sites)
         if self.is_https and not cookie.secure:
-            severity = "high" if cookie.is_session_cookie else "medium"
+            severity = "HIGH" if cookie.is_session_cookie else "MEDIUM"
             self._add_finding(
                 title=f"Cookie '{cookie.name}' Missing Secure Flag",
                 severity=severity,
@@ -462,16 +462,16 @@ class CookieSecurityScanner(ScanModule):
                     description=f"Cookie '{cookie.name}' is transmitted over HTTPS but lacks the Secure flag",
                     evidence=f"Set-Cookie: {cookie.name}=... (no Secure flag)",
                     remediation="Add the Secure flag to prevent transmission over unencrypted connections",
-                    cwe="CWE-614",
+                    cwe_id="CWE-614",
                     cvss_score=6.5 if cookie.is_session_cookie else 4.0,
                 ),
                 target=target,
-                confidence=90.0 if cookie.is_session_cookie else 85.0,
+                confidence_score=90.0 if cookie.is_session_cookie else 85.0,
             )
 
         # 2. Check HttpOnly flag
         if not cookie.httponly and (cookie.is_session_cookie or cookie.is_sensitive):
-            severity = "high" if cookie.is_session_cookie else "medium"
+            severity = "HIGH" if cookie.is_session_cookie else "MEDIUM"
             self._add_finding(
                 title=f"Session Cookie '{cookie.name}' Missing HttpOnly Flag",
                 severity=severity,
@@ -482,47 +482,47 @@ class CookieSecurityScanner(ScanModule):
                     description=f"Session cookie '{cookie.name}' is accessible to JavaScript (XSS risk)",
                     evidence=f"Set-Cookie: {cookie.name}=... (no HttpOnly flag)",
                     remediation="Add the HttpOnly flag to prevent JavaScript access",
-                    cwe="CWE-1004",
+                    cwe_id="CWE-1004",
                     cvss_score=6.0,
                 ),
                 target=target,
-                confidence=90.0 if cookie.is_session_cookie else 85.0,
+                confidence_score=90.0 if cookie.is_session_cookie else 85.0,
             )
 
         # 3. Check SameSite attribute
         if cookie.samesite is None:
             self._add_finding(
                 title=f"Cookie '{cookie.name}' Missing SameSite Attribute",
-                severity="medium",
+                severity=Severity.MEDIUM,
                 vulnerability=CookieVulnerability(
                     vuln_type=CookieVulnType.MISSING_SAMESITE,
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     cookie_name=cookie.name,
                     description=f"Cookie '{cookie.name}' lacks SameSite attribute, may be vulnerable to CSRF",
                     evidence=f"Set-Cookie: {cookie.name}=... (no SameSite)",
                     remediation="Add SameSite=Strict or SameSite=Lax to prevent CSRF attacks",
-                    cwe="CWE-1275",
+                    cwe_id="CWE-1275",
                     cvss_score=5.0,
                 ),
                 target=target,
-                confidence=85.0,
+                confidence_score=85.0,
             )
         elif cookie.samesite.lower() == "none" and not cookie.secure:
             self._add_finding(
                 title=f"Cookie '{cookie.name}' Has SameSite=None Without Secure",
-                severity="high",
+                severity=Severity.HIGH,
                 vulnerability=CookieVulnerability(
                     vuln_type=CookieVulnType.WEAK_SAMESITE,
-                    severity="high",
+                    severity=Severity.HIGH,
                     cookie_name=cookie.name,
                     description="SameSite=None requires Secure flag in modern browsers",
                     evidence=f"Set-Cookie: {cookie.name}=...; SameSite=None (no Secure)",
                     remediation="Add Secure flag when using SameSite=None",
-                    cwe="CWE-1275",
+                    cwe_id="CWE-1275",
                     cvss_score=6.0,
                 ),
                 target=target,
-                confidence=90.0,
+                confidence_score=90.0,
             )
 
         # 4. Check for sensitive data in cookies
@@ -530,19 +530,19 @@ class CookieSecurityScanner(ScanModule):
         if sensitive_data:
             self._add_finding(
                 title=f"Sensitive Data in Cookie '{cookie.name}'",
-                severity="high",
+                severity=Severity.HIGH,
                 vulnerability=CookieVulnerability(
                     vuln_type=CookieVulnType.SENSITIVE_DATA,
-                    severity="high",
+                    severity=Severity.HIGH,
                     cookie_name=cookie.name,
                     description=f"Cookie may contain sensitive data types: {', '.join(sensitive_data)}",
                     evidence=f"Cookie name/value pattern matches: {', '.join(sensitive_data)}",
                     remediation="Never store sensitive data in cookies; use server-side sessions",
-                    cwe="CWE-315",
+                    cwe_id="CWE-315",
                     cvss_score=7.0,
                 ),
                 target=target,
-                confidence=90.0,
+                confidence_score=90.0,
             )
 
         # 5. Check cookie expiration
@@ -550,19 +550,19 @@ class CookieSecurityScanner(ScanModule):
             if cookie.max_age and cookie.max_age > 86400 * 30:  # 30 days
                 self._add_finding(
                     title=f"Session Cookie '{cookie.name}' Has Long Expiration",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.LONG_EXPIRATION,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name=cookie.name,
                         description=f"Session cookie expires in {cookie.max_age // 86400} days",
                         evidence=f"Max-Age: {cookie.max_age} seconds",
                         remediation="Use shorter session lifetimes and implement sliding expiration",
-                        cwe="CWE-613",
+                        cwe_id="CWE-613",
                         cvss_score=4.0,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
         # 6. Check cookie domain scope
@@ -571,19 +571,19 @@ class CookieSecurityScanner(ScanModule):
             if cookie.domain.startswith(".") and cookie.domain.count(".") < 2:
                 self._add_finding(
                     title=f"Cookie '{cookie.name}' Has Overly Permissive Domain",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.OVERLY_PERMISSIVE_DOMAIN,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name=cookie.name,
                         description=f"Cookie domain '{cookie.domain}' is too broad",
                         evidence=f"Domain: {cookie.domain}",
                         remediation="Restrict cookie domain to specific subdomain",
-                        cwe="CWE-1004",
+                        cwe_id="CWE-1004",
                         cvss_score=4.5,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
         # 7. Check cookie path scope
@@ -596,57 +596,57 @@ class CookieSecurityScanner(ScanModule):
             if not cookie.secure or cookie.domain or cookie.path != "/":
                 self._add_finding(
                     title=f"Invalid __Host- Cookie Prefix Usage",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.MISSING_PREFIX,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name=cookie.name,
                         description="__Host- prefix requires Secure, no Domain, and Path=/",
                         evidence=f"Cookie: {cookie.name} (Secure={cookie.secure}, Domain={cookie.domain})",
                         remediation="Ensure __Host- cookies have Secure flag, no Domain, and Path=/",
-                        cwe="CWE-614",
+                        cwe_id="CWE-614",
                         cvss_score=4.0,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
         if cookie.name.startswith("__Secure-"):
             if not cookie.secure:
                 self._add_finding(
                     title=f"Invalid __Secure- Cookie Prefix Usage",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.MISSING_PREFIX,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name=cookie.name,
                         description="__Secure- prefix requires Secure flag",
                         evidence=f"Cookie: {cookie.name} (Secure={cookie.secure})",
                         remediation="Add Secure flag to __Secure- prefixed cookies",
-                        cwe="CWE-614",
+                        cwe_id="CWE-614",
                         cvss_score=4.0,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
         # 9. Check for predictable cookie values
         if cookie.is_session_cookie and self.analyzer.check_predictability(cookie.value):
             self._add_finding(
                 title=f"Session Cookie '{cookie.name}' Has Predictable Value",
-                severity="high",
+                severity=Severity.HIGH,
                 vulnerability=CookieVulnerability(
                     vuln_type=CookieVulnType.PREDICTABLE_VALUE,
-                    severity="high",
+                    severity=Severity.HIGH,
                     cookie_name=cookie.name,
                     description="Session cookie value appears predictable or has low entropy",
                     evidence=f"Cookie entropy: {cookie.entropy:.2f} bits, length: {len(cookie.value)}",
                     remediation="Use cryptographically random session identifiers with high entropy",
-                    cwe="CWE-330",
+                    cwe_id="CWE-330",
                     cvss_score=8.0,
                 ),
                 target=target,
-                confidence=90.0,
+                confidence_score=90.0,
             )
 
     async def _test_session_fixation(self, target: str) -> None:
@@ -681,19 +681,19 @@ class CookieSecurityScanner(ScanModule):
                     if cookie.value == forced_cookies[cookie.name]:
                         self._add_finding(
                             title="Potential Session Fixation Vulnerability",
-                            severity="critical",
+                            severity=Severity.CRITICAL,
                             vulnerability=CookieVulnerability(
                                 vuln_type=CookieVulnType.SESSION_FIXATION,
-                                severity="critical",
+                                severity=Severity.CRITICAL,
                                 cookie_name=cookie.name,
                                 description="Server accepts externally set session identifiers",
                                 evidence=f"Set session '{cookie.name}' to arbitrary value, server did not regenerate",
                                 remediation="Regenerate session ID after authentication and validate session origin",
-                                cwe="CWE-384",
+                                cwe_id="CWE-384",
                                 cvss_score=8.0,
                             ),
                             target=target,
-                            confidence=95.0,
+                            confidence_score=95.0,
                         )
 
         except Exception as e:
@@ -715,19 +715,19 @@ class CookieSecurityScanner(ScanModule):
             if response.status_code >= 500:
                 self._add_finding(
                     title="Cookie Overflow Causes Server Error",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.COOKIE_OVERFLOW,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name="(multiple)",
                         description="Server crashes or errors when receiving many/large cookies",
                         evidence=f"Response status: {response.status_code}",
                         remediation="Implement cookie limits and handle overflow gracefully",
-                        cwe="CWE-400",
+                        cwe_id="CWE-400",
                         cvss_score=5.0,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
         except Exception as e:
@@ -735,19 +735,19 @@ class CookieSecurityScanner(ScanModule):
             if "overflow" in str(e).lower() or "too large" in str(e).lower():
                 self._add_finding(
                     title="Cookie Overflow Denial of Service",
-                    severity="medium",
+                    severity=Severity.MEDIUM,
                     vulnerability=CookieVulnerability(
                         vuln_type=CookieVulnType.COOKIE_OVERFLOW,
-                        severity="medium",
+                        severity=Severity.MEDIUM,
                         cookie_name="(multiple)",
                         description=f"Server cannot handle cookie overflow: {e}",
                         evidence=str(e),
                         remediation="Implement cookie size and count limits",
-                        cwe="CWE-400",
+                        cwe_id="CWE-400",
                         cvss_score=5.0,
                     ),
                     target=target,
-                    confidence=85.0,
+                    confidence_score=85.0,
                 )
 
     def _add_finding(
@@ -759,17 +759,21 @@ class CookieSecurityScanner(ScanModule):
         confidence: float = 85.0,
     ) -> None:
         """Add a finding to the results."""
+        # G-10 FIX: Use correct Finding field names (name, matched_at, type, category)
+        # Also wrap evidence string in list as Finding.evidence expects list[str]
+        evidence_list = [vulnerability.evidence] if vulnerability.evidence else []
         finding = Finding(
-            title=title,
+            name=title,  # was: title (incorrect kwarg)
+            vuln_type=vulnerability.vuln_type,
             severity=severity,
-            module=self.MODULE_NAME,
-            url=target,
+            endpoint=target,  # was: url (incorrect kwarg)
             description=vulnerability.description,
-            evidence=vulnerability.evidence,
+            evidence=evidence_list,
             remediation=vulnerability.remediation,
-            cwe=vulnerability.cwe,
+            cwe_id=vulnerability.cwe,
             cvss_score=vulnerability.cvss_score,
-            confidence=confidence,
+            confidence_score=confidence,
+            category=self.MODULE_NAME,  # was: module (incorrect kwarg)
             metadata={
                 "vuln_type": vulnerability.vuln_type.value,
                 "cookie_name": vulnerability.cookie_name,

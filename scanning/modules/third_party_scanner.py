@@ -16,7 +16,6 @@ Tests for exposed:
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -26,6 +25,7 @@ from urllib.parse import urlparse
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -316,20 +316,36 @@ class ThirdPartyScanner:
         self.result = ThirdPartyScanResult()
     
     async def scan(
-        self, 
-        content: str,
-        target_url: str = "",
+        self,
+        target: str,
+        asset_data: dict | None = None,
+        rate_limiter: Any = None,
         validate_keys: bool = True
     ) -> ThirdPartyScanResult:
         """
-        Scan content for third-party keys.
-        
+        Scan target for third-party keys.
+
         Args:
-            content: HTML/JS content to scan
-            target_url: Target URL for context
+            target: Target URL to scan (will fetch content) OR pre-fetched content
+            asset_data: Asset data (optional, for standard signature compatibility)
+            rate_limiter: Rate limiter (optional, for standard signature compatibility)
             validate_keys: Whether to validate discovered keys
+
+        If target is a URL (starts with http), fetches content first.
+        Otherwise, treats target as pre-fetched content for backwards compatibility.
         """
-        logger.info("🔑 FASE 10: Third-Party Key Discovery")
+        self._rate_limiter = rate_limiter  # Store for use in _fetch_content
+        # Determine if target is a URL or pre-fetched content
+        if target.startswith("http://") or target.startswith("https://"):
+            self._target_url = target
+            # Fetch content from URL
+            content = await self._fetch_content(target)
+            logger.info(f"🔑 FASE 10: Third-Party Key Discovery for {target}")
+        else:
+            # Legacy: target is pre-fetched content
+            self._target_url = ""
+            content = target
+            logger.info("🔑 FASE 10: Third-Party Key Discovery")
         
         # Scan for all key patterns
         for key_name, config in self.KEY_PATTERNS.items():
@@ -374,12 +390,50 @@ class ThirdPartyScanner:
         logger.info(f"   Critical: {self.result.critical_count}")
         
         return self.result
-    
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception as e:
+                logger.debug(f"[ThirdParty] Rate limiter error: {e}")
+
+    async def _fetch_content(self, target: str) -> str:
+        """Fetch HTML/JS content from target URL."""
+        content = ""
+        try:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
+                # Fetch main page
+                await self._acquire_rate_limit()
+                response = await client.get(target)
+                content = response.text
+
+                # Fetch JS bundles (similar to scan_third_party convenience function)
+                script_pattern = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+                scripts = script_pattern.findall(content)
+
+                parsed = urlparse(target)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+                for script in scripts[:10]:
+                    if any(p in script for p in ['main', 'app', 'bundle', 'chunk', 'index']):
+                        url = script if script.startswith('http') else f"{base_url}/{script.lstrip('/')}"
+                        try:
+                            await self._acquire_rate_limit()
+                            js_response = await client.get(url)
+                            content += js_response.text
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"Failed to fetch content from {target}: {e}")
+        return content
+
     async def _validate_keys(self) -> None:
         """Validate discovered keys by testing them."""
         logger.info("🔍 Validating discovered keys...")
         
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with get_scan_client(timeout=self.timeout) as client:
             tasks = []
             
             for key in self.result.keys_discovered:
@@ -474,7 +528,7 @@ async def scan_third_party(
     """
     Convenience function to scan a target for third-party keys.
     """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), verify=False) as client:
+    async with get_scan_client(timeout=15.0, verify_ssl=False) as client:
         # Fetch main page
         response = await client.get(target)
         content = response.text

@@ -27,20 +27,34 @@ Author: PHANTOM AI Team
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
-import random
+from scanning.determinism import deterministic_shuffle, get_deterministic_random
 import re
 import statistics
-import string
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, parse_qs
+
+from utils.shared_findings_store import SharedFindingsStore
 
 logger = logging.getLogger(__name__)
+
+# FIX SAFE-12: Safety mode check - race condition testing sends many concurrent POST requests
+import os
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+# DEF-1 FIX: Allow race testing in cautious mode with very limited concurrency
+# Race conditions are REAL vulnerabilities - shouldn't be skipped entirely
+ALLOW_RACE_TESTING = SAFE_MODE in ("cautious", "standard", "aggressive")
+# Limit concurrency in non-aggressive modes to avoid DoS-like behavior
+MAX_CONCURRENT_REQUESTS = {
+    "safe": 0,       # No testing (too risky for CI/automated)
+    "cautious": 3,   # DEF-1 FIX: Limited testing (was 0) - enough for TOCTOU detection
+    "standard": 5,   # Normal testing
+    "aggressive": 50,  # Full testing
+}
 
 
 # =============================================================================
@@ -212,22 +226,22 @@ RACE_PATTERNS = {
         "pattern": RacePattern.INVENTORY_CHECK,
         "vuln_type": RaceVulnType.INVENTORY_MANIPULATION,
     },
-    # Juice Shop specific patterns
-    "juice_shop_basket": {
-        "indicators": ["basketitem", "basket", "rest/basket"],
-        "params": ["ProductId", "BasketId", "quantity"],
+    # E-commerce basket/cart patterns (generic)
+    "ecommerce_basket": {
+        "indicators": ["basketitem", "basket", "rest/basket", "api/basket", "cart/items"],
+        "params": ["ProductId", "BasketId", "quantity", "product_id", "basket_id", "cart_id"],
         "pattern": RacePattern.INVENTORY_CHECK,
         "vuln_type": RaceVulnType.INVENTORY_MANIPULATION,
     },
-    "juice_shop_coupon": {
-        "indicators": ["/coupon/", "applyCoupon"],
-        "params": ["coupon"],
+    "ecommerce_coupon": {
+        "indicators": ["/coupon", "applyCoupon", "/discount", "/promo", "apply-coupon"],
+        "params": ["coupon", "couponCode", "promo_code", "discount_code"],
         "pattern": RacePattern.REDEEM_REWARD,
         "vuln_type": RaceVulnType.COUPON_ABUSE,
     },
-    "juice_shop_checkout": {
-        "indicators": ["/checkout", "rest/basket"],
-        "params": ["couponCode", "paymentId"],
+    "ecommerce_checkout": {
+        "indicators": ["/checkout", "/payment", "/order", "rest/basket", "api/checkout"],
+        "params": ["couponCode", "paymentId", "payment_method", "order_id"],
         "pattern": RacePattern.CHECK_THEN_ACT,
         "vuln_type": RaceVulnType.DOUBLE_SPEND,
     },
@@ -371,13 +385,63 @@ class SinglePacketAttack:
     1. HTTP/2 allows multiplexing multiple requests on one connection
     2. By carefully constructing the packet, all requests arrive atomically
     3. This creates the smallest possible timing window for race conditions
+
+    FP-FIX 2026-02-12: Added baseline comparison to prevent false positives.
+    Before: is_vulnerable = successes > 1
+    After: is_vulnerable = concurrent_successes > sequential_successes
     """
 
-    VERSION = "3.0.0"
+    VERSION = "3.0.1"
 
     def __init__(self, http_client: Any = None):
         """Initialize single packet attack."""
         self.http_client = http_client
+        self._baseline_successes: int = 0  # FP-FIX: Track sequential baseline
+
+    async def establish_baseline(
+        self,
+        endpoints: List[RaceEndpoint],
+        count: int = 5,
+    ) -> int:
+        """
+        Establish baseline by sending requests SEQUENTIALLY.
+
+        FP-FIX: If sequential requests succeed multiple times, the app
+        NORMALLY allows this - not a race condition.
+
+        Returns:
+            Number of sequential successes (baseline)
+        """
+        successes = 0
+        for i in range(count):
+            endpoint = endpoints[i % len(endpoints)]
+            try:
+                if self.http_client:
+                    response = await self.http_client.request(
+                        method=endpoint.method,
+                        url=endpoint.url,
+                        headers=endpoint.headers,
+                        data=endpoint.body,
+                        params=endpoint.params,
+                    )
+                    if response.status_code == endpoint.expected_success_code:
+                        body = response.text if hasattr(response, 'text') else str(response.content)
+                        if endpoint.expected_success_pattern:
+                            if re.search(endpoint.expected_success_pattern, body):
+                                successes += 1
+                        elif endpoint.expected_failure_pattern:
+                            if not re.search(endpoint.expected_failure_pattern, body):
+                                successes += 1
+                        else:
+                            successes += 1
+                # Wait between sequential requests
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.debug(f"[RaceCondition] Baseline request error: {e}")
+
+        self._baseline_successes = successes
+        logger.debug(f"[RaceCondition] Baseline: {successes}/{count} sequential successes")
+        return successes
 
     async def execute(
         self,
@@ -418,6 +482,19 @@ class SinglePacketAttack:
 
         successes = len([r for r in results if r.was_successful])
 
+        # FP-FIX 2026-02-12: Compare against baseline, not just absolute count
+        # If sequential requests also succeed multiple times, NOT a race condition
+        baseline = self._baseline_successes
+        is_race_vuln = successes > baseline and successes > 1
+
+        # Calculate confidence based on delta from baseline
+        if is_race_vuln:
+            # More successes than baseline = higher confidence
+            delta = successes - baseline
+            confidence = min(0.95, 0.5 + (delta / count) * 0.45)
+        else:
+            confidence = 0.0
+
         return RaceResult(
             technique=AttackTechnique.SINGLE_PACKET,
             requests=results,
@@ -426,9 +503,14 @@ class SinglePacketAttack:
             total_failures=len(results) - successes,
             avg_response_time=avg_time,
             response_variance=variance,
-            evidence={"technique": "single_packet_http2"},
-            is_vulnerable=successes > 1,
-            confidence=min(0.95, successes / count) if successes > 1 else 0.0,
+            evidence={
+                "technique": "single_packet_http2",
+                "baseline_successes": baseline,
+                "concurrent_successes": successes,
+                "delta": successes - baseline,
+            },
+            is_vulnerable=is_race_vuln,
+            confidence=confidence,
         )
 
     async def _execute_http2_multiplex(self, requests: List[RaceRequest]) -> List[RaceRequest]:
@@ -454,8 +536,9 @@ class SinglePacketAttack:
                     req.response_body = response.text if hasattr(response, 'text') else str(response.content)
                     req.response_headers = dict(response.headers) if hasattr(response, 'headers') else {}
                 else:
-                    # Simulation
-                    await asyncio.sleep(random.uniform(0.01, 0.05))
+                    # Simulation (THEME-8: deterministic delays)
+                    _rng = get_deterministic_random("race_sim_single", 0)
+                    await asyncio.sleep(_rng.uniform(0.01, 0.05))
                     req.response_code = 200
                     req.response_body = '{"success": true}'
 
@@ -469,8 +552,9 @@ class SinglePacketAttack:
             return req
 
         # Send all requests simultaneously
-        results = await asyncio.gather(*[send_request(r) for r in requests])
-        return list(results)
+        results = await asyncio.gather(*[send_request(r) for r in requests], return_exceptions=True)
+        # Filter out exceptions and return valid results
+        return [r for r in results if isinstance(r, RaceRequest)]
 
     def _check_success(self, req: RaceRequest) -> bool:
         """Check if request was successful based on endpoint criteria."""
@@ -503,13 +587,56 @@ class LastByteSyncAttack:
 
     This ensures requests complete at nearly the same instant,
     maximizing the chance of hitting a race condition window.
+
+    FP-FIX 2026-02-12: Added baseline comparison for FP reduction.
     """
 
-    VERSION = "3.0.0"
+    VERSION = "3.0.1"
 
     def __init__(self, http_client: Any = None):
         """Initialize last byte sync attack."""
         self.http_client = http_client
+        self._baseline_successes: int = 0  # FP-FIX: Track sequential baseline
+
+    async def establish_baseline(
+        self,
+        endpoint: RaceEndpoint,
+        count: int = 5,
+    ) -> int:
+        """Establish sequential baseline for comparison."""
+        successes = 0
+        for _ in range(count):
+            try:
+                if self.http_client:
+                    response = await self.http_client.request(
+                        method=endpoint.method,
+                        url=endpoint.url,
+                        headers=endpoint.headers,
+                        data=endpoint.body,
+                        params=endpoint.params,
+                    )
+                    if self._check_success_internal(endpoint, response):
+                        successes += 1
+                await asyncio.sleep(0.5)  # Sequential delay
+            except Exception:
+                pass
+        self._baseline_successes = successes
+        return successes
+
+    def _check_success_internal(self, endpoint: RaceEndpoint, response: Any) -> bool:
+        """Check if response indicates success."""
+        if hasattr(response, 'status_code'):
+            if response.status_code != endpoint.expected_success_code:
+                return False
+            body = response.text if hasattr(response, 'text') else str(response.content)
+            if endpoint.expected_success_pattern:
+                if not re.search(endpoint.expected_success_pattern, body):
+                    return False
+            if endpoint.expected_failure_pattern:
+                if re.search(endpoint.expected_failure_pattern, body):
+                    return False
+            return True
+        return False
 
     async def execute(
         self,
@@ -556,7 +683,9 @@ class LastByteSyncAttack:
                     req.response_code = response.status_code
                     req.response_body = response.text if hasattr(response, 'text') else str(response.content)
                 else:
-                    await asyncio.sleep(random.uniform(0.005, 0.02))
+                    # THEME-8: deterministic delays
+                    _rng = get_deterministic_random("race_sim_http2", 0)
+                    await asyncio.sleep(_rng.uniform(0.005, 0.02))
                     req.response_code = 200
                     req.response_body = '{"success": true}'
 
@@ -579,8 +708,9 @@ class LastByteSyncAttack:
         sync_event.set()
 
         # Gather results
-        results = await asyncio.gather(*tasks)
-        results = list(results)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Filter out exceptions
+        results = [r for r in results if isinstance(r, RaceRequest)]
 
         # Calculate statistics
         response_times = [r.timestamp_received - r.timestamp_sent for r in results if r.timestamp_received > 0]
@@ -588,6 +718,16 @@ class LastByteSyncAttack:
         variance = statistics.variance(response_times) if len(response_times) > 1 else 0
 
         successes = len([r for r in results if r.was_successful])
+
+        # FP-FIX 2026-02-12: Compare against baseline
+        baseline = self._baseline_successes
+        is_race_vuln = successes > baseline and successes > 1
+
+        if is_race_vuln:
+            delta = successes - baseline
+            confidence = min(0.90, 0.5 + (delta / count) * 0.40)
+        else:
+            confidence = 0.0
 
         return RaceResult(
             technique=AttackTechnique.LAST_BYTE_SYNC,
@@ -597,9 +737,14 @@ class LastByteSyncAttack:
             total_failures=len(results) - successes,
             avg_response_time=avg_time,
             response_variance=variance,
-            evidence={"technique": "last_byte_sync"},
-            is_vulnerable=successes > 1,
-            confidence=min(0.90, successes / count) if successes > 1 else 0.0,
+            evidence={
+                "technique": "last_byte_sync",
+                "baseline_successes": baseline,
+                "concurrent_successes": successes,
+                "delta": successes - baseline,
+            },
+            is_vulnerable=is_race_vuln,
+            confidence=confidence,
         )
 
     def _check_success(self, req: RaceRequest) -> bool:
@@ -662,7 +807,8 @@ class MultiEndpointRace:
                 all_requests.append(req)
 
         # Shuffle to interleave requests from different endpoints
-        random.shuffle(all_requests)
+        # THEME-8: Use deterministic shuffle for reproducible race testing
+        deterministic_shuffle(all_requests, "race_condition_shuffle")
 
         # Synchronization
         sync_event = asyncio.Event()
@@ -683,7 +829,9 @@ class MultiEndpointRace:
                     req.response_code = response.status_code
                     req.response_body = response.text if hasattr(response, 'text') else str(response.content)
                 else:
-                    await asyncio.sleep(random.uniform(0.01, 0.03))
+                    # THEME-8: deterministic delays
+                    _rng = get_deterministic_random("race_sim_multi", 0)
+                    await asyncio.sleep(_rng.uniform(0.01, 0.03))
                     req.response_code = 200
                     req.response_body = '{"success": true}'
 
@@ -701,8 +849,9 @@ class MultiEndpointRace:
         await asyncio.sleep(0.01)
         sync_event.set()
 
-        results = await asyncio.gather(*tasks)
-        results = list(results)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Filter out exceptions
+        results = [r for r in results if isinstance(r, RaceRequest)]
 
         # Analyze results per endpoint
         endpoint_results = {}
@@ -797,7 +946,19 @@ class RaceConditionScanner:
         Returns:
             List of discovered vulnerabilities
         """
-        logger.info(f"[RaceCondition] Starting scan: {target_url}")
+        # FIX SAFE-12: Race condition testing sends many concurrent POST requests
+        # This can look like a DoS attack - block in safe/cautious modes
+        if not ALLOW_RACE_TESTING:
+            logger.info(f"[RaceCondition] SKIPPED (safe_mode={SAFE_MODE}, requires standard/aggressive)")
+            return []
+
+        # Limit concurrency based on safe mode
+        max_concurrent = MAX_CONCURRENT_REQUESTS.get(SAFE_MODE, 5)
+        if self.config:
+            self.config.concurrent_requests = min(self.config.concurrent_requests, max_concurrent)
+            self.config.burst_size = min(self.config.burst_size, max_concurrent)
+
+        logger.info(f"[RaceCondition] Starting scan: {target_url} (max_concurrent: {max_concurrent})")
 
         # Extract auth context if available (injected by full_scanner)
         auth_ctx = kwargs.get("auth_context") or getattr(self, "_auth_context", None)
@@ -838,6 +999,32 @@ class RaceConditionScanner:
         # Run multi-endpoint tests
         if len(endpoints) > 1:
             await self._test_multi_endpoint_race(endpoints)
+
+        # Run cross-endpoint pair tests (checkout+cancel, transfer+balance, etc.)
+        await self._test_cross_endpoint_pairs(target_url, auth_headers)
+
+        # ====================================================================
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        # Race conditions enable chains: Race + Business Logic → Financial Fraud
+        # ====================================================================
+        try:
+            store = SharedFindingsStore.get_instance()
+            for f in self.findings:
+                await store.add_finding(
+                    {
+                        "type": "race_condition",
+                        "endpoint": f.endpoint.url if f.endpoint else target_url,
+                        "severity": f.severity,
+                        "metadata": {
+                            "vuln_type": f.vuln_type.name if f.vuln_type else "unknown",
+                            "technique": f.technique.name if f.technique else "unknown",
+                            "success_rate": f.success_rate,
+                        },
+                    },
+                    module="race_condition",
+                )
+        except Exception as e:
+            logger.debug(f"[RaceCondition] SharedFindingsStore error: {e}")
 
         logger.info(f"[RaceCondition] Scan complete. Found {len(self.findings)} vulnerabilities")
         return self.findings
@@ -906,7 +1093,9 @@ class RaceConditionScanner:
                             timeout=10.0,
                         )
                     else:
-                        await asyncio.sleep(random.uniform(0.01, 0.05))
+                        # THEME-8: deterministic delays
+                        _rng = get_deterministic_random("race_sim_baseline", 0)
+                        await asyncio.sleep(_rng.uniform(0.01, 0.05))
 
                     times.append(time.time() - start)
                 except Exception:
@@ -924,8 +1113,15 @@ class RaceConditionScanner:
         # Detect pattern type
         pattern_type = self._detect_pattern_type(endpoint)
 
+        # FP-FIX 2026-02-12: Establish baseline BEFORE race testing
+        # This prevents false positives when app normally allows multiple requests
+        baseline_count = 5
+
         # Test with single-packet attack
         if self.config and self.config.use_single_packet:
+            # Establish baseline first
+            await self.single_packet.establish_baseline([endpoint], baseline_count)
+
             result = await self.single_packet.execute(
                 endpoints=[endpoint],
                 count=self.config.burst_size if self.config else 10,
@@ -934,6 +1130,9 @@ class RaceConditionScanner:
 
         # Test with last-byte sync
         if self.config and self.config.use_last_byte_sync:
+            # Establish baseline first
+            await self.last_byte_sync.establish_baseline(endpoint, baseline_count)
+
             result = await self.last_byte_sync.execute(
                 endpoint=endpoint,
                 count=self.config.burst_size if self.config else 10,
@@ -975,6 +1174,111 @@ class RaceConditionScanner:
                         evidence=result.evidence,
                         requests_needed=result.total_sent,
                         success_rate=successes / len(endpoint_requests),
+                        timing_window_ms=result.avg_response_time * 1000,
+                    )
+
+    async def _test_cross_endpoint_pairs(
+        self,
+        base_url: str,
+        auth_headers: dict,
+    ) -> None:
+        """Test race conditions between semantically related endpoint pairs.
+
+        These pairs represent common TOCTOU scenarios:
+        - checkout + cancel (complete order while cancelling)
+        - transfer + check_balance (transfer more than balance during check)
+        - verify + resend (verify while resending to different email)
+        - add_to_cart + checkout (modify cart during checkout)
+        """
+        logger.debug("[RaceCondition] Testing cross-endpoint pairs")
+
+        # Define related endpoint pairs with their race scenario
+        CROSS_ENDPOINT_PAIRS = [
+            # (endpoint1_patterns, endpoint2_patterns, scenario_name, vuln_type)
+            (
+                ["/checkout", "/order", "/api/checkout", "/rest/basket/checkout"],
+                ["/cancel", "/refund", "/api/order/cancel", "/rest/basket/cancel"],
+                "Checkout + Cancel Race",
+                RaceVulnType.DOUBLE_SPEND,
+            ),
+            (
+                ["/transfer", "/send", "/api/transfer", "/api/wallet/transfer"],
+                ["/balance", "/wallet", "/api/balance", "/api/wallet/balance"],
+                "Transfer + Balance Check Race",
+                RaceVulnType.BALANCE_MANIPULATION,
+            ),
+            (
+                ["/verify", "/confirm", "/api/verify", "/api/email/verify"],
+                ["/resend", "/api/resend", "/api/email/resend", "/user/resend"],
+                "Verify + Resend Race",
+                RaceVulnType.TOKEN_REUSE,
+            ),
+            (
+                ["/cart/add", "/basket/add", "/api/cart/items", "/rest/BasketItems"],
+                ["/checkout", "/order", "/api/checkout", "/rest/basket/checkout"],
+                "Add-to-Cart + Checkout Race",
+                RaceVulnType.INVENTORY_MANIPULATION,
+            ),
+            (
+                ["/coupon", "/apply-coupon", "/api/coupon", "/rest/basket/coupon"],
+                ["/checkout", "/order", "/api/checkout", "/rest/basket/checkout"],
+                "Coupon Apply + Checkout Race",
+                RaceVulnType.COUPON_ABUSE,
+            ),
+        ]
+
+        for patterns1, patterns2, scenario, vuln_type in CROSS_ENDPOINT_PAIRS:
+            # Build endpoint URLs
+            endpoints_to_test: List[RaceEndpoint] = []
+
+            for pattern in patterns1[:2]:  # Limit to 2 variations
+                url = f"{base_url}{pattern}"
+                endpoints_to_test.append(RaceEndpoint(
+                    url=url,
+                    method="POST",
+                    headers=auth_headers.copy(),
+                    expected_success_pattern=r'"success":\s*true|"status":\s*"ok"|"id":\s*\d+',
+                ))
+
+            for pattern in patterns2[:2]:
+                url = f"{base_url}{pattern}"
+                endpoints_to_test.append(RaceEndpoint(
+                    url=url,
+                    method="POST" if "cancel" in pattern or "resend" in pattern else "GET",
+                    headers=auth_headers.copy(),
+                    expected_success_pattern=r'"success":\s*true|"balance":\s*\d+',
+                ))
+
+            if len(endpoints_to_test) >= 2:
+                result = await self.multi_endpoint.execute(
+                    endpoints=endpoints_to_test,
+                    requests_per_endpoint=3,
+                )
+
+                if result.is_vulnerable and result.total_success > 2:
+                    self._create_finding(
+                        vuln_type=vuln_type,
+                        severity="CRITICAL",
+                        confidence=result.confidence,
+                        endpoint=endpoints_to_test[0],
+                        technique=AttackTechnique.MULTI_ENDPOINT,
+                        pattern=RacePattern.CHECK_THEN_ACT,
+                        description=(
+                            f"Cross-endpoint race condition: {scenario}. "
+                            f"Racing requests between {patterns1[0]} and {patterns2[0]} "
+                            f"resulted in {result.total_success} successful requests "
+                            f"that should have been mutually exclusive."
+                        ),
+                        impact=(
+                            "Attackers can exploit timing between related operations "
+                            "to achieve double-spend, bypass validations, or corrupt state."
+                        ),
+                        evidence=result.evidence + [
+                            f"Scenario: {scenario}",
+                            f"Endpoint pair: {patterns1[0]} vs {patterns2[0]}",
+                        ],
+                        requests_needed=result.total_sent,
+                        success_rate=result.total_success / result.total_sent,
                         timing_window_ms=result.avg_response_time * 1000,
                     )
 
@@ -1120,6 +1424,145 @@ class RaceConditionScanner:
         }
 
         return impacts.get(vuln_type, "Attackers can exploit concurrent execution for unintended behavior.")
+
+    # =========================================================================
+    # FP REDUCTION: Mandatory Negative Control for Race Conditions
+    # =========================================================================
+    # Problem: ~30% false positive rate due to timing variations
+    # Solution: Require negative control baseline before marking as vulnerable
+    #
+    # Negative control: Single sequential request should NOT show race behavior
+    # If sequential also shows "anomaly", it's not a real race condition
+    # =========================================================================
+
+    async def _verify_with_negative_control(
+        self,
+        endpoint: "RaceEndpoint",
+        parallel_result: dict,
+        http_client: Any,
+    ) -> tuple[bool, str]:
+        """
+        Verify race condition finding with negative control.
+
+        Runs single sequential request to compare against parallel burst.
+        If sequential shows same behavior, it's a false positive.
+
+        Args:
+            endpoint: The endpoint that showed race behavior
+            parallel_result: Result from parallel burst test
+            http_client: HTTP client to use
+
+        Returns:
+            (is_valid, reason) - True if finding passes negative control
+        """
+        try:
+            # Baseline: Single sequential request
+            baseline_responses = []
+            for _ in range(3):  # 3 sequential requests
+                try:
+                    if hasattr(http_client, 'post'):
+                        if endpoint.method.upper() == "POST":
+                            resp = await http_client.post(
+                                endpoint.url,
+                                data=endpoint.body,
+                                headers=endpoint.headers,
+                                timeout=10.0,
+                            )
+                        else:
+                            resp = await http_client.get(
+                                endpoint.url,
+                                headers=endpoint.headers,
+                                timeout=10.0,
+                            )
+                        baseline_responses.append({
+                            "status": resp.status_code,
+                            "length": len(resp.text),
+                        })
+                    else:
+                        # aiohttp client
+                        if endpoint.method.upper() == "POST":
+                            async with http_client.post(
+                                endpoint.url,
+                                data=endpoint.body,
+                                headers=endpoint.headers,
+                            ) as resp:
+                                text = await resp.text()
+                                baseline_responses.append({
+                                    "status": resp.status,
+                                    "length": len(text),
+                                })
+                        else:
+                            async with http_client.get(
+                                endpoint.url,
+                                headers=endpoint.headers,
+                            ) as resp:
+                                text = await resp.text()
+                                baseline_responses.append({
+                                    "status": resp.status,
+                                    "length": len(text),
+                                })
+                    await asyncio.sleep(0.5)  # Sequential delay
+                except Exception as e:
+                    logger.debug(f"[RaceCondition] Negative control request failed: {e}")
+                    continue
+
+            if len(baseline_responses) < 2:
+                # Can't verify - allow finding but note uncertainty
+                return True, "negative_control_incomplete"
+
+            # Compare: Sequential should be consistent, parallel should show variance
+            parallel_variance = parallel_result.get("status_variance", 0)
+            parallel_success_rate = parallel_result.get("success_rate", 0)
+            parallel_response_count = parallel_result.get("response_count", 0)
+
+            # Calculate sequential variance
+            seq_statuses = [r["status"] for r in baseline_responses]
+            seq_lengths = [r["length"] for r in baseline_responses]
+            seq_status_variance = len(set(seq_statuses))
+            seq_length_variance = max(seq_lengths) - min(seq_lengths) if seq_lengths else 0
+
+            # FIX 2026-02-19: Relaxed rejection logic to prevent false negatives
+            # Audit found: Sequential variance from session timeout/load balancer was rejecting real races
+            # Solution: Only reject if sequential variance >= parallel variance (real race should show MORE variance in parallel)
+
+            # FP Detection: Only reject if sequential shows EQUAL OR MORE variance than parallel
+            if seq_status_variance > 1:
+                # Sequential varies - but does parallel vary MORE?
+                if parallel_variance <= seq_status_variance:
+                    # Parallel doesn't show more variance than sequential → likely FP
+                    logger.info(f"[RaceCondition] FP detected: Sequential variance ({seq_status_variance}) >= parallel ({parallel_variance})")
+                    return False, "sequential_variance_matches_parallel"
+                else:
+                    # Parallel shows MORE variance → still likely real race condition
+                    logger.info(f"[RaceCondition] Keeping finding: Parallel variance ({parallel_variance}) > sequential ({seq_status_variance})")
+                    # Continue to other checks
+
+            # FIX: Use success_rate in decision (was fetched but never used)
+            # Low success rate in parallel (many timeouts) = potential timing-sensitive race
+            if parallel_success_rate < 0.5 and parallel_response_count >= 5:
+                # Less than 50% success in parallel burst = server struggling = race window exists
+                logger.info(f"[RaceCondition] Low parallel success rate ({parallel_success_rate:.0%}) indicates timing sensitivity")
+                return True, "timing_sensitive_race"
+
+            # FIX: Relaxed length variance check
+            # Only reject if sequential variance is HIGHER than parallel AND both are small
+            if seq_length_variance > 100:
+                if parallel_variance < 2 and seq_status_variance <= 1:
+                    # Sequential length varies a lot but status is stable, parallel doesn't vary much
+                    # This could be dynamic content, not FP - only reject if confident
+                    parallel_length_variance = parallel_result.get("length_variance", 0)
+                    if parallel_length_variance <= seq_length_variance:
+                        logger.info(f"[RaceCondition] FP suspected: Sequential length variance ({seq_length_variance}) >= parallel")
+                        return False, "sequential_length_variance_higher"
+                    # else: Parallel shows more length variance - keep finding
+
+            # Valid: Parallel shows variance but sequential is stable (or parallel variance > sequential)
+            return True, "negative_control_passed"
+
+        except Exception as e:
+            logger.debug(f"[RaceCondition] Negative control error: {e}")
+            # On error, allow finding but flag uncertainty
+            return True, f"negative_control_error: {e}"
 
     def _create_finding(
         self,

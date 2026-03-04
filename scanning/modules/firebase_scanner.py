@@ -16,17 +16,16 @@ SAFETY MODES:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 from scanning.modules.backend_detector import FirebaseConfig, BackendDetector
 
 if TYPE_CHECKING:
@@ -182,9 +181,9 @@ class FirebaseScanner:
 
         logger.info(f"🔥 Starting Firebase security scan for {self.config.project_id}")
         
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            verify=False,
+        async with get_scan_client(
+            timeout=15.0,
+            verify_ssl=False,
         ) as client:
             # Run tests
             await asyncio.gather(
@@ -232,18 +231,19 @@ class FirebaseScanner:
             
             if response.status_code == 200:
                 data = response.json()
-                if data.get("idToken"):
-                    self.result.findings.append(FirebaseFinding(
-                        phase="F1",
-                        title="Anonymous Authentication Enabled",
-                        severity=Severity.MEDIUM,
-                        description="Firebase anonymous authentication is enabled. "
-                                   "Anyone can create anonymous sessions.",
-                        evidence="Anonymous signUp successful",
-                        remediation="Disable anonymous auth if not required. "
-                                   "Ensure security rules don't trust anonymous users.",
-                        cwe="CWE-287"
-                    ))
+                if isinstance(asset_data, dict):
+                    if isinstance(data, dict) and data.get("idToken"):
+                        self.result.findings.append(FirebaseFinding(
+                            phase="F1",
+                            title="Anonymous Authentication Enabled",
+                            severity=Severity.MEDIUM,
+                            description="Firebase anonymous authentication is enabled. "
+                                    "Anyone can create anonymous sessions.",
+                            evidence="Anonymous signUp successful",
+                            remediation="Disable anonymous auth if not required. "
+                                    "Ensure security rules don't trust anonymous users.",
+                            cwe_id="CWE-287"
+                        ))
             
             # Test 2: Email enumeration
             test_emails = [
@@ -281,7 +281,7 @@ class FirebaseScanner:
                         evidence=f"Errors: {error_messages}",
                         remediation="This is Firebase default behavior. "
                                    "Use rate limiting and monitoring.",
-                        cwe="CWE-203"
+                        cwe_id="CWE-203"
                     ))
             
             # Test 3: Weak password signup
@@ -305,7 +305,7 @@ class FirebaseScanner:
                     evidence="Password '123456' accepted",
                     remediation="Implement client-side password validation. "
                                "Consider Firebase App Check.",
-                    cwe="CWE-521"
+                    cwe_id="CWE-521"
                 ))
                 
         except Exception as e:
@@ -334,7 +334,9 @@ class FirebaseScanner:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    documents = data.get("documents", [])
+                    documents = []
+                    if isinstance(asset_data, dict):
+                        documents = data.get("documents", [])
                     
                     if documents:
                         self.result.collections_discovered.append(collection)
@@ -359,22 +361,22 @@ class FirebaseScanner:
                             resource=collection,
                             remediation="Add Firestore security rules: "
                                        "allow read: if request.auth != null;",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                 
                 # Test 2: Try to create a document (ONLY in write-allowed modes)
                 if not ALLOW_WRITES:
                     logger.debug(f"⚠️ SAFE MODE: Skipping write test for collection '{collection}'")
-                    # Still report that we COULD test writes (for manual verification)
+                    # Report that write test was skipped
                     self.result.findings.append(FirebaseFinding(
                         phase="F2",
                         title=f"Collection '{collection}' - Write test skipped (safe mode)",
                         severity=Severity.INFO,
-                        description=f"Write test skipped due to safe mode. Manual verification recommended.",
+                        description=f"Write test skipped due to safe mode. Run with aggressive mode to test write permissions.",
                         evidence="Safe mode active - no writes performed",
                         resource=collection,
-                        remediation="Run with --safe-mode=standard to test write permissions",
-                        cwe="CWE-284",
+                        remediation="Run with --safe-mode=aggressive to test write permissions",
+                        cwe_id="CWE-284",
                         confidence=0.0,  # Mark as unverified
                     ))
                 else:
@@ -401,7 +403,7 @@ class FirebaseScanner:
                             evidence=f"Document created with status {response.status_code}",
                             resource=collection,
                             remediation="Add write rules: allow write: if request.auth != null;",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                         
                         # Try to delete the test document (cleanup)
@@ -461,7 +463,7 @@ class FirebaseScanner:
                             evidence=f"Data type: {type(data).__name__}, Size: {len(str(data))} chars",
                             resource=path or "/",
                             remediation="Set RTDB rules: {\"rules\": {\".read\": \"auth != null\"}}",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                 
                 # Test 2: Write access (ONLY in write-allowed modes)
@@ -484,7 +486,7 @@ class FirebaseScanner:
                             evidence="Write to /security_test_node successful",
                             resource="/",
                             remediation="Set write rules: {\".write\": \"auth != null\"}",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                         
                         # Clean up
@@ -516,7 +518,9 @@ class FirebaseScanner:
             
             if response.status_code == 200:
                 data = response.json()
-                items = data.get("items", [])
+                items = []
+                if isinstance(asset_data, dict):
+                    items = data.get("items", [])
                 
                 if items:
                     self.result.storage_buckets.append(self.config.storage_bucket)
@@ -529,7 +533,7 @@ class FirebaseScanner:
                         evidence=f"Files: {[f.get('name', '') for f in items[:5]]}",
                         resource=self.config.storage_bucket,
                         remediation="Add storage rules to prevent listing or require auth",
-                        cwe="CWE-548"
+                        cwe_id="CWE-548"
                     ))
             
             # Test 2: Try to upload a file - ONLY in write-allowed modes
@@ -556,7 +560,7 @@ class FirebaseScanner:
                         evidence="File upload successful",
                         resource=self.config.storage_bucket,
                         remediation="Set storage rules: allow write: if request.auth != null;",
-                        cwe="CWE-434"
+                        cwe_id="CWE-434"
                     ))
                     
                     # Try to delete (cleanup)
@@ -573,7 +577,9 @@ class FirebaseScanner:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    items = data.get("items", [])
+                    items = []
+                    if isinstance(asset_data, dict):
+                        items = data.get("items", [])
                     if items:
                         self.result.findings.append(FirebaseFinding(
                             phase="F4",
@@ -583,7 +589,7 @@ class FirebaseScanner:
                             evidence=f"Sample files: {[f.get('name', '')[:30] for f in items[:3]]}",
                             resource=path,
                             remediation="Review if this path should be public",
-                            cwe="CWE-548"
+                            cwe_id="CWE-548"
                         ))
                         
         except Exception as e:

@@ -9,11 +9,13 @@ import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
-import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -107,9 +109,15 @@ class CMSScanner(ScanModule):
         ],
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -118,6 +126,11 @@ class CMSScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Scan for CMS vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[dict[str, Any]] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
@@ -164,13 +177,13 @@ class CMSScanner(ScanModule):
     ) -> str | None:
         """Detect which CMS is running."""
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
+            verify_ssl=False,
             follow_redirects=True,
         ) as client:
             await rate_limiter.acquire()
-            
+
             try:
                 response = await client.get(base_url)
                 content = response.text.lower()
@@ -192,18 +205,31 @@ class CMSScanner(ScanModule):
                         if re.search(pattern, f"{header}: {value}"):
                             return cms
             
-            # Check paths
+            # Check paths — require CMS-specific content, not just status code
+            _CMS_PATH_VALIDATORS: dict[str, list[str]] = {
+                "wordpress": ["wp-content", "wp-includes", "wp-login", "wordpress"],
+                "joomla": ["joomla", "com_content", "josession", "/administrator/"],
+                "drupal": ["drupal", "sites/default", 'data-drupal', "drupalSettings"],
+                "magento": ["magento", "mage/", "varien", "skin/frontend", "/downloader/"],
+                "shopify": ["shopify", "cdn.shopify"],
+            }
             for cms, signatures in self.CMS_SIGNATURES.items():
                 for path in signatures.get("paths", [])[:2]:
                     await rate_limiter.acquire()
-                    
+
                     try:
                         url = urljoin(base_url, path)
                         path_response = await client.get(url)
-                        
+
                         if path_response.status_code in [200, 301, 302, 403]:
-                            return cms
-                            
+                            # FIX 2026-03-02: ALL paths need body validation, not just /admin/.
+                            # Non-CMS apps can return 200/301/302 for /skin/, /js/mage/, etc.
+                            # (SPAs serve 200 for everything; reverse proxies may redirect.)
+                            body_lower = path_response.text.lower()
+                            validators = _CMS_PATH_VALIDATORS.get(cms, [])
+                            if any(v in body_lower for v in validators):
+                                return cms
+
                     except Exception:
                         continue
         
@@ -217,12 +243,12 @@ class CMSScanner(ScanModule):
         """Scan WordPress-specific vulnerabilities."""
         findings = []
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
+            verify_ssl=False,
             follow_redirects=True,
         ) as client:
-            
+
             # Check user enumeration
             for enum_path in self.WP_VULNS["user_enumeration"]:
                 await rate_limiter.acquire()
@@ -240,22 +266,22 @@ class CMSScanner(ScanModule):
                                     usernames = [u.get("slug", u.get("name", "unknown")) for u in users[:5]]
                                     
                                     findings.append(Finding(
-                                        type="cms",
+                                        vuln_type=VulnType.INFO_DISCLOSURE,
                                         name="WordPress User Enumeration via REST API",
-                                        severity="MEDIUM",
+                                        severity=Severity.MEDIUM,
                                         description="WordPress REST API exposes user information, "
                                                    "allowing enumeration of valid usernames.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"Users found: {usernames}",
                                             f"Endpoint: {enum_path}",
                                         ],
                                         cvss_score=5.3,
-                                        cwe="CWE-200",
+                                        cwe_id="CWE-200",
                                         remediation="Disable REST API user endpoint or require authentication. "
                                                    "Use security plugins like WordFence.",
-                                        confidence=85,
+                                        confidence_score=85,
                                     ).to_dict())
                                     break
                             except Exception:
@@ -263,17 +289,17 @@ class CMSScanner(ScanModule):
                         elif "author=" in enum_path:
                             if "author" in response.text.lower():
                                 findings.append(Finding(
-                                    type="cms",
+                                    vuln_type=VulnType.INFO_DISCLOSURE,
                                     name="WordPress User Enumeration via Author Parameter",
-                                    severity="LOW",
+                                    severity=Severity.LOW,
                                     description="WordPress allows user enumeration via author parameter.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[f"Endpoint: {enum_path}"],
                                     cvss_score=3.7,
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     remediation="Block author enumeration requests.",
-                                    confidence=75,
+                                    confidence_score=75,
                                 ).to_dict())
                                 break
                                 
@@ -310,22 +336,22 @@ class CMSScanner(ScanModule):
                     severity = "HIGH" if "system.multicall" in response.text else "MEDIUM"
                     
                     findings.append(Finding(
-                        type="cms",
+                        vuln_type=VulnType.INFO_DISCLOSURE,
                         name="WordPress XML-RPC Enabled",
                         severity=severity,
                         description="XML-RPC is enabled and can be used for brute force attacks, "
                                    "DDoS amplification (pingback), or credential attacks.",
                         host=base_url,
-                        matched_at=xmlrpc_url,
+                        endpoint=xmlrpc_url,
                         evidence=[
                             "XML-RPC endpoint active",
                             f"Dangerous methods: {found_methods}" if found_methods else "",
                         ],
                         cvss_score=7.5 if severity == "HIGH" else 5.3,
-                        cwe="CWE-288",
+                        cwe_id="CWE-288",
                         remediation="Disable XML-RPC if not needed. "
                                    "Block xmlrpc.php via web server or security plugin.",
-                        confidence=90 if severity == "HIGH" else 85,
+                        confidence_score=90 if severity == "HIGH" else 85,
                     ).to_dict())
                     
             except Exception as e:
@@ -340,19 +366,19 @@ class CMSScanner(ScanModule):
                 
                 if response.status_code == 200 and "PHP" in response.text:
                     findings.append(Finding(
-                        type="cms",
+                        vuln_type=VulnType.INFO_DISCLOSURE,
                         name="WordPress Debug Log Exposed",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description="WordPress debug.log is publicly accessible. "
                                    "May contain sensitive information, paths, and errors.",
                         host=base_url,
-                        matched_at=debug_url,
+                        endpoint=debug_url,
                         evidence=["Debug log accessible"],
                         cvss_score=7.5,
-                        cwe="CWE-532",
+                        cwe_id="CWE-532",
                         remediation="Remove debug.log from production. "
                                    "Disable WP_DEBUG in production.",
-                        confidence=95,
+                        confidence_score=95,
                     ).to_dict())
                     
             except Exception as e:
@@ -370,19 +396,19 @@ class CMSScanner(ScanModule):
                     if response.status_code == 200:
                         if "DB_PASSWORD" in response.text or "DB_NAME" in response.text:
                             findings.append(Finding(
-                                type="cms",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="WordPress Config Backup Exposed",
-                                severity="CRITICAL",
+                                severity=Severity.CRITICAL,
                                 description=f"WordPress configuration backup '{backup_path}' is accessible. "
                                            f"Contains database credentials and secret keys.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Config backup contains credentials"],
                                 cvss_score=9.8,
-                                cwe="CWE-530",
+                                cwe_id="CWE-530",
                                 remediation="Remove backup files immediately. "
                                            "Change all credentials.",
-                                confidence=95,
+                                confidence_score=95,
                             ).to_dict())
                             break
                             
@@ -403,17 +429,17 @@ class CMSScanner(ScanModule):
                         version = version_match.group(1)
                         
                         findings.append(Finding(
-                            type="cms",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
                             name="WordPress Version Disclosure",
-                            severity="LOW",
+                            severity=Severity.LOW,
                             description=f"WordPress version {version} detected via readme.html.",
                             host=base_url,
-                            matched_at=readme_url,
+                            endpoint=readme_url,
                             evidence=[f"Version: {version}"],
                             cvss_score=3.7,
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             remediation="Remove readme.html or restrict access.",
-                            confidence=75,
+                            confidence_score=75,
                         ).to_dict())
                         
             except Exception as e:
@@ -437,9 +463,9 @@ class CMSScanner(ScanModule):
             ("/configuration.php.old", "Config backup"),
         ]
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
+            verify_ssl=False,
             follow_redirects=True,
         ) as client:
             for path, check_name in joomla_checks:
@@ -454,33 +480,33 @@ class CMSScanner(ScanModule):
                         if "configuration.php" in path:
                             if "$" in response.text or "class JConfig" in response.text:
                                 findings.append(Finding(
-                                    type="cms",
+                                    vuln_type=VulnType.INFO_DISCLOSURE,
                                     name="Joomla Config Backup Exposed",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description="Joomla configuration backup is accessible.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[f"Path: {path}"],
                                     cvss_score=9.8,
-                                    cwe="CWE-530",
+                                    cwe_id="CWE-530",
                                     remediation="Remove backup files.",
-                                    confidence=95,
+                                    confidence_score=95,
                                 ).to_dict())
                         else:
                             version_match = re.search(r'<version>([\d.]+)</version>', response.text)
                             if version_match:
                                 findings.append(Finding(
-                                    type="cms",
+                                    vuln_type=VulnType.INFO_DISCLOSURE,
                                     name="Joomla Version Disclosure",
-                                    severity="LOW",
+                                    severity=Severity.LOW,
                                     description=f"Joomla version {version_match.group(1)} detected.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[f"Version: {version_match.group(1)}"],
                                     cvss_score=3.7,
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     remediation="Remove version information from public files.",
-                                    confidence=75,
+                                    confidence_score=75,
                                 ).to_dict())
                                 
                 except Exception as e:
@@ -504,9 +530,9 @@ class CMSScanner(ScanModule):
             "/sites/default/settings.php.bak",
         ]
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
+            verify_ssl=False,
             follow_redirects=True,
         ) as client:
             for path in drupal_checks:
@@ -522,31 +548,31 @@ class CMSScanner(ScanModule):
                             version_match = re.search(r'Drupal\s*([\d.]+)', response.text)
                             if version_match:
                                 findings.append(Finding(
-                                    type="cms",
+                                    vuln_type=VulnType.INFO_DISCLOSURE,
                                     name="Drupal Version Disclosure",
-                                    severity="LOW",
+                                    severity=Severity.LOW,
                                     description=f"Drupal version {version_match.group(1)} detected.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[f"Version: {version_match.group(1)}"],
                                     cvss_score=3.7,
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     remediation="Remove CHANGELOG.txt from production.",
-                                    confidence=75,
+                                    confidence_score=75,
                                 ).to_dict())
                         elif "settings.php" in path:
                             findings.append(Finding(
-                                type="cms",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="Drupal Settings Backup Exposed",
-                                severity="CRITICAL",
+                                severity=Severity.CRITICAL,
                                 description="Drupal settings backup is accessible.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[f"Path: {path}"],
                                 cvss_score=9.8,
-                                cwe="CWE-530",
+                                cwe_id="CWE-530",
                                 remediation="Remove backup files.",
-                                confidence=95,
+                                confidence_score=95,
                             ).to_dict())
                             
                 except Exception as e:
@@ -572,36 +598,82 @@ class CMSScanner(ScanModule):
         
         admin_path = admin_paths.get(cms, "/admin/")
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
+            verify_ssl=False,
             follow_redirects=False,
         ) as client:
+            # Fetch homepage for SPA detection
+            try:
+                await rate_limiter.acquire()
+                homepage = await client.get(base_url)
+                homepage_text = homepage.text
+            except Exception:
+                homepage_text = ""
+
             await rate_limiter.acquire()
-            
+
             url = urljoin(base_url, admin_path)
-            
+
             try:
                 response = await client.get(url)
-                
+
                 # Check if admin is accessible without auth
                 if response.status_code == 200:
-                    if "login" not in response.text.lower() and "password" not in response.text.lower():
+                    resp_text = response.text.lower()
+
+                    # CMS content verification: response must contain CMS-specific markers
+                    _CMS_ADMIN_MARKERS: dict[str, list[str]] = {
+                        "wordpress": ["wp-admin", "wp-content", "wordpress", "wp-login"],
+                        "joomla": ["joomla", "com_login", "administrator"],
+                        "drupal": ["drupal", "user/login", "drupal.settings"],
+                        "magento": ["magento", "mage/", "varien", "skin/frontend", "adminhtml"],
+                    }
+                    markers = _CMS_ADMIN_MARKERS.get(cms, [])
+                    has_cms_content = any(m in resp_text for m in markers)
+
+                    if not has_cms_content:
+                        logger.debug(
+                            f"CMS admin check {admin_path}: no {cms} markers in response, skipping"
+                        )
+
+                    # SPA detection: if response matches homepage, it's a SPA fallback
+                    elif homepage_text and abs(len(response.text) - len(homepage_text)) < 100:
+                        hp_start = homepage_text[:500].strip()
+                        rp_start = response.text[:500].strip()
+                        if hp_start == rp_start:
+                            logger.debug(f"CMS admin check {admin_path}: SPA fallback")
+                        elif "login" not in resp_text and "password" not in resp_text:
+                            findings.append(Finding(
+                                vuln_type=VulnType.INFO_DISCLOSURE,
+                                name=f"{cms.title()} Admin Panel Accessible",
+                                severity=Severity.MEDIUM,
+                                description="CMS admin panel is accessible without authentication.",
+                                host=base_url,
+                                endpoint=url,
+                                evidence=["Admin panel returned 200 without login form"],
+                                cvss_score=5.3,
+                                cwe_id="CWE-306",
+                                remediation="Require authentication for admin access. "
+                                           "Implement IP restrictions.",
+                                confidence_score=85,
+                            ).to_dict())
+                    elif "login" not in resp_text and "password" not in resp_text:
                         findings.append(Finding(
-                            type="cms",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
                             name=f"{cms.title()} Admin Panel Accessible",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description="CMS admin panel is accessible without authentication.",
                             host=base_url,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["Admin panel returned 200 without login form"],
                             cvss_score=5.3,
-                            cwe="CWE-306",
+                            cwe_id="CWE-306",
                             remediation="Require authentication for admin access. "
                                        "Implement IP restrictions.",
-                            confidence=85,
+                            confidence_score=85,
                         ).to_dict())
-                        
+
             except Exception as e:
                 logger.debug(f"Admin check error: {e}")
         

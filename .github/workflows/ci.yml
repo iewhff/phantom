@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  MIN_COVERAGE: 15  # Start low, increase as coverage improves
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run Ruff linter
+        run: |
+          ruff check . --select=E,F,W --ignore=E501
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=scanning \
+            --cov=phantom \
+            --cov=utils \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ env.MIN_COVERAGE }} \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+          verbose: true
+
+  test-pipeline:
+    name: Test Pipeline & Scanner Groups
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Test Pipeline Architecture
+        run: |
+          pytest tests/test_pipeline.py tests/test_findings.py tests/test_scanner_groups.py -v
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't fail CI on type errors yet
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run mypy on critical modules
+        run: |
+          mypy scanning/findings.py scanning/pipeline/ --ignore-missing-imports || true
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip bandit
+
+      - name: Run Bandit security linter
+        run: |
+          bandit -r scanning/ phantom/ utils/ -ll -ii --exclude '*_test.py,*/tests/*' || true
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check docstrings in core modules
+        run: |
+          python -c "
+          import ast
+          import sys
+          from pathlib import Path
+
+          core_files = [
+              'scanning/findings.py',
+              'scanning/module_registry.py',
+              'scanning/scanner_group.py',
+              'scanning/pipeline/base.py',
+          ]
+
+          missing_docs = []
+          for file in core_files:
+              path = Path(file)
+              if not path.exists():
+                  continue
+
+              try:
+                  tree = ast.parse(path.read_text())
+                  for node in ast.walk(tree):
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                          if not ast.get_docstring(node):
+                              missing_docs.append(f'{file}:{node.lineno} {node.name}')
+              except Exception as e:
+                  print(f'Error parsing {file}: {e}')
+
+          if missing_docs and len(missing_docs) > 20:
+              print(f'Warning: {len(missing_docs)} items missing docstrings')
+              for item in missing_docs[:10]:
+                  print(f'  - {item}')
+              print('  ...')
+          "

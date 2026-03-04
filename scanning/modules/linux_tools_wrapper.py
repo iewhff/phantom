@@ -28,20 +28,16 @@ CWE Coverage: CWE-200, CWE-22, CWE-89, CWE-287, CWE-20
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode
 
 from utils.logger import get_logger
 
@@ -405,15 +401,17 @@ class LinuxToolsWrapper:
             results.append(result)
         
         # Enterprise: Smart Parameter Fuzzing
-        if asset_data.get("endpoints") and hasattr(self, '_run_smart_parameter_fuzzing_impl'):
-            param_results = await self._run_smart_parameter_fuzzing_impl(host, asset_data)
-            results.extend(param_results)
+        if isinstance(asset_data, dict):
+            if asset_data.get("endpoints") and hasattr(self, '_run_smart_parameter_fuzzing_impl'):
+                param_results = await self._run_smart_parameter_fuzzing_impl(host, asset_data)
+                results.extend(param_results)
         
         # Enterprise: Advanced SQLMap with parameters
-        if "sqlmap" in tools and asset_data.get("endpoints") and hasattr(self, '_run_sqlmap_advanced_impl'):
-            result = await self._run_sqlmap_advanced_impl(host, asset_data)
-            results.append(result)
-        
+        if isinstance(asset_data, dict):
+            if "sqlmap" in tools and asset_data.get("endpoints") and hasattr(self, '_run_sqlmap_advanced_impl'):
+                result = await self._run_sqlmap_advanced_impl(host, asset_data)
+                results.append(result)
+            
         # Aggregate results
         for result in results:
             if result.success:
@@ -441,7 +439,8 @@ class LinuxToolsWrapper:
     def _detect_technology(self, host: str, asset_data: dict) -> str:
         """Detect target technology for smart wordlist selection."""
         url = host.lower()
-        endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
         
         # Check URL patterns
         if ".php" in url or any(".php" in e for e in endpoints):
@@ -454,7 +453,8 @@ class LinuxToolsWrapper:
             return "java"
         
         # Check headers if available
-        headers = asset_data.get("headers", {})
+        if isinstance(asset_data, dict):
+            headers = asset_data.get("headers", {})
         server = headers.get("server", "").lower()
         
         if "php" in server:
@@ -483,14 +483,51 @@ class LinuxToolsWrapper:
         # Check for correlated vulnerabilities
         for url, findings in findings_by_url.items():
             tools = set(f.tool for f in findings)
-            
-            # If multiple tools found issues at same URL, increase confidence
-            if len(tools) >= 2:
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FEEDBACK-05 FIX: Corroboration boost capped, requires different methods
+            # 2 tools using same regex can both be wrong → don't blindly boost
+            # ═══════════════════════════════════════════════════════════════════
+
+            # Group tools by detection method
+            REGEX_TOOLS = {"nikto", "whatweb", "wapiti"}  # Similar pattern-based detection
+            PROBE_TOOLS = {"nmap", "masscan"}  # Active probing
+            DYNAMIC_TOOLS = {"nuclei", "sqlmap", "xsser"}  # Payload-based
+
+            tool_method_groups = set()
+            for t in tools:
+                if t.lower() in REGEX_TOOLS:
+                    tool_method_groups.add("regex")
+                elif t.lower() in PROBE_TOOLS:
+                    tool_method_groups.add("probe")
+                elif t.lower() in DYNAMIC_TOOLS:
+                    tool_method_groups.add("dynamic")
+                else:
+                    tool_method_groups.add(t.lower())  # Unique method
+
+            # Only boost if tools use DIFFERENT detection methods
+            if len(tool_method_groups) >= 2:
                 for finding in findings:
-                    finding.confidence = "HIGH"
-                    finding.description += f" [Corroborated by {len(tools)} tools]"
+                    # FEEDBACK-05: Cap boost at +15%, don't set to HIGH unconditionally
+                    current_conf = finding.confidence if isinstance(finding.confidence, (int, float)) else 65.0
+                    # Only boost if original confidence is at least MEDIUM
+                    if current_conf >= 50.0:
+                        boosted_conf = min(85.0, current_conf + 15.0)  # Cap at 85%
+                        finding.confidence = boosted_conf
+                        finding.description += f" [Corroborated by {len(tool_method_groups)} detection methods: {', '.join(sorted(tool_method_groups))}]"
+
                     self.correlation_data[url].append({
                         "tools": list(tools),
+                        "detection_methods": list(tool_method_groups),
+                        "finding_count": len(findings),
+                    })
+            elif len(tools) >= 2:
+                # Same detection method - log but don't boost
+                for finding in findings:
+                    finding.description += f" [Note: {len(tools)} tools using similar detection]"
+                    self.correlation_data[url].append({
+                        "tools": list(tools),
+                        "same_method": True,
                         "finding_count": len(findings),
                     })
         
@@ -654,7 +691,8 @@ class LinuxToolsWrapper:
         # Try JSON parsing first
         try:
             data = json.loads(output)
-            if "vulnerabilities" in data:
+            # BUG-FIX: Only process dict responses, not arrays
+            if isinstance(data, dict) and "vulnerabilities" in data:
                 for vuln in data["vulnerabilities"]:
                     findings.append(ToolFinding(
                         tool="nikto",
@@ -763,15 +801,17 @@ class LinuxToolsWrapper:
                     "info": "INFO",
                 }
                 
-                findings.append(ToolFinding(
-                    tool="nuclei",
-                    severity=severity_map.get(data.get("info", {}).get("severity", ""), "MEDIUM"),
-                    title=data.get("info", {}).get("name", "Unknown"),
-                    description=data.get("info", {}).get("description", ""),
-                    url=data.get("matched-at", url),
-                    evidence=data.get("extracted-results", ""),
-                    cve=",".join(data.get("info", {}).get("classification", {}).get("cve-id", [])),
-                ))
+                if isinstance(asset_data, dict):
+                    findings.append(ToolFinding(
+                        tool="nuclei",
+                        severity=severity_map.get(data.get("info", {}).get("severity", ""), "MEDIUM"),
+                        title=data.get("info", {}).get("name", "Unknown"),
+                        description=data.get("info", {}).get("description", ""),
+                        url=data.get("matched-at", url),
+                        evidence=data.get("extracted-results", ""),
+                        cve=",".join(data.get("info", {}).get("classification", {}).get("cve-id", [])),
+                    ))
+
                 
             except json.JSONDecodeError:
                 logger.debug(f"Failed to parse nuclei line: {line[:100]}")
@@ -1060,7 +1100,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
     def _parse_ffuf_output(self, data: dict, base_url: str) -> list[ToolFinding]:
         """Parse ffuf JSON output with anomaly analysis."""
         findings = []
-        results = data.get("results", [])
+        if isinstance(asset_data, dict):
+            results = data.get("results", [])
         
         if not results:
             return findings
@@ -1133,7 +1174,7 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
                     url=url,
                     payload=input_val,
                     anomaly_score=anomaly_score,
-                    confidence="HIGH" if anomaly_score > 0.5 else "MEDIUM",
+                    confidence=85.0 if anomaly_score > 0.5 else "MEDIUM",
                 ))
         
         return findings
@@ -1151,7 +1192,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
             return result
         
         url = host if host.startswith("http") else f"https://{host}"
-        endpoints = asset_data.get("endpoints", [url])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [url])
         
         all_findings = []
         
@@ -1266,7 +1308,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
                     continue
                 try:
                     data = json.loads(line)
-                    subdomain = data.get("host", "")
+                    if isinstance(asset_data, dict):
+                        subdomain = data.get("host", "")
                     if subdomain:
                         subdomains.append(subdomain)
                 except json.JSONDecodeError:
@@ -1307,7 +1350,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
         logger.info("🔍 Running smart parameter fuzzing...")
         
         results = []
-        endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
         
         for endpoint in endpoints[:5]:  # Limit to 5 endpoints
             result = ToolResult(tool="smart_fuzzer", success=False)
@@ -1350,7 +1394,7 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
                                 url=endpoint,
                                 parameter=param_name,
                                 payload=mutation.mutated_value,
-                                cwe=self._get_cwe_for_vuln(mutation.payload_category),
+                                cwe_id=self._get_cwe_for_vuln(mutation.payload_category),
                             ))
                             
                     except Exception as e:
@@ -1446,7 +1490,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
             result.error = "sqlmap not installed"
             return result
         
-        endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
         
         # Filter endpoints with parameters
         param_endpoints = [e for e in endpoints if "?" in e]
@@ -1502,8 +1547,8 @@ class EnterpriseLinuxTools(LinuxToolsWrapper):
                         url=endpoint,
                         parameter=param_name,
                         evidence=output[:500],
-                        cwe="CWE-89",
-                        confidence="HIGH",
+                        cwe_id="CWE-89",
+                        confidence=85.0,
                     ))
                 
             except asyncio.TimeoutError:

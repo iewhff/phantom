@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum, auto
+from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -630,7 +630,7 @@ class ComplianceMapper:
                 pci_reqs = OWASP_TO_PCI_DSS.get(owasp_cat, [])
                 pci_dss_requirements.update(pci_reqs)
             except ValueError:
-                pass
+                pass  # FIX 2026-02-12: Expected - value may not be valid OWASP category
 
         # Get NIST mappings from OWASP
         nist_controls: Set[str] = set()
@@ -640,7 +640,7 @@ class ComplianceMapper:
                 nist = OWASP_TO_NIST.get(owasp_cat, [])
                 nist_controls.update(nist)
             except ValueError:
-                pass
+                pass  # FIX 2026-02-12: Expected - value may not be valid OWASP category
 
         # Get ISO 27001 mappings from OWASP
         iso27001_controls: Set[str] = set()
@@ -650,7 +650,7 @@ class ComplianceMapper:
                 iso = OWASP_TO_ISO27001.get(owasp_cat, [])
                 iso27001_controls.update(iso)
             except ValueError:
-                pass
+                pass  # FIX 2026-02-12: Expected - value may not be valid OWASP category
 
         # Get GDPR articles if affects PII
         gdpr_articles = []

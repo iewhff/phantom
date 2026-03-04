@@ -32,11 +32,10 @@ Usage:
 """
 
 from enum import Enum, auto
-from typing import List, Optional, Callable
-from urllib.parse import quote, quote_plus, unquote
+from typing import List
+from urllib.parse import quote, unquote
 import base64
 import html
-import codecs
 import re
 
 
@@ -168,7 +167,7 @@ class PayloadEncoder:
         """Encode as UTF-7 (for legacy XSS)."""
         try:
             return payload.encode('utf-7').decode('ascii')
-        except:
+        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
             return payload
 
     @staticmethod
@@ -239,11 +238,14 @@ class PayloadEncoder:
     @staticmethod
     def base64_decode(payload: str) -> str:
         """Base64 decode."""
-        # Add padding if needed
-        padding = 4 - len(payload) % 4
-        if padding != 4:
-            payload += '=' * padding
-        return base64.b64decode(payload).decode()
+        try:
+            # Add padding if needed
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += '=' * padding
+            return base64.b64decode(payload).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
     # ====================
     # HTML Entity Encodings
@@ -265,12 +267,13 @@ class PayloadEncoder:
         return ''.join(f'&#x{ord(c):x};' for c in payload)
 
     @staticmethod
-    def html_entity_mixed(payload: str) -> str:
-        """Mix decimal and hex encoding randomly."""
-        import random
+    def html_entity_mixed(payload: str, deterministic_index: int = 0) -> str:
+        """Mix decimal and hex encoding (deterministic when PHANTOM_DETERMINISTIC=1)."""
+        from scanning.determinism import get_deterministic_random
+        rng = get_deterministic_random("payload_encoder_html_entity", deterministic_index)
         result = ""
         for c in payload:
-            if random.choice([True, False]):
+            if rng.choice([True, False]):
                 result += f'&#{ord(c)};'
             else:
                 result += f'&#x{ord(c):x};'
@@ -299,11 +302,12 @@ class PayloadEncoder:
         )
 
     @staticmethod
-    def case_random(payload: str) -> str:
-        """Random case variation."""
-        import random
+    def case_random(payload: str, deterministic_index: int = 0) -> str:
+        """Random case variation (deterministic when PHANTOM_DETERMINISTIC=1)."""
+        from scanning.determinism import get_deterministic_random
+        rng = get_deterministic_random("payload_encoder_case", deterministic_index)
         return ''.join(
-            c.upper() if random.choice([True, False]) else c.lower()
+            c.upper() if rng.choice([True, False]) else c.lower()
             for c in payload
         )
 
@@ -419,12 +423,13 @@ class PayloadEncoder:
         return payload.replace(' ', '/**/')
 
     @staticmethod
-    def whitespace_random(payload: str) -> str:
-        """Replace spaces with random whitespace."""
-        import random
+    def whitespace_random(payload: str, deterministic_index: int = 0) -> str:
+        """Replace spaces with random whitespace (deterministic when PHANTOM_DETERMINISTIC=1)."""
+        from scanning.determinism import get_deterministic_random
+        rng = get_deterministic_random("payload_encoder_whitespace", deterministic_index)
         whitespace_chars = ['\t', '\n', '\r', '\v', '\f', '/**/']
         return ''.join(
-            random.choice(whitespace_chars) if c == ' ' else c
+            rng.choice(whitespace_chars) if c == ' ' else c
             for c in payload
         )
 
@@ -441,6 +446,44 @@ class PayloadEncoder:
     def null_byte_terminate(payload: str) -> str:
         """Append null byte at end."""
         return payload + '%00'
+
+    @staticmethod
+    def null_byte_variations(payload: str) -> list[str]:
+        """Generate null byte injection variations for LFI/path traversal."""
+        return [
+            payload + '%00',           # Null terminate
+            payload + '%00.jpg',       # Null + fake extension
+            payload + '%00.png',
+            payload + '%00.gif',
+            payload + '%00.txt',
+            payload + '\x00',          # Raw null
+            payload + '%2500',         # Double-encoded null
+        ]
+
+    @staticmethod
+    def overlong_utf8(payload: str) -> str:
+        """
+        Overlong UTF-8 encoding for WAF bypass.
+        Encodes ../ as overlong UTF-8 sequences.
+        """
+        # Overlong encoding of '.' (0x2E) and '/' (0x2F)
+        overlong_dot = '%c0%ae'    # Overlong encoding of '.'
+        overlong_slash = '%c0%af'  # Overlong encoding of '/'
+
+        result = payload
+        result = result.replace('../', f'{overlong_dot}{overlong_dot}{overlong_slash}')
+        result = result.replace('..\\', f'{overlong_dot}{overlong_dot}\\')
+        return result
+
+    @staticmethod
+    def utf16_encode(payload: str) -> str:
+        """UTF-16 encoding for WAF bypass."""
+        # UTF-16 encoding of common path traversal characters
+        result = payload
+        result = result.replace('.', '%u002e')
+        result = result.replace('/', '%u002f')
+        result = result.replace('\\', '%u005c')
+        return result
 
     @staticmethod
     def backslash_escape(payload: str) -> str:
@@ -499,7 +542,7 @@ class PayloadEncoder:
             try:
                 base64.b64decode(payload)
                 detected.append('base64')
-            except:
+            except (ValueError, TypeError):
                 pass
 
         # Check for HTML entities

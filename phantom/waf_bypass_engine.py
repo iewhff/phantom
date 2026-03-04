@@ -42,21 +42,54 @@ Version: 3.0.0 Enterprise
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import random
 import re
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Pattern
-from urllib.parse import quote, quote_plus, urljoin
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set, Tuple, Pattern
+from urllib.parse import quote
 
 import httpx
 
 from utils.logger import get_logger
 
+# H4 FIX 2026-02-13: Determinism support
+try:
+    from scanning.determinism import is_deterministic_mode, get_deterministic_random
+except ImportError:
+    # Fallback if determinism module not available
+    def is_deterministic_mode() -> bool:
+        return False
+    def get_deterministic_random(component: str, index: int = 0):
+        return random
+
 logger = get_logger(__name__)
+
+# =============================================================================
+# CONSTANTS (M1 FIX 2026-02-13)
+# =============================================================================
+
+DEFAULT_DETECTION_TIMEOUT = 15.0
+CACHE_TTL_SECONDS = 3600
+DEFAULT_TOP_TECHNIQUES = 3
+DEFAULT_MAX_VARIANTS = 10
+MAX_CACHE_ENTRIES = 1000
+MAX_HISTORY_PER_WAF = 100
+MIN_HISTORY_FOR_LEARNING = 5
+MIN_TECHNIQUE_RESULTS = 3
+
+# Test payloads for WAF detection (M2 FIX)
+WAF_TEST_PAYLOADS = [
+    ("1' OR '1'='1", "SQLi"),
+    ("<script>alert(1)</script>", "XSS"),
+    ("../../../etc/passwd", "LFI"),
+    ("; ls -la", "CMDi"),
+    ("{{7*7}}", "SSTI"),
+]
 
 
 # =============================================================================
@@ -1234,9 +1267,11 @@ class BypassTechniqueEngine:
 
     @staticmethod
     def apply_mixed_case(payload: str) -> str:
-        """Apply random mixed case."""
+        """Apply random mixed case. H4 FIX: Determinism support."""
+        # Use deterministic random if in deterministic mode
+        rng = get_deterministic_random("waf_bypass") if is_deterministic_mode() else random
         return ''.join(
-            c.upper() if random.random() > 0.5 else c.lower()
+            c.upper() if rng.random() > 0.5 else c.lower()
             for c in payload
         )
 
@@ -1268,12 +1303,14 @@ class BypassTechniqueEngine:
 
     @staticmethod
     def apply_whitespace_variation(payload: str) -> str:
-        """Use various whitespace characters."""
+        """Use various whitespace characters. H4 FIX: Determinism support."""
         whitespaces = [' ', '\t', '\x0b', '\x0c', '\xa0']
+        # Use deterministic random if in deterministic mode
+        rng = get_deterministic_random("waf_bypass") if is_deterministic_mode() else random
         result = ""
         for char in payload:
             if char == ' ':
-                result += random.choice(whitespaces)
+                result += rng.choice(whitespaces)
             else:
                 result += char
         return result
@@ -1493,11 +1530,72 @@ class WAFBypassEngine:
         self._bypass_history: Dict[str, List[BypassResult]] = {}
         self._detection_cache: Dict[str, WAFDetectionResult] = {}
 
+        # C1 FIX 2026-02-13: Thread safety for shared state
+        self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()
+
+        # H1 FIX 2026-02-13: Initialize metrics
+        self._init_metrics()
+
+        logger.debug(f"[WAFBypassEngine] v{self.VERSION} initialized")
+
+    def _init_metrics(self) -> None:
+        """Initialize metrics tracking. H1 FIX 2026-02-13."""
+        self._metrics = {
+            "detections_attempted": 0,
+            "wafs_detected": 0,
+            "bypasses_attempted": 0,
+            "bypasses_generated": 0,
+            "cache_hits": 0,
+            "cache_size": 0,
+            "by_waf": defaultdict(int),
+            "by_technique": defaultdict(int),
+            "by_family": defaultdict(int),
+        }
+
+    def get_metrics(self) -> dict:
+        """Return current metrics. H1 FIX 2026-02-13."""
+        metrics = dict(self._metrics)
+        metrics["by_waf"] = dict(metrics["by_waf"])
+        metrics["by_technique"] = dict(metrics["by_technique"])
+        metrics["by_family"] = dict(metrics["by_family"])
+        metrics["cache_size"] = len(self._detection_cache)
+        metrics["history_entries"] = sum(len(v) for v in self._bypass_history.values())
+        return metrics
+
+    def reset_metrics(self) -> None:
+        """Reset metrics to initial state. H1 FIX 2026-02-13."""
+        self._init_metrics()
+
+    def _prune_cache_if_needed(self) -> None:
+        """Prune detection cache if it exceeds limit. H3 FIX 2026-02-13."""
+        if len(self._detection_cache) > MAX_CACHE_ENTRIES:
+            # Remove oldest entries (by cache_time)
+            entries = [
+                (k, getattr(v, '_cache_time', 0))
+                for k, v in self._detection_cache.items()
+            ]
+            entries.sort(key=lambda x: x[1])
+            entries_to_remove = len(entries) - int(MAX_CACHE_ENTRIES * 0.8)
+
+            for key, _ in entries[:entries_to_remove]:
+                del self._detection_cache[key]
+
+            logger.debug(f"[WAF] Pruned {entries_to_remove} cache entries")
+
+    def _prune_history_if_needed(self, waf_key: str) -> None:
+        """Prune bypass history if it exceeds limit. H3 FIX 2026-02-13."""
+        if waf_key in self._bypass_history:
+            if len(self._bypass_history[waf_key]) > MAX_HISTORY_PER_WAF:
+                # Keep most recent entries
+                self._bypass_history[waf_key] = self._bypass_history[waf_key][-MAX_HISTORY_PER_WAF:]
+
     async def detect_waf(
         self,
         target_url: str,
-        timeout: float = 15.0,
+        timeout: float = DEFAULT_DETECTION_TIMEOUT,  # M1 FIX: Use constant
         test_payloads: bool = True,
+        verify_ssl: bool = True,  # H5 FIX: Make SSL configurable
     ) -> WAFDetectionResult:
         """
         Detect WAF on target URL.
@@ -1512,23 +1610,27 @@ class WAFBypassEngine:
             target_url: Target URL to check
             timeout: Request timeout
             test_payloads: Whether to send test payloads
+            verify_ssl: Whether to verify SSL certificates (default True)
 
         Returns:
             WAFDetectionResult with detection details
         """
+        self._metrics["detections_attempted"] += 1
         result = WAFDetectionResult()
 
         # Check cache
         cache_key = hashlib.md5(target_url.encode()).hexdigest()
-        if cache_key in self._detection_cache:
-            cached = self._detection_cache[cache_key]
-            if time.time() - getattr(cached, '_cache_time', 0) < 3600:  # 1 hour cache
-                return cached
+        async with self._lock:
+            if cache_key in self._detection_cache:
+                cached = self._detection_cache[cache_key]
+                if time.time() - getattr(cached, '_cache_time', 0) < CACHE_TTL_SECONDS:
+                    self._metrics["cache_hits"] += 1
+                    return cached
 
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                verify=False,
+                verify=verify_ssl,  # H5 FIX: Use parameter
                 follow_redirects=True,
             ) as client:
                 # 1. Normal request
@@ -1566,9 +1668,18 @@ class WAFBypassEngine:
                 result.behaviour_family
             )
 
-        # Cache result
+        # Update metrics
+        if result.detected:
+            self._metrics["wafs_detected"] += 1
+            if result.waf_name:
+                self._metrics["by_waf"][result.waf_name] += 1
+            self._metrics["by_family"][result.behaviour_family.value] += 1
+
+        # Cache result with thread safety (C1 FIX)
         result._cache_time = time.time()
-        self._detection_cache[cache_key] = result
+        async with self._lock:
+            self._detection_cache[cache_key] = result
+            self._prune_cache_if_needed()
 
         return result
 
@@ -1590,7 +1701,7 @@ class WAFBypassEngine:
                     result.confidence = 0.9
                     result.detection_methods.append("header_analysis")
                     result.evidence.append(f"Header {header_name}: {header_value[:50]}")
-                    return
+                    return None
 
     def _analyze_cookies(
         self,
@@ -1611,7 +1722,7 @@ class WAFBypassEngine:
                             result.confidence = 0.8
                         result.detection_methods.append("cookie_analysis")
                         result.evidence.append(f"Cookie: {cookie_name}")
-                        return
+                        return None
 
     def _analyze_body(
         self,
@@ -1630,7 +1741,7 @@ class WAFBypassEngine:
                         result.confidence = 0.85
                     result.detection_methods.append("body_analysis")
                     result.evidence.append(f"Body pattern: {match.group()[:50]}")
-                    return
+                    return None
 
     async def _test_with_payloads(
         self,
@@ -1639,16 +1750,8 @@ class WAFBypassEngine:
         result: WAFDetectionResult,
     ) -> None:
         """Test with suspicious payloads to trigger WAF."""
-        # Test payloads designed to trigger WAFs without being harmful
-        test_payloads = [
-            "1' OR '1'='1",
-            "<script>alert(1)</script>",
-            "../../../etc/passwd",
-            "; ls -la",
-            "{{7*7}}",
-        ]
-
-        for payload in test_payloads:
+        # M2 FIX 2026-02-13: Use configurable test payloads
+        for payload, payload_type in WAF_TEST_PAYLOADS:
             try:
                 test_url = f"{target_url}?test={quote(payload)}"
                 response = await client.get(test_url)
@@ -1659,15 +1762,16 @@ class WAFBypassEngine:
                     result.block_type = BlockType.STATUS_CODE
                     result.block_status_code = response.status_code
                     result.detection_methods.append("payload_test")
-                    result.evidence.append(f"Blocked with status {response.status_code}")
+                    result.evidence.append(f"Blocked {payload_type} with status {response.status_code}")
                     result.confidence = max(result.confidence, 0.9)
 
                     # Try to identify WAF from block page
                     self._analyze_body(response.text, result)
                     break
 
-            except httpx.HTTPError:
-                pass
+            except httpx.HTTPError as e:
+                # H2 FIX 2026-02-13: Use module-level logger instead of import
+                logger.warning(f"WAF bypass payload test HTTPError: {e}")
 
     def _get_techniques_for_family(
         self,
@@ -1766,12 +1870,15 @@ class WAFBypassEngine:
         Returns:
             Bypassed payload
         """
+        self._metrics["bypasses_attempted"] += 1
+
         if techniques is None:
-            techniques = detection.recommended_techniques[:3]  # Top 3
+            techniques = detection.recommended_techniques[:DEFAULT_TOP_TECHNIQUES]  # M1 FIX
 
         result = payload
         for technique in techniques:
             result = self.technique_engine.apply_technique(technique, result, context)
+            self._metrics["by_technique"][technique.value] += 1
 
         return result
 
@@ -1780,7 +1887,7 @@ class WAFBypassEngine:
         payload: str,
         detection: WAFDetectionResult,
         context: str = "generic",
-        max_variants: int = 10,
+        max_variants: int = DEFAULT_MAX_VARIANTS,  # M1 FIX
     ) -> List[Tuple[str, List[BypassTechnique]]]:
         """
         Generate multiple bypass variants of a payload.
@@ -1815,6 +1922,7 @@ class WAFBypassEngine:
             if bypassed not in [v[0] for v in variants]:
                 variants.append((bypassed, [technique]))
 
+        self._metrics["bypasses_generated"] += len(variants)
         return variants[:max_variants]
 
     def record_bypass_result(
@@ -1833,32 +1941,37 @@ class WAFBypassEngine:
             technique: Technique that was tried
             success: Whether bypass was successful
         """
-        key = waf_name.lower()
-        if key not in self._bypass_history:
-            self._bypass_history[key] = []
+        # C1 FIX 2026-02-13: Thread-safe history mutation
+        with self._sync_lock:
+            key = waf_name.lower()
+            if key not in self._bypass_history:
+                self._bypass_history[key] = []
 
-        self._bypass_history[key].append(BypassResult(
-            original_payload="",
-            bypassed_payload="",
-            technique=technique,
-            success=success,
-        ))
+            self._bypass_history[key].append(BypassResult(
+                original_payload="",
+                bypassed_payload="",
+                technique=technique,
+                success=success,
+            ))
 
-        # Update signature if we have enough data
-        sig = self.signature_db.get_signature(waf_name)
-        if sig and len(self._bypass_history[key]) >= 5:
-            # Calculate success rate for this technique
-            technique_results = [
-                r for r in self._bypass_history[key]
-                if r.technique == technique
-            ]
-            if len(technique_results) >= 3:
-                success_rate = sum(1 for r in technique_results if r.success) / len(technique_results)
+            # H3 FIX: Prune history if too large
+            self._prune_history_if_needed(key)
 
-                if success_rate >= 0.7 and technique not in sig.effective_techniques:
-                    sig.effective_techniques.append(technique)
-                elif success_rate <= 0.3 and technique not in sig.ineffective_techniques:
-                    sig.ineffective_techniques.append(technique)
+            # Update signature if we have enough data (M1 FIX: use constants)
+            sig = self.signature_db.get_signature(waf_name)
+            if sig and len(self._bypass_history[key]) >= MIN_HISTORY_FOR_LEARNING:
+                # Calculate success rate for this technique
+                technique_results = [
+                    r for r in self._bypass_history[key]
+                    if r.technique == technique
+                ]
+                if len(technique_results) >= MIN_TECHNIQUE_RESULTS:
+                    success_rate = sum(1 for r in technique_results if r.success) / len(technique_results)
+
+                    if success_rate >= 0.7 and technique not in sig.effective_techniques:
+                        sig.effective_techniques.append(technique)
+                    elif success_rate <= 0.3 and technique not in sig.ineffective_techniques:
+                        sig.ineffective_techniques.append(technique)
 
     def get_waf_info(self, waf_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -1913,6 +2026,7 @@ class WAFBypassEngine:
 
 _engine_instance: Optional[WAFBypassEngine] = None
 _engine_lock = asyncio.Lock()
+_sync_engine_lock = threading.Lock()  # C2 FIX 2026-02-13
 
 
 async def get_waf_bypass_engine() -> WAFBypassEngine:
@@ -1931,15 +2045,17 @@ async def get_waf_bypass_engine() -> WAFBypassEngine:
 
 
 def get_waf_bypass_engine_sync() -> WAFBypassEngine:
-    """Get WAFBypassEngine instance (sync)."""
+    """Get WAFBypassEngine instance (sync). C2 FIX 2026-02-13: Thread-safe."""
     global _engine_instance
 
-    if _engine_instance is None:
-        _engine_instance = WAFBypassEngine()
-        logger.debug(
-            f"[WAFBypassEngine] Initialized with "
-            f"{len(_engine_instance.signature_db.signatures)} signatures"
-        )
+    # C2 FIX: Use lock to prevent race condition
+    with _sync_engine_lock:
+        if _engine_instance is None:
+            _engine_instance = WAFBypassEngine()
+            logger.debug(
+                f"[WAFBypassEngine] Initialized with "
+                f"{len(_engine_instance.signature_db.signatures)} signatures"
+            )
 
     return _engine_instance
 

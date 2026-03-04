@@ -34,10 +34,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Set, Tuple, Pattern
-from urllib.parse import urlparse
 
 import httpx
 
@@ -152,6 +153,9 @@ class TechSignature:
     # Attack surface contribution (0.0-1.0)
     attack_surface_weight: float = 0.5
 
+    # M8: WAF bypass hints (for WAF category signatures)
+    bypass_hints: List[str] = field(default_factory=list)
+
 
 @dataclass
 class DetectedTechnology:
@@ -191,6 +195,7 @@ class FingerprintResult:
     security_headers: Dict[str, bool] = field(default_factory=dict)
     total_cves: int = 0
     critical_cves: int = 0
+    waf_bypass_hints: List[str] = field(default_factory=list)  # M8: Bypass hints
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -204,6 +209,7 @@ class FingerprintResult:
             "total_cves": self.total_cves,
             "critical_cves": self.critical_cves,
             "technology_count": len(self.technologies),
+            "waf_bypass_hints": self.waf_bypass_hints,  # M8
         }
 
     def get_by_category(self, category: TechCategory) -> List[DetectedTechnology]:
@@ -259,6 +265,7 @@ class SignatureDatabase:
         self._add_authentication()
         self._add_payment_systems()
         self._add_dev_tools()
+        self._add_enterprise_infrastructure()  # H6: 2023-2026 CVEs
         self._add_additional_signatures()
 
         logger.debug(f"[TechFingerprinter] Loaded {len(self.signatures)} signatures")
@@ -407,22 +414,30 @@ class SignatureDatabase:
             attack_surface_weight=0.5,
         ))
 
-        # Spring Framework
+        # Spring Framework - enhanced detection
         self._add_signature(TechSignature(
             name="Spring",
             category=TechCategory.WEB_FRAMEWORK,
             header_patterns=[
                 ("X-Application-Context", self._compile_pattern(r'.*')),
             ],
+            cookie_patterns=[
+                self._compile_pattern(r'^JSESSIONID$'),  # Java session cookie
+            ],
             body_patterns=[
                 self._compile_pattern(r'Whitelabel Error Page'),
                 self._compile_pattern(r'org\.springframework'),
                 self._compile_pattern(r'spring-boot'),
+                self._compile_pattern(r'_csrf'),  # Spring Security CSRF token
+                self._compile_pattern(r'j_spring_security'),
+                self._compile_pattern(r'spring_security'),
             ],
             url_patterns=[
                 self._compile_pattern(r'/actuator'),
                 self._compile_pattern(r'/actuator/health'),
                 self._compile_pattern(r'/actuator/info'),
+                self._compile_pattern(r'/login\?error'),  # Spring Security login error
+                self._compile_pattern(r'\.mvc$'),  # Spring MVC
             ],
             version_patterns=[
                 self._compile_pattern(r'Spring[/\s]?Boot[/\s]?([0-9.]+)'),
@@ -435,6 +450,30 @@ class SignatureDatabase:
                 "2.x": [
                     CVEEntry("CVE-2022-22965", Severity.CRITICAL, "Spring4Shell RCE", ["<5.3.18"], 9.8, True),
                     CVEEntry("CVE-2022-22963", Severity.CRITICAL, "Spring Cloud RCE", ["<3.1.7"], 9.8, True),
+                ],
+                "3.x": [
+                    CVEEntry("CVE-2024-22234", Severity.HIGH, "Spring Security auth bypass", ["<6.2.2"], 8.1, False),
+                    CVEEntry("CVE-2024-22243", Severity.HIGH, "Spring Web URL parsing issue", ["<6.1.5"], 8.1, False),
+                ],
+            },
+        ))
+
+        # Log4j (H6 FIX: Critical vulnerability detection)
+        self._add_signature(TechSignature(
+            name="Log4j",
+            category=TechCategory.JAVASCRIPT_LIBRARY,  # Actually Java library
+            body_patterns=[
+                self._compile_pattern(r'log4j'),
+                self._compile_pattern(r'Log4j'),
+            ],
+            implies=["Java"],
+            website="https://logging.apache.org/log4j/",
+            attack_surface_weight=0.9,  # Very high due to Log4Shell
+            cves={
+                "2.x": [
+                    CVEEntry("CVE-2021-44228", Severity.CRITICAL, "Log4Shell RCE", [">=2.0,<2.15.0"], 10.0, True),
+                    CVEEntry("CVE-2021-45046", Severity.CRITICAL, "Log4Shell bypass", [">=2.0,<2.16.0"], 9.0, True),
+                    CVEEntry("CVE-2021-45105", Severity.HIGH, "Log4j DoS", [">=2.0,<2.17.0"], 7.5, False),
                 ],
             },
         ))
@@ -608,7 +647,7 @@ class SignatureDatabase:
             attack_surface_weight=0.3,
         ))
 
-        # Phoenix (Elixir)
+        # Phoenix (Elixir) - specific patterns to avoid false positives
         self._add_signature(TechSignature(
             name="Phoenix",
             category=TechCategory.WEB_FRAMEWORK,
@@ -616,8 +655,13 @@ class SignatureDatabase:
                 self._compile_pattern(r'^_.*_key$'),
             ],
             body_patterns=[
-                self._compile_pattern(r'phoenix\.'),
-                self._compile_pattern(r'phx-'),
+                # More specific patterns to avoid false positives
+                self._compile_pattern(r'phoenix\.js'),
+                self._compile_pattern(r'phoenix\.LiveView'),
+                self._compile_pattern(r'phx-click'),
+                self._compile_pattern(r'phx-submit'),
+                self._compile_pattern(r'phx-change'),
+                self._compile_pattern(r'phx-hook'),
             ],
             implies=["Elixir", "Erlang"],
             website="https://www.phoenixframework.org",
@@ -1452,6 +1496,79 @@ class SignatureDatabase:
             attack_surface_weight=0.2,
         ))
 
+        # Theme 11: Additional modern frameworks (2025-2026)
+
+        # Fresh (Deno framework)
+        self._add_signature(TechSignature(
+            name="Fresh",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'data-fresh-'),
+                self._compile_pattern(r'__FRESH_'),
+            ],
+            meta_patterns=[
+                ("generator", self._compile_pattern(r'Fresh')),
+            ],
+            implies=["Preact", "Deno"],
+            website="https://fresh.deno.dev",
+            attack_surface_weight=0.3,
+        ))
+
+        # Leptos (Rust WASM framework)
+        self._add_signature(TechSignature(
+            name="Leptos",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'data-leptos'),
+                self._compile_pattern(r'hk-\d+'),  # Hydration keys
+                self._compile_pattern(r'leptos'),
+            ],
+            implies=["Rust", "WebAssembly"],
+            website="https://leptos.dev",
+            attack_surface_weight=0.3,
+        ))
+
+        # Inertia.js
+        self._add_signature(TechSignature(
+            name="Inertia.js",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'data-page.*inertiaVersion'),
+                self._compile_pattern(r'@inertiajs'),
+            ],
+            header_patterns=[
+                ("X-Inertia", self._compile_pattern(r'true')),
+                ("X-Inertia-Version", self._compile_pattern(r'.*')),
+            ],
+            website="https://inertiajs.com",
+            attack_surface_weight=0.3,
+        ))
+
+        # Million.js (React virtual DOM replacement)
+        self._add_signature(TechSignature(
+            name="Million.js",
+            category=TechCategory.JAVASCRIPT_LIBRARY,
+            body_patterns=[
+                self._compile_pattern(r'data-million'),
+                self._compile_pattern(r'__MILLION'),
+            ],
+            implies=["React"],
+            website="https://million.dev",
+            attack_surface_weight=0.2,
+        ))
+
+        # Marko
+        self._add_signature(TechSignature(
+            name="Marko",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'data-marko'),
+                self._compile_pattern(r'marko-'),
+            ],
+            website="https://markojs.com",
+            attack_surface_weight=0.3,
+        ))
+
     # =========================================================================
     # JAVASCRIPT LIBRARIES (60+ signatures)
     # =========================================================================
@@ -2143,18 +2260,26 @@ class SignatureDatabase:
             attack_surface_weight=0.3,
         ))
 
-        # Tomcat
+        # Tomcat - enhanced detection
         self._add_signature(TechSignature(
             name="Apache Tomcat",
             category=TechCategory.SERVER,
             header_patterns=[
                 ("Server", self._compile_pattern(r'Apache-Coyote')),
+                ("Server", self._compile_pattern(r'Apache Tomcat')),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^JSESSIONID$'),  # Java session cookie
             ],
             body_patterns=[
                 self._compile_pattern(r'Apache Tomcat'),
+                self._compile_pattern(r'Tomcat/[0-9]+\.[0-9]+'),
+                self._compile_pattern(r'HTTP Status [0-9]+ –'),  # Tomcat error page format
+                self._compile_pattern(r'Type Status Report'),  # Tomcat 404/500 page
             ],
             version_patterns=[
                 self._compile_pattern(r'Tomcat/([0-9.]+)'),
+                self._compile_pattern(r'Apache Tomcat/([0-9.]+)'),
             ],
             implies=["Java"],
             website="https://tomcat.apache.org",
@@ -2771,7 +2896,7 @@ class SignatureDatabase:
     def _add_waf_systems(self) -> None:
         """Add WAF signatures."""
 
-        # Cloudflare WAF
+        # Cloudflare WAF - M8: Added bypass hints
         self._add_signature(TechSignature(
             name="Cloudflare WAF",
             category=TechCategory.WAF,
@@ -2786,9 +2911,17 @@ class SignatureDatabase:
             implies=["Cloudflare"],
             website="https://www.cloudflare.com/waf/",
             attack_surface_weight=0.1,
+            bypass_hints=[
+                "Use case alternation: sElEcT, UnIoN",
+                "URL encoding: %27 for quote, %3C for <",
+                "Unicode escapes: \\u003c for <",
+                "Comment injection: /*!50000union*/",
+                "HTTP/2 pseudoheaders manipulation",
+                "Chunked transfer encoding tricks",
+            ],
         ))
 
-        # AWS WAF
+        # AWS WAF - M8: Added bypass hints
         self._add_signature(TechSignature(
             name="AWS WAF",
             category=TechCategory.WAF,
@@ -2801,9 +2934,16 @@ class SignatureDatabase:
             implies=["AWS"],
             website="https://aws.amazon.com/waf/",
             attack_surface_weight=0.1,
+            bypass_hints=[
+                "JSON with Unicode escapes: \\u0027 for quote",
+                "HTTP parameter pollution",
+                "Multipart form-data content-type tricks",
+                "Large payload (>8KB body may bypass)",
+                "Null byte injection in parameters",
+            ],
         ))
 
-        # ModSecurity
+        # ModSecurity - M8: Added bypass hints
         self._add_signature(TechSignature(
             name="ModSecurity",
             category=TechCategory.WAF,
@@ -2816,6 +2956,14 @@ class SignatureDatabase:
             ],
             website="https://www.modsecurity.org",
             attack_surface_weight=0.1,
+            bypass_hints=[
+                "HPP (HTTP Parameter Pollution): ?id=1&id=2",
+                "MySQL comments: /*!union*/ /*!select*/",
+                "Double URL encoding: %2527 for quote",
+                "Case randomization: SeLeCt",
+                "White space substitution: SELECT%09*%09FROM",
+                "Use %00 null byte to truncate",
+            ],
         ))
 
         # Imperva/Incapsula
@@ -3857,6 +4005,606 @@ class SignatureDatabase:
             attack_surface_weight=0.1,
         ))
 
+        # =====================================================================
+        # L1: Mobile App Frameworks
+        # =====================================================================
+
+        # React Native
+        self._add_signature(TechSignature(
+            name="React Native",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'react-native'),
+                self._compile_pattern(r'ReactNative'),
+                self._compile_pattern(r'__REACT_NATIVE_'),
+            ],
+            implies=["React", "JavaScript"],
+            website="https://reactnative.dev",
+            attack_surface_weight=0.4,
+        ))
+
+        # Flutter
+        self._add_signature(TechSignature(
+            name="Flutter",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'flutter'),
+                self._compile_pattern(r'main\.dart\.js'),
+                self._compile_pattern(r'flutter_service_worker'),
+            ],
+            implies=["Dart"],
+            website="https://flutter.dev",
+            attack_surface_weight=0.3,
+        ))
+
+        # Capacitor (Ionic)
+        self._add_signature(TechSignature(
+            name="Capacitor",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'@capacitor'),
+                self._compile_pattern(r'capacitor\.js'),
+                self._compile_pattern(r'Capacitor\.'),
+            ],
+            implies=["Ionic", "JavaScript"],
+            website="https://capacitorjs.com",
+            attack_surface_weight=0.3,
+        ))
+
+        # Cordova
+        self._add_signature(TechSignature(
+            name="Cordova",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'cordova'),
+                self._compile_pattern(r'cordova\.js'),
+            ],
+            implies=["JavaScript"],
+            website="https://cordova.apache.org",
+            attack_surface_weight=0.4,
+        ))
+
+        # =====================================================================
+        # L6: Container/Infrastructure Detection
+        # =====================================================================
+
+        # Docker
+        self._add_signature(TechSignature(
+            name="Docker",
+            category=TechCategory.HOSTING,
+            header_patterns=[
+                ("Server", self._compile_pattern(r'Docker')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'docker'),
+                self._compile_pattern(r'/v2/_catalog'),  # Docker Registry
+            ],
+            website="https://www.docker.com",
+            attack_surface_weight=0.6,
+        ))
+
+        # Kubernetes
+        self._add_signature(TechSignature(
+            name="Kubernetes",
+            category=TechCategory.HOSTING,
+            body_patterns=[
+                self._compile_pattern(r'kubernetes'),
+                self._compile_pattern(r'/api/v1/namespaces'),
+                self._compile_pattern(r'kubectl'),
+            ],
+            header_patterns=[
+                ("Server", self._compile_pattern(r'kube')),
+            ],
+            website="https://kubernetes.io",
+            attack_surface_weight=0.8,
+        ))
+
+        # AWS ECS/EKS
+        self._add_signature(TechSignature(
+            name="AWS ECS",
+            category=TechCategory.HOSTING,
+            header_patterns=[
+                ("X-Amz-Cf-Id", self._compile_pattern(r'.*')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'amazonaws\.com'),
+                self._compile_pattern(r'ecs\.'),
+            ],
+            implies=["AWS"],
+            website="https://aws.amazon.com/ecs/",
+            attack_surface_weight=0.5,
+        ))
+
+        # =====================================================================
+        # L7: CI/CD Detection
+        # =====================================================================
+
+        # Jenkins
+        self._add_signature(TechSignature(
+            name="Jenkins",
+            category=TechCategory.DEV_TOOLS,
+            header_patterns=[
+                ("X-Jenkins", self._compile_pattern(r'.*')),
+                ("X-Jenkins-Session", self._compile_pattern(r'.*')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'Jenkins'),
+                self._compile_pattern(r'/jenkins/'),
+                self._compile_pattern(r'jenkins-crumb'),
+            ],
+            website="https://www.jenkins.io",
+            attack_surface_weight=0.7,
+        ))
+
+        # GitLab CI
+        self._add_signature(TechSignature(
+            name="GitLab CI",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'gitlab-ci'),
+                self._compile_pattern(r'\.gitlab-ci\.yml'),
+            ],
+            implies=["GitLab"],
+            website="https://docs.gitlab.com/ee/ci/",
+            attack_surface_weight=0.6,
+        ))
+
+        # GitHub Actions
+        self._add_signature(TechSignature(
+            name="GitHub Actions",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'github-actions'),
+                self._compile_pattern(r'\.github/workflows'),
+                self._compile_pattern(r'actions/checkout'),
+            ],
+            implies=["GitHub"],
+            website="https://github.com/features/actions",
+            attack_surface_weight=0.5,
+        ))
+
+        # CircleCI
+        self._add_signature(TechSignature(
+            name="CircleCI",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'circleci'),
+                self._compile_pattern(r'\.circleci/config'),
+            ],
+            website="https://circleci.com",
+            attack_surface_weight=0.5,
+        ))
+
+        # Travis CI
+        self._add_signature(TechSignature(
+            name="Travis CI",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'travis-ci'),
+                self._compile_pattern(r'\.travis\.yml'),
+            ],
+            website="https://www.travis-ci.com",
+            attack_surface_weight=0.5,
+        ))
+
+    # =========================================================================
+    # ENTERPRISE INFRASTRUCTURE (H6: 2023-2026 CVEs)
+    # =========================================================================
+
+    def _add_enterprise_infrastructure(self) -> None:
+        """Add enterprise infrastructure signatures with critical 2023-2026 CVEs."""
+
+        # Atlassian Confluence
+        self._add_signature(TechSignature(
+            name="Confluence",
+            category=TechCategory.CMS,
+            header_patterns=[
+                ("X-Confluence-Request-Time", self._compile_pattern(r'.*')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'Atlassian Confluence'),
+                self._compile_pattern(r'confluence-'),
+                self._compile_pattern(r'ajs-remote-user'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^confluence\.'),
+            ],
+            website="https://www.atlassian.com/software/confluence",
+            attack_surface_weight=0.8,
+            cves={
+                "8.x": [
+                    CVEEntry("CVE-2023-22515", Severity.CRITICAL, "Privilege escalation create admin", ["<8.3.3"], 10.0, True),
+                    CVEEntry("CVE-2023-22518", Severity.CRITICAL, "Improper authorization RCE", ["<8.4.0"], 9.8, True),
+                    CVEEntry("CVE-2024-21683", Severity.HIGH, "RCE via templates", ["<8.9.1"], 8.8, True),
+                ],
+                "7.x": [
+                    CVEEntry("CVE-2022-26134", Severity.CRITICAL, "OGNL Injection RCE", ["<7.18.1"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Atlassian Jira
+        self._add_signature(TechSignature(
+            name="Jira",
+            category=TechCategory.DEV_TOOLS,
+            header_patterns=[
+                ("X-AUSERNAME", self._compile_pattern(r'.*')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'Atlassian Jira'),
+                self._compile_pattern(r'jira\.'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^atlassian\.xsrf\.token'),
+            ],
+            website="https://www.atlassian.com/software/jira",
+            attack_surface_weight=0.7,
+            cves={
+                "9.x": [
+                    CVEEntry("CVE-2023-22501", Severity.CRITICAL, "Authentication bypass", ["<9.2.0"], 9.1, True),
+                ],
+            },
+        ))
+
+        # GitLab
+        self._add_signature(TechSignature(
+            name="GitLab",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'GitLab'),
+                self._compile_pattern(r'gitlab-'),
+                self._compile_pattern(r'<meta content="GitLab"'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^_gitlab_session'),
+            ],
+            website="https://gitlab.com",
+            attack_surface_weight=0.8,
+            cves={
+                "16.x": [
+                    CVEEntry("CVE-2023-7028", Severity.CRITICAL, "Account takeover via password reset", ["<16.5.6"], 10.0, True),
+                    CVEEntry("CVE-2024-0402", Severity.CRITICAL, "Path traversal arbitrary file write", ["<16.6.6"], 9.9, True),
+                    CVEEntry("CVE-2024-4835", Severity.CRITICAL, "XSS to account takeover", ["<16.11.1"], 8.7, True),
+                ],
+                "15.x": [
+                    CVEEntry("CVE-2023-2825", Severity.CRITICAL, "Path traversal read any file", ["<15.11.1"], 10.0, True),
+                ],
+            },
+        ))
+
+        # MOVEit Transfer
+        self._add_signature(TechSignature(
+            name="MOVEit Transfer",
+            category=TechCategory.HOSTING,
+            body_patterns=[
+                self._compile_pattern(r'MOVEit'),
+                self._compile_pattern(r'/moveitisapi/'),
+                self._compile_pattern(r'Progress MOVEit'),
+            ],
+            header_patterns=[
+                ("Server", self._compile_pattern(r'MOVEit')),
+            ],
+            website="https://www.progress.com/moveit",
+            attack_surface_weight=0.9,
+            cves={
+                "2023": [
+                    CVEEntry("CVE-2023-34362", Severity.CRITICAL, "SQL injection RCE", ["<2023.0.1"], 9.8, True),
+                    CVEEntry("CVE-2023-35036", Severity.CRITICAL, "SQL injection data theft", ["<2023.0.2"], 9.8, True),
+                    CVEEntry("CVE-2023-35708", Severity.CRITICAL, "Privilege escalation", ["<2023.0.3"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Citrix NetScaler/ADC
+        self._add_signature(TechSignature(
+            name="Citrix NetScaler",
+            category=TechCategory.CDN,
+            header_patterns=[
+                ("Via", self._compile_pattern(r'NS-CACHE')),
+                ("Set-Cookie", self._compile_pattern(r'NSC_')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'Citrix'),
+                self._compile_pattern(r'NetScaler'),
+                self._compile_pattern(r'/vpn/index\.html'),
+            ],
+            website="https://www.citrix.com",
+            attack_surface_weight=0.9,
+            cves={
+                "13.x": [
+                    CVEEntry("CVE-2023-4966", Severity.CRITICAL, "Citrix Bleed session hijack", ["<13.1-49.15"], 9.4, True),
+                    CVEEntry("CVE-2023-3519", Severity.CRITICAL, "Unauthenticated RCE", ["<13.1-49.13"], 9.8, True),
+                    CVEEntry("CVE-2024-3388", Severity.HIGH, "XSS in management", ["<13.1-51.3"], 8.1, False),
+                ],
+            },
+        ))
+
+        # Fortinet FortiOS
+        self._add_signature(TechSignature(
+            name="FortiOS",
+            category=TechCategory.WAF,
+            header_patterns=[
+                ("Server", self._compile_pattern(r'FortiGate')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'Fortinet'),
+                self._compile_pattern(r'FortiGate'),
+                self._compile_pattern(r'/remote/login'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^SVPNCOOKIE'),
+            ],
+            website="https://www.fortinet.com",
+            attack_surface_weight=0.9,
+            cves={
+                "7.x": [
+                    CVEEntry("CVE-2024-21762", Severity.CRITICAL, "Out-of-bounds write RCE", ["<7.4.2"], 9.8, True),
+                    CVEEntry("CVE-2023-27997", Severity.CRITICAL, "Heap overflow RCE via SSL-VPN", ["<7.2.5"], 9.8, True),
+                    CVEEntry("CVE-2022-42475", Severity.CRITICAL, "Heap overflow RCE", ["<7.2.3"], 9.8, True),
+                ],
+                "6.x": [
+                    CVEEntry("CVE-2024-21762", Severity.CRITICAL, "Out-of-bounds write RCE", ["<6.4.15"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Ivanti Connect Secure (Pulse Secure)
+        self._add_signature(TechSignature(
+            name="Ivanti Connect Secure",
+            category=TechCategory.SECURITY,
+            body_patterns=[
+                self._compile_pattern(r'Ivanti'),
+                self._compile_pattern(r'Pulse Secure'),
+                self._compile_pattern(r'/dana-na/'),
+                self._compile_pattern(r'/dana/home/'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^DSID'),
+            ],
+            website="https://www.ivanti.com",
+            attack_surface_weight=0.9,
+            cves={
+                "22.x": [
+                    CVEEntry("CVE-2024-21887", Severity.CRITICAL, "Command injection RCE", ["<22.6R2.2"], 9.1, True),
+                    CVEEntry("CVE-2023-46805", Severity.CRITICAL, "Auth bypass", ["<22.6R2.2"], 8.2, True),
+                    CVEEntry("CVE-2024-21893", Severity.CRITICAL, "SSRF RCE", ["<22.6R2.2"], 8.2, True),
+                ],
+            },
+        ))
+
+        # Palo Alto PAN-OS
+        self._add_signature(TechSignature(
+            name="PAN-OS",
+            category=TechCategory.WAF,
+            body_patterns=[
+                self._compile_pattern(r'Palo Alto'),
+                self._compile_pattern(r'GlobalProtect'),
+                self._compile_pattern(r'/global-protect/'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^portal-'),
+            ],
+            website="https://www.paloaltonetworks.com",
+            attack_surface_weight=0.9,
+            cves={
+                "10.x": [
+                    CVEEntry("CVE-2024-3400", Severity.CRITICAL, "Command injection RCE", ["<10.2.9-h1"], 10.0, True),
+                ],
+                "11.x": [
+                    CVEEntry("CVE-2024-3400", Severity.CRITICAL, "Command injection RCE", ["<11.1.2-h3"], 10.0, True),
+                ],
+            },
+        ))
+
+        # JetBrains TeamCity
+        self._add_signature(TechSignature(
+            name="TeamCity",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'TeamCity'),
+                self._compile_pattern(r'JetBrains'),
+                self._compile_pattern(r'buildServerUrl'),
+            ],
+            header_patterns=[
+                ("X-TeamCity-Node-Id", self._compile_pattern(r'.*')),
+            ],
+            website="https://www.jetbrains.com/teamcity/",
+            attack_surface_weight=0.8,
+            cves={
+                "2023.x": [
+                    CVEEntry("CVE-2024-27198", Severity.CRITICAL, "Auth bypass admin takeover", ["<2023.11.4"], 9.8, True),
+                    CVEEntry("CVE-2024-27199", Severity.HIGH, "Path traversal", ["<2023.11.4"], 7.3, False),
+                    CVEEntry("CVE-2023-42793", Severity.CRITICAL, "Auth bypass RCE", ["<2023.05.4"], 9.8, True),
+                ],
+            },
+        ))
+
+        # ConnectWise ScreenConnect
+        self._add_signature(TechSignature(
+            name="ScreenConnect",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'ScreenConnect'),
+                self._compile_pattern(r'ConnectWise Control'),
+            ],
+            website="https://www.connectwise.com/platform/unified-management/control",
+            attack_surface_weight=0.9,
+            cves={
+                "23.x": [
+                    CVEEntry("CVE-2024-1709", Severity.CRITICAL, "Auth bypass", ["<23.9.8"], 10.0, True),
+                    CVEEntry("CVE-2024-1708", Severity.HIGH, "Path traversal RCE", ["<23.9.8"], 8.4, True),
+                ],
+            },
+        ))
+
+        # SonicWall
+        self._add_signature(TechSignature(
+            name="SonicWall",
+            category=TechCategory.WAF,
+            body_patterns=[
+                self._compile_pattern(r'SonicWall'),
+                self._compile_pattern(r'SonicOS'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^swap'),
+            ],
+            website="https://www.sonicwall.com",
+            attack_surface_weight=0.8,
+            cves={
+                "7.x": [
+                    CVEEntry("CVE-2024-40766", Severity.CRITICAL, "Auth bypass in SSL-VPN", ["<7.0.1-5165"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Barracuda Email Security Gateway
+        self._add_signature(TechSignature(
+            name="Barracuda ESG",
+            category=TechCategory.SECURITY,
+            body_patterns=[
+                self._compile_pattern(r'Barracuda'),
+                self._compile_pattern(r'barracuda\.com'),
+            ],
+            website="https://www.barracuda.com",
+            attack_surface_weight=0.8,
+            cves={
+                "9.x": [
+                    CVEEntry("CVE-2023-2868", Severity.CRITICAL, "Command injection via tar", ["<9.2.0.008"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Apache Struts 2
+        self._add_signature(TechSignature(
+            name="Apache Struts",
+            category=TechCategory.WEB_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'struts'),
+                self._compile_pattern(r'\.action$'),
+            ],
+            url_patterns=[
+                self._compile_pattern(r'\.action'),
+            ],
+            implies=["Java"],
+            website="https://struts.apache.org",
+            attack_surface_weight=0.8,
+            cves={
+                "2.x": [
+                    CVEEntry("CVE-2023-50164", Severity.CRITICAL, "File upload path traversal RCE", ["<2.5.33"], 9.8, True),
+                    CVEEntry("CVE-2024-53677", Severity.CRITICAL, "Path traversal RCE", ["<2.5.34"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Apache OFBiz
+        self._add_signature(TechSignature(
+            name="Apache OFBiz",
+            category=TechCategory.ECOMMERCE,
+            body_patterns=[
+                self._compile_pattern(r'OFBiz'),
+                self._compile_pattern(r'ofbiz'),
+            ],
+            url_patterns=[
+                self._compile_pattern(r'/webtools/'),
+                self._compile_pattern(r'/control/'),
+            ],
+            implies=["Java"],
+            website="https://ofbiz.apache.org",
+            attack_surface_weight=0.8,
+            cves={
+                "18.x": [
+                    CVEEntry("CVE-2023-49070", Severity.CRITICAL, "Pre-auth RCE", ["<18.12.10"], 9.8, True),
+                    CVEEntry("CVE-2023-51467", Severity.CRITICAL, "Auth bypass SSRF", ["<18.12.11"], 9.8, True),
+                    CVEEntry("CVE-2024-32113", Severity.CRITICAL, "Path traversal RCE", ["<18.12.13"], 9.8, True),
+                ],
+            },
+        ))
+
+        # VMware vCenter
+        self._add_signature(TechSignature(
+            name="VMware vCenter",
+            category=TechCategory.HOSTING,
+            body_patterns=[
+                self._compile_pattern(r'vSphere Client'),
+                self._compile_pattern(r'VMware vCenter'),
+            ],
+            header_patterns=[
+                ("Server", self._compile_pattern(r'VMware')),
+            ],
+            website="https://www.vmware.com",
+            attack_surface_weight=0.9,
+            cves={
+                "8.x": [
+                    CVEEntry("CVE-2024-37085", Severity.CRITICAL, "Auth bypass in AD integration", ["<8.0U3"], 9.8, True),
+                    CVEEntry("CVE-2023-34048", Severity.CRITICAL, "Out-of-bounds write RCE", ["<8.0U2"], 9.8, True),
+                ],
+                "7.x": [
+                    CVEEntry("CVE-2021-22005", Severity.CRITICAL, "Arbitrary file upload RCE", ["<7.0U2c"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Zimbra
+        self._add_signature(TechSignature(
+            name="Zimbra",
+            category=TechCategory.CMS,
+            body_patterns=[
+                self._compile_pattern(r'Zimbra'),
+                self._compile_pattern(r'/zimbraAdmin'),
+            ],
+            cookie_patterns=[
+                self._compile_pattern(r'^ZM_AUTH_TOKEN'),
+            ],
+            website="https://www.zimbra.com",
+            attack_surface_weight=0.8,
+            cves={
+                "8.x": [
+                    CVEEntry("CVE-2024-45519", Severity.CRITICAL, "Postjournal RCE", ["<8.8.15p46"], 10.0, True),
+                    CVEEntry("CVE-2023-37580", Severity.CRITICAL, "XSS to RCE", ["<8.8.15p43"], 9.8, True),
+                ],
+                "9.x": [
+                    CVEEntry("CVE-2024-45519", Severity.CRITICAL, "Postjournal RCE", ["<9.0.0p41"], 10.0, True),
+                ],
+            },
+        ))
+
+        # CrushFTP
+        self._add_signature(TechSignature(
+            name="CrushFTP",
+            category=TechCategory.HOSTING,
+            body_patterns=[
+                self._compile_pattern(r'CrushFTP'),
+            ],
+            header_patterns=[
+                ("Server", self._compile_pattern(r'CrushFTP')),
+            ],
+            website="https://www.crushftp.com",
+            attack_surface_weight=0.8,
+            cves={
+                "10.x": [
+                    CVEEntry("CVE-2024-4040", Severity.CRITICAL, "VFS sandbox escape RCE", ["<10.7.1"], 9.8, True),
+                ],
+            },
+        ))
+
+        # Telerik
+        self._add_signature(TechSignature(
+            name="Telerik UI",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'Telerik'),
+                self._compile_pattern(r'Telerik\.Web\.UI'),
+            ],
+            implies=[".NET"],
+            website="https://www.telerik.com",
+            attack_surface_weight=0.7,
+            cves={
+                "2023": [
+                    CVEEntry("CVE-2024-1800", Severity.CRITICAL, "Deserialization RCE in Report Server", ["<10.0.24"], 9.8, True),
+                ],
+            },
+        ))
+
     # =========================================================================
     # ADDITIONAL SIGNATURES (to reach 500+)
     # =========================================================================
@@ -3897,19 +4645,64 @@ class SignatureDatabase:
             attack_surface_weight=0.1,
         ))
 
-        # GraphQL
+        # GraphQL - M7: Enhanced detection
         self._add_signature(TechSignature(
             name="GraphQL",
             category=TechCategory.API_GATEWAY,
+            header_patterns=[
+                ("Content-Type", self._compile_pattern(r'application/graphql')),
+            ],
             body_patterns=[
                 self._compile_pattern(r'"__typename"'),
-                self._compile_pattern(r'graphql'),
+                self._compile_pattern(r'"__schema"'),
+                self._compile_pattern(r'"queryType"'),
+                self._compile_pattern(r'"mutationType"'),
+                self._compile_pattern(r'"subscriptionType"'),
+                self._compile_pattern(r'GraphQL Playground'),
+                self._compile_pattern(r'GraphiQL'),
+                self._compile_pattern(r'"errors":\s*\[\s*\{\s*"message"'),
             ],
             url_patterns=[
                 self._compile_pattern(r'/graphql'),
+                self._compile_pattern(r'/graphiql'),
+                self._compile_pattern(r'/playground'),
+                self._compile_pattern(r'/altair'),
             ],
             website="https://graphql.org",
-            attack_surface_weight=0.4,
+            attack_surface_weight=0.6,  # Higher risk - introspection, batching attacks
+        ))
+
+        # Apollo GraphQL Server
+        self._add_signature(TechSignature(
+            name="Apollo Server",
+            category=TechCategory.API_GATEWAY,
+            body_patterns=[
+                self._compile_pattern(r'Apollo Server'),
+                self._compile_pattern(r'@apollo/server'),
+                self._compile_pattern(r'apollographql'),
+            ],
+            header_patterns=[
+                ("apollographql-client-name", self._compile_pattern(r'.*')),
+            ],
+            implies=["GraphQL", "Node.js"],
+            website="https://www.apollographql.com",
+            attack_surface_weight=0.5,
+        ))
+
+        # Hasura GraphQL Engine
+        self._add_signature(TechSignature(
+            name="Hasura",
+            category=TechCategory.API_GATEWAY,
+            body_patterns=[
+                self._compile_pattern(r'Hasura'),
+                self._compile_pattern(r'hasura-graphql-engine'),
+            ],
+            header_patterns=[
+                ("X-Hasura-Admin-Secret", self._compile_pattern(r'.*')),
+            ],
+            implies=["GraphQL", "PostgreSQL"],
+            website="https://hasura.io",
+            attack_surface_weight=0.7,  # Admin console exposure risk
         ))
 
         # Swagger UI
@@ -4134,8 +4927,8 @@ class SignatureDatabase:
             ("Lucky", "Crystal", r"lucky"),
             ("Amber", "Crystal", r"amber"),
             ("Kemal", "Crystal", r"kemal"),
-            ("Plug", "Elixir", r"plug"),
-            ("Absinthe", "Elixir", r"absinthe"),
+            ("Plug", "Elixir", r"Plug\.Conn|plug_session|plug\.conn"),
+            ("Absinthe", "Elixir", r"Absinthe\.Schema|absinthe_graphql"),
         ]
 
         for name, lang, pattern in frameworks:
@@ -4547,6 +5340,280 @@ class SignatureDatabase:
                 attack_surface_weight=0.2,
             ))
 
+        # H7 FIX: Modern 2025-2026 frameworks and runtimes
+        self._add_modern_2025_signatures()
+
+    def _add_modern_2025_signatures(self) -> None:
+        """H7 FIX: Add modern 2025-2026 framework signatures."""
+
+        # Bun (JavaScript runtime) - EXPANDED 2026-02-19
+        self._add_signature(TechSignature(
+            name="Bun",
+            category=TechCategory.LANGUAGE,
+            header_patterns=[
+                ("Server", self._compile_pattern(r'Bun(?:/[\d.]+)?')),
+                ("X-Powered-By", self._compile_pattern(r'Bun')),
+                # Bun.serve() specific headers
+                ("X-Bun-Version", self._compile_pattern(r'[\d.]+')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'bun\.sh'),
+                self._compile_pattern(r'bun:'),
+                # Bun-specific imports in bundled code
+                self._compile_pattern(r'from\s+["\']bun["\']'),
+                self._compile_pattern(r'require\(["\']bun["\']\)'),
+                # Bun built-ins
+                self._compile_pattern(r'Bun\.serve'),
+                self._compile_pattern(r'Bun\.file'),
+                self._compile_pattern(r'Bun\.write'),
+                self._compile_pattern(r'Bun\.spawn'),
+                self._compile_pattern(r'Bun\.password'),
+                # Bun bundler artifacts
+                self._compile_pattern(r'@bun/'),
+                self._compile_pattern(r'bun-types'),
+                # Bun error patterns (also useful for detection)
+                self._compile_pattern(r'BunError'),
+            ],
+            version_patterns=[
+                self._compile_pattern(r'Bun[/\s]?([\d.]+)'),
+                self._compile_pattern(r'X-Bun-Version:\s*([\d.]+)'),
+            ],
+            website="https://bun.sh",
+            attack_surface_weight=0.35,
+        ))
+
+        # Elysia (Bun web framework)
+        self._add_signature(TechSignature(
+            name="Elysia",
+            category=TechCategory.WEB_FRAMEWORK,
+            header_patterns=[
+                ("X-Powered-By", self._compile_pattern(r'Elysia')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'@elysiajs/'),
+                self._compile_pattern(r'elysia'),
+                self._compile_pattern(r'from\s+["\']elysia["\']'),
+            ],
+            implies=["Bun"],
+            website="https://elysiajs.com",
+            attack_surface_weight=0.3,
+        ))
+
+        # Hono (Web framework for edge)
+        self._add_signature(TechSignature(
+            name="Hono",
+            category=TechCategory.WEB_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'hono'),
+                self._compile_pattern(r'@hono/'),
+            ],
+            implies=["Node.js"],
+            website="https://hono.dev",
+            attack_surface_weight=0.3,
+        ))
+
+        # SolidStart (SolidJS meta-framework)
+        self._add_signature(TechSignature(
+            name="SolidStart",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'solid-start'),
+                self._compile_pattern(r'@solidjs/start'),
+            ],
+            implies=["Solid.js"],
+            website="https://start.solidjs.com",
+            attack_surface_weight=0.3,
+        ))
+
+        # Analog (Angular meta-framework)
+        self._add_signature(TechSignature(
+            name="Analog",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'@analogjs/'),
+                self._compile_pattern(r'analog\.js'),
+            ],
+            implies=["Angular"],
+            website="https://analogjs.org",
+            attack_surface_weight=0.3,
+        ))
+
+        # Nitro (UnJS server engine)
+        self._add_signature(TechSignature(
+            name="Nitro",
+            category=TechCategory.WEB_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'nitropack'),
+                self._compile_pattern(r'@nitro/'),
+            ],
+            implies=["Node.js"],
+            website="https://nitro.unjs.io",
+            attack_surface_weight=0.3,
+        ))
+
+        # Vinxi (Full-stack framework bundler)
+        self._add_signature(TechSignature(
+            name="Vinxi",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'vinxi'),
+            ],
+            website="https://vinxi.dev",
+            attack_surface_weight=0.2,
+        ))
+
+        # TanStack Start (TanStack meta-framework)
+        self._add_signature(TechSignature(
+            name="TanStack Start",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'@tanstack/start'),
+                self._compile_pattern(r'tanstack-start'),
+            ],
+            implies=["React"],
+            website="https://tanstack.com/start",
+            attack_surface_weight=0.3,
+        ))
+
+        # Waku (Minimal React framework)
+        self._add_signature(TechSignature(
+            name="Waku",
+            category=TechCategory.JAVASCRIPT_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'waku'),
+                self._compile_pattern(r'@waku/'),
+            ],
+            implies=["React"],
+            website="https://waku.gg",
+            attack_surface_weight=0.3,
+        ))
+
+        # Effect.ts (TypeScript library)
+        self._add_signature(TechSignature(
+            name="Effect.ts",
+            category=TechCategory.JAVASCRIPT_LIBRARY,
+            body_patterns=[
+                self._compile_pattern(r'@effect/'),
+                self._compile_pattern(r'effect-ts'),
+            ],
+            implies=["TypeScript"],
+            website="https://effect.website",
+            attack_surface_weight=0.2,
+        ))
+
+        # Tauri (Desktop app framework)
+        self._add_signature(TechSignature(
+            name="Tauri",
+            category=TechCategory.DEV_TOOLS,
+            body_patterns=[
+                self._compile_pattern(r'tauri'),
+                self._compile_pattern(r'@tauri-apps/'),
+                self._compile_pattern(r'__TAURI__'),
+            ],
+            implies=["Rust"],
+            website="https://tauri.app",
+            attack_surface_weight=0.3,
+        ))
+
+        # Deno 2.x - EXPANDED 2026-02-19
+        self._add_signature(TechSignature(
+            name="Deno",
+            category=TechCategory.LANGUAGE,
+            header_patterns=[
+                ("Server", self._compile_pattern(r'Deno(?:/[\d.]+)?')),
+                ("X-Powered-By", self._compile_pattern(r'Deno')),
+                # Deno Deploy specific
+                ("X-Deno-Ray", self._compile_pattern(r'[a-f0-9-]+')),
+                ("Server", self._compile_pattern(r'deno deploy', re.IGNORECASE)),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'deno\.land'),
+                self._compile_pattern(r'deno\.com'),
+                self._compile_pattern(r'@deno/'),
+                # Deno-specific imports
+                self._compile_pattern(r'from\s+["\']https://deno\.land'),
+                self._compile_pattern(r'from\s+["\']jsr:'),  # JSR registry
+                self._compile_pattern(r'from\s+["\']npm:'),  # npm: specifier
+                # Deno APIs in bundled code
+                self._compile_pattern(r'Deno\.serve'),
+                self._compile_pattern(r'Deno\.readFile'),
+                self._compile_pattern(r'Deno\.writeFile'),
+                self._compile_pattern(r'Deno\.env'),
+                self._compile_pattern(r'Deno\.Command'),
+                self._compile_pattern(r'Deno\.openKv'),  # Deno KV
+                # Deno permissions in error messages
+                self._compile_pattern(r'--allow-'),
+                self._compile_pattern(r'PermissionDenied'),
+                # Deno error patterns
+                self._compile_pattern(r'Deno\.errors\.'),
+            ],
+            version_patterns=[
+                self._compile_pattern(r'Deno[/\s]?([\d.]+)'),
+                self._compile_pattern(r'deno\s+([\d.]+)'),
+            ],
+            website="https://deno.land",
+            attack_surface_weight=0.35,
+        ))
+
+        # Deno Deploy (Edge hosting)
+        self._add_signature(TechSignature(
+            name="Deno Deploy",
+            category=TechCategory.HOSTING,
+            header_patterns=[
+                ("Server", self._compile_pattern(r'deno deploy', re.IGNORECASE)),
+                ("X-Deno-Ray", self._compile_pattern(r'.')),
+                # Deno Deploy edge locations
+                ("X-Deno-Region", self._compile_pattern(r'[a-z]+-[a-z]+-\d+')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'dash\.deno\.com'),
+                self._compile_pattern(r'deno\.dev'),  # Default domain
+            ],
+            implies=["Deno"],
+            website="https://deno.com/deploy",
+            attack_surface_weight=0.25,
+        ))
+
+        # Fresh (Deno web framework) - EXPANDED
+        self._add_signature(TechSignature(
+            name="Fresh",
+            category=TechCategory.WEB_FRAMEWORK,
+            header_patterns=[
+                ("X-Fresh-Version", self._compile_pattern(r'[\d.]+')),
+            ],
+            body_patterns=[
+                self._compile_pattern(r'_fresh'),
+                self._compile_pattern(r'fresh\.gen\.ts'),
+                self._compile_pattern(r'from\s+["\']fresh["\']'),
+                self._compile_pattern(r'islands/'),  # Fresh islands pattern
+                self._compile_pattern(r'data-fresh'),
+                # Fresh-specific attributes
+                self._compile_pattern(r'f-client-nav'),
+                self._compile_pattern(r'f-partial'),
+            ],
+            version_patterns=[
+                self._compile_pattern(r'Fresh[/\s]?([\d.]+)'),
+                self._compile_pattern(r'X-Fresh-Version:\s*([\d.]+)'),
+            ],
+            implies=["Deno", "Preact"],
+            website="https://fresh.deno.dev",
+            attack_surface_weight=0.3,
+        ))
+
+        # Oak (Deno middleware framework)
+        self._add_signature(TechSignature(
+            name="Oak",
+            category=TechCategory.WEB_FRAMEWORK,
+            body_patterns=[
+                self._compile_pattern(r'oak/mod\.ts'),
+                self._compile_pattern(r'from\s+["\'].*oak'),
+                self._compile_pattern(r'@oak/'),
+            ],
+            implies=["Deno"],
+            website="https://oakserver.github.io/oak/",
+            attack_surface_weight=0.3,
+        ))
+
     def get_signature(self, name: str) -> Optional[TechSignature]:
         """Get a signature by name."""
         return self.signatures.get(name.lower())
@@ -4578,11 +5645,47 @@ class TechFingerprinter:
             print(f"{tech.name}: {tech.confidence}")
     """
 
-    VERSION = "3.0.0"
+    VERSION = "3.3.0"  # M2: Added caching
 
-    def __init__(self):
+    # H4: Default retry configuration
+    DEFAULT_MAX_RETRIES = 3
+    DEFAULT_RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff
+
+    # M2: Cache configuration
+    DEFAULT_CACHE_TTL = 300  # 5 minutes
+    MAX_CACHE_SIZE = 100  # Maximum cached targets
+
+    def __init__(
+        self,
+        rate_limiter: Optional[Any] = None,
+        ssl_verify: bool = False,
+        max_retries: int = 3,
+        cache_ttl: int = 300,
+    ):
+        """
+        Initialize TechFingerprinter.
+
+        Args:
+            rate_limiter: Optional rate limiter instance (H1 fix)
+            ssl_verify: Whether to verify SSL certificates (H2 fix, default False for pentesting)
+            max_retries: Maximum retry attempts on failure (H4 fix)
+            cache_ttl: Cache TTL in seconds (M2 fix, default 5 minutes)
+        """
         self.database = SignatureDatabase()
         self._client: Optional[httpx.AsyncClient] = None
+
+        # H1: Rate limiter integration
+        self._rate_limiter = rate_limiter
+
+        # H2: SSL verification configurable
+        self._ssl_verify = ssl_verify
+
+        # H4: Retry configuration
+        self._max_retries = max_retries
+
+        # M2: Result caching with TTL
+        self._cache: Dict[str, Tuple[FingerprintResult, float]] = {}
+        self._cache_ttl = cache_ttl
 
         # Security header checks
         self.security_headers = [
@@ -4595,11 +5698,87 @@ class TechFingerprinter:
             "Permissions-Policy",
         ]
 
+        # H8: Metrics tracking
+        self._metrics = {
+            "targets_fingerprinted": 0,
+            "technologies_detected": 0,
+            "versions_extracted": 0,
+            "cves_mapped": 0,
+            "errors": 0,
+            "errors_by_type": {},
+            "by_category": {},
+            "by_detection_method": {},
+            "retries_total": 0,
+            "retries_successful": 0,
+        }
+
+    def set_rate_limiter(self, rate_limiter: Any) -> None:
+        """Set rate limiter for HTTP requests (H1 fix)."""
+        self._rate_limiter = rate_limiter
+
+    def set_ssl_verify(self, verify: bool) -> None:
+        """Set SSL verification mode (H2 fix)."""
+        self._ssl_verify = verify
+
+    # M2: Cache management methods
+    def get_cached(self, target: str) -> Optional[FingerprintResult]:
+        """Get cached result if still valid (M2 fix)."""
+        normalized = target if target.startswith(("http://", "https://")) else f"https://{target}"
+        if normalized in self._cache:
+            result, timestamp = self._cache[normalized]
+            if time.time() - timestamp < self._cache_ttl:
+                return result
+            # Expired - remove from cache
+            del self._cache[normalized]
+        return None
+
+    def clear_cache(self) -> int:
+        """Clear all cached results. Returns count of cleared entries (M2 fix)."""
+        count = len(self._cache)
+        self._cache.clear()
+        return count
+
+    def _cache_result(self, target: str, result: FingerprintResult) -> None:
+        """Store result in cache with TTL (M2 fix)."""
+        # Evict oldest entries if cache is full
+        if len(self._cache) >= self.MAX_CACHE_SIZE:
+            oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
+            del self._cache[oldest_key]
+
+        normalized = target if target.startswith(("http://", "https://")) else f"https://{target}"
+        self._cache[normalized] = (result, time.time())
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get fingerprinting metrics."""
+        return {
+            **self._metrics,
+            "signature_count": len(self.database.signatures),
+            "avg_techs_per_target": (
+                self._metrics["technologies_detected"] / max(1, self._metrics["targets_fingerprinted"])
+            ),
+        }
+
+    def reset_metrics(self) -> None:
+        """Reset all metrics counters."""
+        self._metrics = {
+            "targets_fingerprinted": 0,
+            "technologies_detected": 0,
+            "versions_extracted": 0,
+            "cves_mapped": 0,
+            "errors": 0,
+            "errors_by_type": {},
+            "by_category": {},
+            "by_detection_method": {},
+            "retries_total": 0,
+            "retries_successful": 0,
+        }
+
     async def fingerprint(
         self,
         target: str,
         timeout: float = 15.0,
         follow_redirects: bool = True,
+        use_cache: bool = True,
     ) -> FingerprintResult:
         """
         Perform technology fingerprinting on a target.
@@ -4608,10 +5787,18 @@ class TechFingerprinter:
             target: Target URL to fingerprint
             timeout: Request timeout in seconds
             follow_redirects: Whether to follow redirects
+            use_cache: Whether to use cached results (M2 fix)
 
         Returns:
             FingerprintResult with detected technologies
         """
+        # M2: Check cache first
+        if use_cache:
+            cached = self.get_cached(target)
+            if cached:
+                self._metrics["cache_hits"] = self._metrics.get("cache_hits", 0) + 1
+                return cached
+
         result = FingerprintResult(target=target)
 
         # Normalize URL
@@ -4621,17 +5808,51 @@ class TechFingerprinter:
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                verify=False,
+                verify=self._ssl_verify,  # H2: Configurable SSL verification
                 follow_redirects=follow_redirects,
             ) as client:
                 self._client = client
 
-                # Fetch main page
-                try:
-                    response = await client.get(target)
-                except httpx.HTTPError as e:
-                    logger.warning(f"[TechFingerprinter] HTTP error for {target}: {e}")
+                # H1: Acquire rate limiter before request
+                if self._rate_limiter:
+                    try:
+                        await self._rate_limiter.acquire()
+                    except Exception as e:
+                        logger.debug(f"[TechFingerprinter] Rate limiter error: {e}")
+
+                # H4: Fetch with retry mechanism
+                response = None
+                last_error = None
+
+                for attempt in range(self._max_retries):
+                    try:
+                        response = await client.get(target)
+                        break  # Success
+                    except (httpx.TimeoutException, httpx.ConnectError) as e:
+                        last_error = e
+                        self._metrics["retries_total"] += 1
+
+                        if attempt < self._max_retries - 1:
+                            delay = self.DEFAULT_RETRY_DELAYS[min(attempt, len(self.DEFAULT_RETRY_DELAYS) - 1)]
+                            logger.debug(f"[TechFingerprinter] Retry {attempt + 1}/{self._max_retries} after {delay}s: {e}")
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.warning(f"[TechFingerprinter] All {self._max_retries} retries failed for {target}: {e}")
+                    except httpx.HTTPError as e:
+                        # Non-retryable HTTP errors
+                        logger.warning(f"[TechFingerprinter] HTTP error for {target}: {e}")
+                        return result
+
+                if response is None:
+                    self._metrics["errors"] += 1
+                    self._metrics["errors_by_type"]["retry_exhausted"] = (
+                        self._metrics["errors_by_type"].get("retry_exhausted", 0) + 1
+                    )
                     return result
+
+                if last_error is not None:
+                    # Retry was successful
+                    self._metrics["retries_successful"] += 1
 
                 # Extract data for matching
                 headers = dict(response.headers)
@@ -4671,10 +5892,14 @@ class TechFingerprinter:
                 # Calculate attack surface score
                 result.attack_surface_score = self._calculate_attack_surface(detections)
 
-                # Detect WAF and CDN
+                # Detect WAF and CDN, collect bypass hints (M8)
                 for tech in result.technologies:
                     if tech.category == TechCategory.WAF and not result.waf_detected:
                         result.waf_detected = tech.name
+                        # M8: Collect bypass hints from signature
+                        sig = self.database.get_signature(tech.name)
+                        if sig and sig.bypass_hints:
+                            result.waf_bypass_hints.extend(sig.bypass_hints)
                     elif tech.category == TechCategory.CDN and not result.cdn_detected:
                         result.cdn_detected = tech.name
 
@@ -4690,10 +5915,54 @@ class TechFingerprinter:
                     result.total_cves += len(tech.cves)
                     result.critical_cves += len([c for c in tech.cves if c.severity == Severity.CRITICAL])
 
+                # H8: Update metrics
+                self._metrics["targets_fingerprinted"] += 1
+                self._metrics["technologies_detected"] += len(result.technologies)
+                self._metrics["cves_mapped"] += result.total_cves
+
+                for tech in result.technologies:
+                    # Track by category
+                    cat_name = tech.category.name
+                    self._metrics["by_category"][cat_name] = self._metrics["by_category"].get(cat_name, 0) + 1
+
+                    # Track by detection method
+                    for method in tech.detection_methods:
+                        method_name = method.name
+                        self._metrics["by_detection_method"][method_name] = (
+                            self._metrics["by_detection_method"].get(method_name, 0) + 1
+                        )
+
+                    # Track version extraction
+                    if tech.version:
+                        self._metrics["versions_extracted"] += 1
+
                 logger.info(f"[TechFingerprinter] Detected {len(result.technologies)} technologies")
 
+                # M2: Cache successful result
+                if use_cache and result.technologies:
+                    self._cache_result(target, result)
+
+        except httpx.TimeoutException as e:
+            # H3: Specific error classification
+            self._metrics["errors"] += 1
+            self._metrics["errors_by_type"]["timeout"] = self._metrics["errors_by_type"].get("timeout", 0) + 1
+            logger.warning(f"[TechFingerprinter] Timeout fingerprinting {target}: {e}")
+
+        except httpx.ConnectError as e:
+            self._metrics["errors"] += 1
+            self._metrics["errors_by_type"]["connection"] = self._metrics["errors_by_type"].get("connection", 0) + 1
+            logger.warning(f"[TechFingerprinter] Connection error for {target}: {e}")
+
+        except httpx.HTTPStatusError as e:
+            self._metrics["errors"] += 1
+            self._metrics["errors_by_type"]["http_status"] = self._metrics["errors_by_type"].get("http_status", 0) + 1
+            logger.warning(f"[TechFingerprinter] HTTP status error for {target}: {e.response.status_code}")
+
         except Exception as e:
-            logger.error(f"[TechFingerprinter] Error fingerprinting {target}: {e}")
+            # H3: Log full traceback for unexpected errors
+            self._metrics["errors"] += 1
+            self._metrics["errors_by_type"]["unexpected"] = self._metrics["errors_by_type"].get("unexpected", 0) + 1
+            logger.error(f"[TechFingerprinter] Error fingerprinting {target}: {e}", exc_info=True)
 
         return result
 
@@ -4912,21 +6181,128 @@ class TechFingerprinter:
         detected_version: str,
         affected_versions: List[str],
     ) -> bool:
-        """Check if detected version is in affected range."""
-        # Simplified version check
+        """
+        Check if detected version is in affected range.
+
+        Supports version specifiers:
+        - "<5.3.18" - Less than version
+        - "<=5.3.18" - Less than or equal
+        - ">5.0.0" - Greater than version
+        - ">=5.0.0" - Greater than or equal
+        - "5.3.x" - Wildcard match (5.3.0, 5.3.1, etc.)
+        - "5.3.18" - Exact match
+        - ">=4.0,<5.0" - Range (both conditions must be true)
+        """
+        if not detected_version or not affected_versions:
+            return False  # No version to check = not affected (safer than assuming True)
+
+        # Normalize detected version
+        detected_parts = self._parse_version(detected_version)
+        if not detected_parts:
+            return False  # Unparseable version = skip
+
         for affected in affected_versions:
-            if affected.startswith("<"):
-                # Less than check
-                pass  # Would need proper semver comparison
-            elif affected.startswith(">"):
-                # Greater than check
-                pass
+            # Handle range specifiers (e.g., ">=4.0,<5.0")
+            if "," in affected:
+                range_parts = affected.split(",")
+                all_match = True
+                for part in range_parts:
+                    if not self._check_version_constraint(detected_parts, part.strip()):
+                        all_match = False
+                        break
+                if all_match:
+                    return True
             else:
-                # Exact match
-                if detected_version.startswith(affected.replace("x", "")):
+                if self._check_version_constraint(detected_parts, affected):
                     return True
 
-        return True  # Conservative - assume affected if unclear
+        return False
+
+    def _parse_version(self, version_str: str) -> Optional[Tuple[int, ...]]:
+        """Parse version string into tuple of integers."""
+        # Remove common prefixes
+        version_str = version_str.lstrip("vV")
+
+        # Extract numeric version parts
+        match = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?', version_str)
+        if not match:
+            return None
+
+        parts = []
+        for group in match.groups():
+            if group is not None:
+                parts.append(int(group))
+            else:
+                parts.append(0)
+
+        return tuple(parts)
+
+    def _check_version_constraint(
+        self,
+        detected_parts: Tuple[int, ...],
+        constraint: str,
+    ) -> bool:
+        """Check single version constraint."""
+        constraint = constraint.strip()
+
+        # Extract operator and version
+        if constraint.startswith("<="):
+            op = "<="
+            version_str = constraint[2:].strip()
+        elif constraint.startswith(">="):
+            op = ">="
+            version_str = constraint[2:].strip()
+        elif constraint.startswith("<"):
+            op = "<"
+            version_str = constraint[1:].strip()
+        elif constraint.startswith(">"):
+            op = ">"
+            version_str = constraint[1:].strip()
+        else:
+            op = "=="
+            version_str = constraint
+
+        # Handle wildcard versions (e.g., "5.3.x", "5.x")
+        if "x" in version_str.lower():
+            # Wildcard match - check prefix
+            prefix = version_str.lower().split("x")[0].rstrip(".")
+            prefix_parts = self._parse_version(prefix)
+            if not prefix_parts:
+                return False
+
+            # Compare only the prefix parts
+            for i, part in enumerate(prefix_parts):
+                if part == 0 and i > 0:
+                    break
+                if i >= len(detected_parts):
+                    return False
+                if detected_parts[i] != part:
+                    return False
+            return True
+
+        # Parse constraint version
+        constraint_parts = self._parse_version(version_str)
+        if not constraint_parts:
+            return False
+
+        # Compare versions
+        # Pad to same length
+        max_len = max(len(detected_parts), len(constraint_parts))
+        detected_padded = detected_parts + (0,) * (max_len - len(detected_parts))
+        constraint_padded = constraint_parts + (0,) * (max_len - len(constraint_parts))
+
+        if op == "==":
+            return detected_padded == constraint_padded
+        elif op == "<":
+            return detected_padded < constraint_padded
+        elif op == "<=":
+            return detected_padded <= constraint_padded
+        elif op == ">":
+            return detected_padded > constraint_padded
+        elif op == ">=":
+            return detected_padded >= constraint_padded
+
+        return False
 
     def _check_security_headers(
         self,
@@ -4974,14 +6350,15 @@ class TechFingerprinter:
 # =============================================================================
 
 _fingerprinter_instance: Optional[TechFingerprinter] = None
-_fingerprinter_lock = asyncio.Lock()
+_fingerprinter_async_lock = asyncio.Lock()
+_fingerprinter_sync_lock = threading.Lock()
 
 
 async def get_tech_fingerprinter() -> TechFingerprinter:
     """Get singleton TechFingerprinter instance (async)."""
     global _fingerprinter_instance
 
-    async with _fingerprinter_lock:
+    async with _fingerprinter_async_lock:
         if _fingerprinter_instance is None:
             _fingerprinter_instance = TechFingerprinter()
             logger.debug(f"[TechFingerprinter] Instance created with {len(_fingerprinter_instance.database.signatures)} signatures")
@@ -4990,14 +6367,15 @@ async def get_tech_fingerprinter() -> TechFingerprinter:
 
 
 def get_tech_fingerprinter_sync() -> TechFingerprinter:
-    """Get TechFingerprinter instance (sync)."""
+    """Get TechFingerprinter instance (sync, thread-safe)."""
     global _fingerprinter_instance
 
-    if _fingerprinter_instance is None:
-        _fingerprinter_instance = TechFingerprinter()
-        logger.debug(f"[TechFingerprinter] Instance created with {len(_fingerprinter_instance.database.signatures)} signatures")
+    with _fingerprinter_sync_lock:
+        if _fingerprinter_instance is None:
+            _fingerprinter_instance = TechFingerprinter()
+            logger.debug(f"[TechFingerprinter] Instance created with {len(_fingerprinter_instance.database.signatures)} signatures")
 
-    return _fingerprinter_instance
+        return _fingerprinter_instance
 
 
 def get_signature_count() -> int:

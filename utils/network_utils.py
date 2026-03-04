@@ -24,6 +24,36 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Local network prefixes for protocol detection
+_LOCAL_PREFIXES = ("localhost", "127.", "192.168.", "10.", "172.16.", "172.17.",
+                   "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.",
+                   "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+                   "172.30.", "172.31.", "[::1]", "0.0.0.0")
+
+
+def resolve_base_url(host: str) -> str:
+    """
+    Resolve a host to a full base URL with appropriate protocol.
+
+    Uses http:// for localhost/local IPs, https:// for external hosts.
+    If the host already has a protocol, returns it as-is.
+
+    Args:
+        host: Hostname, IP, or full URL
+
+    Returns:
+        Full URL with protocol (e.g., "https://example.com")
+    """
+    if host.startswith(("http://", "https://")):
+        return host.rstrip("/")
+
+    # Check if it's a local address
+    host_lower = host.lower()
+    is_local = any(host_lower.startswith(p) for p in _LOCAL_PREFIXES)
+
+    protocol = "http://" if is_local else "https://"
+    return f"{protocol}{host}".rstrip("/")
+
 
 class NetworkError(Exception):
     """Network-related error."""
@@ -96,7 +126,7 @@ async def async_request(
         raise TimeoutError(f"Request timed out: {url}")
     except httpx.ConnectError as e:
         raise ConnectionError(f"Connection failed: {url} - {e}")
-    except Exception as e:
+    except httpx.RequestError as e:
         raise NetworkError(f"Request failed: {url} - {e}")
 
 
@@ -182,7 +212,7 @@ async def resolve_domain(
     except socket.gaierror as e:
         logger.debug(f"DNS resolution failed for {domain}: {e}")
         return []
-    except Exception as e:
+    except (socket.herror, OSError) as e:
         logger.error(f"DNS resolution error for {domain}: {e}")
         return []
 
@@ -210,7 +240,7 @@ async def reverse_dns(ip: str, timeout: float = 10.0) -> str | None:
     except asyncio.TimeoutError:
         logger.debug(f"Reverse DNS timeout for {ip}")
         return None
-    except Exception:
+    except (socket.herror, socket.gaierror, OSError):
         return None
 
 
@@ -238,7 +268,7 @@ async def check_port(
         writer.close()
         await writer.wait_closed()
         return True
-    except Exception:
+    except (asyncio.TimeoutError, OSError, ConnectionRefusedError):
         return False
 
 
@@ -284,8 +314,8 @@ async def grab_banner(
         finally:
             writer.close()
             await writer.wait_closed()
-            
-    except Exception:
+
+    except (asyncio.TimeoutError, OSError, ConnectionRefusedError):
         return None
 
 
@@ -375,7 +405,7 @@ def is_same_domain(url1: str, url2: str) -> bool:
         host1 = urlparse(url1).netloc.lower().split(":")[0]
         host2 = urlparse(url2).netloc.lower().split(":")[0]
         return host1 == host2
-    except Exception:
+    except (ValueError, AttributeError):
         return False
 
 

@@ -17,23 +17,16 @@ Date: Janeiro 2026
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import urljoin, urlparse, urlunparse
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import httpx
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 if TYPE_CHECKING:
-    from core.config_manager import Settings
+    pass
 
 from utils.logger import get_logger
 

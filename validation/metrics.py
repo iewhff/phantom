@@ -311,7 +311,7 @@ class MetricsCollector:
         scan = next((s for s in self.scan_history if s.scan_id == scan_id), None)
         if not scan:
             logger.warning(f"Scan {scan_id} not found")
-            return
+            return None
         
         # This would update the finding status
         scan.validated_findings += 1

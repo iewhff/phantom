@@ -121,7 +121,7 @@ COMMON_API_ENDPOINTS = [
     "/redoc",
 ]
 
-# Patterns that indicate SPA frameworks
+# Patterns that indicate SPA frameworks and dynamic JavaScript apps
 SPA_INDICATORS = {
     "angular": [
         r'ng-app',
@@ -162,6 +162,30 @@ SPA_INDICATORS = {
         r'__NUXT__',
         r'nuxt\.js',
     ],
+    # JavaScript module loaders (dynamic content loading)
+    "requirejs": [
+        r'require\.min\.js',
+        r'require\.js',
+        r'data-main=',
+        r'requirejs\.config',
+        r'define\s*\(\s*\[',
+    ],
+    "backbone": [
+        r'backbone\.js',
+        r'backbone\.min\.js',
+        r'Backbone\.View',
+        r'Backbone\.Model',
+    ],
+    "ember": [
+        r'ember\.js',
+        r'ember-cli',
+        r'Ember\.Application',
+    ],
+    "knockout": [
+        r'knockout\.js',
+        r'ko\.observable',
+        r'data-bind=',
+    ],
 }
 
 
@@ -198,19 +222,25 @@ class SPAAwareCrawler:
         max_depth: int = 5,
         max_pages: int = 200,
         probe_api: bool = True,
+        auth_cookies: dict[str, str] | None = None,
+        auth_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
-        Crawl target with SPA awareness.
+        Crawl target with SPA awareness and optional authentication.
 
         Args:
             target: Target URL
             max_depth: Max crawl depth
             max_pages: Max pages to discover
             probe_api: Whether to probe common API endpoints
+            auth_cookies: Cookies from AuthContext for authenticated crawling
+            auth_headers: Headers from AuthContext for API probing
 
         Returns:
             Dict with discovered URLs, endpoints, forms, etc.
         """
+        self._auth_cookies = auth_cookies
+        self._auth_headers = auth_headers or {}
         start_url = target if target.startswith(('http://', 'https://')) else f"https://{target}"
 
         result = {
@@ -226,8 +256,28 @@ class SPAAwareCrawler:
 
         logger.info(f"Starting SPA-aware crawl of {start_url}")
 
-        # Step 1: Fetch main page and detect SPA
-        spa_info = await self._detect_spa(start_url)
+        # Step 1: Detect SPA - try base URL first, then authenticated URLs if auth available
+        spa_info = await self._detect_spa(start_url, auth_cookies=auth_cookies)
+        effective_start_url = start_url  # URL to actually start crawling from
+
+        # If not detected as SPA and we have auth, try common authenticated landing pages
+        # (some apps only load JavaScript frameworks AFTER login)
+        if not spa_info["is_spa"] and auth_cookies:
+            parsed = urlparse(start_url)
+            auth_urls_to_try = [
+                f"{parsed.scheme}://{parsed.netloc}{parsed.path}/start.mvc",  # Spring MVC
+                f"{parsed.scheme}://{parsed.netloc}{parsed.path}/home",
+                f"{parsed.scheme}://{parsed.netloc}{parsed.path}/dashboard",
+                f"{parsed.scheme}://{parsed.netloc}{parsed.path}/app",
+            ]
+            for auth_url in auth_urls_to_try:
+                spa_info = await self._detect_spa(auth_url, auth_cookies=auth_cookies)
+                if spa_info["is_spa"]:
+                    logger.info(f"SPA detected on authenticated page: {auth_url}")
+                    # Use the authenticated URL for crawling instead of login page
+                    effective_start_url = auth_url
+                    break
+
         result["is_spa"] = spa_info["is_spa"]
         result["spa_framework"] = spa_info["framework"]
 
@@ -237,8 +287,8 @@ class SPAAwareCrawler:
 
         # Step 2: Choose crawling strategy
         if spa_info["is_spa"] and self._headless_available:
-            # Use headless browser for SPA
-            spa_urls = await self._crawl_with_headless(start_url, max_pages)
+            # Use headless browser for SPA (start from authenticated URL if available)
+            spa_urls = await self._crawl_with_headless(effective_start_url, max_pages)
             result["urls"].extend(spa_urls)
         else:
             # Use basic crawler
@@ -271,7 +321,7 @@ class SPAAwareCrawler:
 
         return result
 
-    async def _detect_spa(self, url: str) -> dict[str, Any]:
+    async def _detect_spa(self, url: str, auth_cookies: dict[str, str] | None = None) -> dict[str, Any]:
         """Detect if target is a SPA and identify framework."""
         result = {"is_spa": False, "framework": None, "content": ""}
 
@@ -279,7 +329,9 @@ class SPAAwareCrawler:
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 headers = {"User-Agent": self.user_agent}
-                async with session.get(url, headers=headers, ssl=False) as resp:
+                # Use auth cookies if provided (essential for apps that require auth)
+                cookies = auth_cookies if auth_cookies else None
+                async with session.get(url, headers=headers, cookies=cookies, ssl=False) as resp:
                     content = await resp.text()
                     result["content"] = content
 
@@ -312,20 +364,29 @@ class SPAAwareCrawler:
         return result
 
     async def _crawl_with_headless(self, url: str, max_pages: int) -> list[str]:
-        """Crawl using headless browser for JavaScript rendering."""
+        """Crawl using headless browser for JavaScript rendering with auth support."""
         urls = []
 
         try:
             from utils.headless_browser import HeadlessBrowser
 
             async with HeadlessBrowser() as browser:
-                spa_results = await browser.crawl_spa(url, max_pages=max_pages)
+                # Pass auth cookies to enable authenticated SPA crawling
+                spa_results = await browser.crawl_spa(
+                    url,
+                    max_pages=max_pages,
+                    auth_cookies=self._auth_cookies,
+                )
 
                 for page_info in spa_results:
                     if isinstance(page_info, dict):
                         urls.append(page_info.get("url", ""))
                         # Extract links from page
                         urls.extend(page_info.get("links", []))
+                        # Also collect discovered API calls
+                        for api_call in page_info.get("api_calls", []):
+                            if api_call.get("url"):
+                                urls.append(api_call["url"])
                     elif isinstance(page_info, str):
                         urls.append(page_info)
 
@@ -381,7 +442,7 @@ class SPAAwareCrawler:
         base: str,
         endpoint: str,
     ) -> bool:
-        """Check if an API endpoint exists."""
+        """Check if an API endpoint exists (with auth if available)."""
         url = urljoin(base, endpoint)
 
         try:
@@ -389,6 +450,10 @@ class SPAAwareCrawler:
                 "User-Agent": self.user_agent,
                 "Accept": "application/json, text/plain, */*",
             }
+
+            # Add auth headers if available — enables authenticated API probing
+            if hasattr(self, '_auth_headers') and self._auth_headers:
+                headers.update(self._auth_headers)
 
             async with session.get(url, headers=headers, allow_redirects=False) as resp:
                 # Consider endpoint valid if:
@@ -404,30 +469,59 @@ class SPAAwareCrawler:
                     return True
 
         except Exception:
-            pass
+            pass  # FIX 2026-02-12: Expected error
 
         return False
 
     def _extract_parameters(self, url: str) -> set[str]:
         """Extract parameter names from URL."""
+        from urllib.parse import unquote, parse_qs
+        import re
+
         params = set()
         parsed = urlparse(url)
 
         if parsed.query:
-            # Extract parameter names from query string
-            for param in parsed.query.split("&"):
-                if "=" in param:
-                    name = param.split("=")[0]
-                    params.add(name)
+            # Use parse_qs for proper URL decoding and multi-value handling
+            try:
+                query_params = parse_qs(parsed.query, keep_blank_values=True)
+                for name in query_params.keys():
+                    # URL-decode the parameter name
+                    decoded_name = unquote(name)
+                    params.add(decoded_name)
+            except Exception:
+                # Fallback to manual parsing if parse_qs fails
+                for param in parsed.query.split("&"):
+                    if "=" in param:
+                        name = unquote(param.split("=")[0])
+                        params.add(name)
 
-        # Also extract path parameters (e.g., /api/users/123)
-        path_parts = parsed.path.split("/")
+        # Extract path parameters with improved heuristics
+        path_parts = [p for p in parsed.path.split("/") if p]
         for i, part in enumerate(path_parts):
-            # Check if part looks like an ID
-            if part.isdigit() or (len(part) > 20 and all(c.isalnum() or c in '-_' for c in part)):
-                # The previous part is likely the resource name
-                if i > 0 and path_parts[i-1]:
-                    params.add(f"path:{path_parts[i-1]}_id")
+            is_dynamic = False
+
+            # Check if part looks like an ID (multiple patterns)
+            if part.isdigit():
+                # Pure numeric ID (e.g., /users/123)
+                is_dynamic = True
+            elif re.match(r'^[0-9a-f]{8,}(-[0-9a-f]{4,})*$', part.lower()):
+                # UUID-like pattern (e.g., /items/550e8400-e29b-41d4-a716-446655440000)
+                is_dynamic = True
+            elif re.match(r'^[a-z0-9]{20,}$', part.lower()):
+                # Long alphanumeric (MongoDB ObjectId, etc.)
+                is_dynamic = True
+            elif re.match(r'^\d+[-_]\w+|\w+[-_]\d+$', part):
+                # Mixed ID-slug pattern (e.g., /posts/123-my-post-title)
+                is_dynamic = True
+
+            if is_dynamic and i > 0:
+                # The previous part is the resource name
+                resource = path_parts[i-1]
+                # Singularize common patterns
+                if resource.endswith("s") and len(resource) > 3:
+                    resource = resource[:-1]  # users -> user
+                params.add(f"path:{resource}_id")
 
         return params
 

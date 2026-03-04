@@ -49,6 +49,16 @@ class RateLimitConfig(BaseModel):
     })
 
 
+class PhaseTimeoutsConfig(BaseModel):
+    """Per-phase timeout configuration (L9 fix)."""
+    discovery: int = Field(default=300, ge=30)
+    auth_acquisition: int = Field(default=180, ge=30)
+    module_execution: int = Field(default=7200, ge=60)
+    proof_engine: int = Field(default=600, ge=30)
+    chain_analysis: int = Field(default=300, ge=30)
+    validation: int = Field(default=300, ge=30)
+
+
 class TimeoutsConfig(BaseModel):
     """Timeout configuration."""
 
@@ -64,6 +74,8 @@ class TimeoutsConfig(BaseModel):
     # Per-module timeouts (configurable via settings.yaml)
     module_heavy: int = Field(default=900, ge=60)   # 15 min for sqli, xss, nosql, etc.
     module_normal: int = Field(default=600, ge=60)  # 10 min for normal modules
+    # L9 fix: Per-phase timeouts
+    phase_timeouts: PhaseTimeoutsConfig = Field(default_factory=PhaseTimeoutsConfig)
 
 
 class StorageConfig(BaseModel):
@@ -543,9 +555,7 @@ class BugBountyConfig(BaseModel):
 
         # Log enforcement actions (imports are at module level, but we avoid logging import here)
         if any([enforced_ssrf, enforced_killswitch, enforced_dos, enforced_scope]):
-            # Note: We can't use structlog here due to circular imports
-            # The enforcement message will be logged when settings are loaded
-            pass
+            pass  # Note: Can't log here (circular imports), logged when settings loaded
 
 
 # =============================================================================
@@ -648,7 +658,9 @@ class QualityAssuranceConfig(BaseModel):
     """Quality assurance configuration."""
     verify_findings: bool = True
     retest_attempts: int = Field(default=3, ge=1)
-    manual_verification_required: bool = True
+    # Changed default to False: PHANTOM now has automatic verification
+    # via ProofEngine, state mutation verification, and baseline comparison
+    manual_verification_required: bool = False
     peer_review: PeerReviewConfig = Field(default_factory=PeerReviewConfig)
     fp_tracking: FPTrackingConfig = Field(default_factory=FPTrackingConfig)
 
@@ -672,6 +684,132 @@ class ProjectConfig(BaseModel):
     name: str = "AI-Pentest Framework"
     version: str = "2.0.0"
     environment: str = "production"
+
+
+# =============================================================================
+# SCANNER LIMITS CONFIGURATION
+# =============================================================================
+
+class IDORLimitsConfig(BaseModel):
+    """IDOR/Access control testing limits."""
+    max_ids_per_endpoint: int = Field(default=10, ge=1)
+    max_id_variations: int = Field(default=5, ge=1)
+    max_horizontal_ids: int = Field(default=5, ge=1)
+    max_vertical_ids: int = Field(default=3, ge=1)
+
+
+class BusinessLogicLimitsConfig(BaseModel):
+    """Business logic testing limits."""
+    max_negative_payloads: int = Field(default=14, ge=1)
+    max_boundary_tests: int = Field(default=10, ge=1)
+    max_flow_variations: int = Field(default=5, ge=1)
+
+
+class InjectionLimitsConfig(BaseModel):
+    """Injection testing limits."""
+    max_payloads_per_param: int = Field(default=50, ge=1)
+    max_extraction_attempts: int = Field(default=20, ge=1)
+    max_tamper_variations: int = Field(default=10, ge=1)
+
+
+class LFILimitsConfig(BaseModel):
+    """LFI/Path traversal limits."""
+    max_traversal_depth: int = Field(default=10, ge=1)
+    max_wrapper_tests: int = Field(default=8, ge=1)
+    max_encoding_variations: int = Field(default=6, ge=1)
+
+
+class RaceConditionLimitsConfig(BaseModel):
+    """Race condition testing limits."""
+    concurrent_requests: int = Field(default=10, ge=2)
+    max_race_attempts: int = Field(default=5, ge=1)
+    timing_window_ms: int = Field(default=100, ge=10)
+
+
+class AuthLimitsConfig(BaseModel):
+    """Authentication testing limits."""
+    max_login_attempts: int = Field(default=10, ge=1)
+    max_token_variations: int = Field(default=20, ge=1)
+    max_bypass_techniques: int = Field(default=15, ge=1)
+
+
+class DiscoveryLimitsConfig(BaseModel):
+    """Discovery/enumeration limits."""
+    max_hidden_paths: int = Field(default=100, ge=1)
+    max_endpoints_per_phase: int = Field(default=500, ge=1)
+    max_parameters_per_endpoint: int = Field(default=50, ge=1)
+
+
+class ProofEngineModeConfig(BaseModel):
+    """Single proof engine mode configuration."""
+    max_requests: int = Field(default=0, ge=0)
+    allow_write: bool = False
+    allow_auth: bool = False
+
+
+class ProofEngineLimitsConfig(BaseModel):
+    """Proof engine budget limits by safety mode."""
+    safe: ProofEngineModeConfig = Field(
+        default_factory=lambda: ProofEngineModeConfig(max_requests=0, allow_write=False, allow_auth=False)
+    )
+    cautious: ProofEngineModeConfig = Field(
+        default_factory=lambda: ProofEngineModeConfig(max_requests=5, allow_write=False, allow_auth=False)
+    )
+    standard: ProofEngineModeConfig = Field(
+        default_factory=lambda: ProofEngineModeConfig(max_requests=15, allow_write=False, allow_auth=True)
+    )
+    aggressive: ProofEngineModeConfig = Field(
+        default_factory=lambda: ProofEngineModeConfig(max_requests=50, allow_write=True, allow_auth=True)
+    )
+
+
+class AmplificationLimitsConfig(BaseModel):
+    """Amplification engine limits."""
+    max_actions_per_finding: int = Field(default=10, ge=1)
+    max_total_actions: int = Field(default=50, ge=1)
+    max_depth: int = Field(default=3, ge=1)
+
+
+class ChainLimitsConfig(BaseModel):
+    """Chain analysis limits."""
+    max_chain_length: int = Field(default=5, ge=2)
+    max_chains_per_finding: int = Field(default=10, ge=1)
+    min_confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class ValidationLimitsConfig(BaseModel):
+    """Validation pipeline limits."""
+    max_replay_attempts: int = Field(default=3, ge=1)
+    max_negative_control_tests: int = Field(default=2, ge=1)
+    timeout_per_test_ms: int = Field(default=5000, ge=100)
+
+
+class ConcurrencyLimitsConfig(BaseModel):
+    """General concurrency limits."""
+    max_parallel_modules: int = Field(default=10, ge=1)
+    max_requests_per_module: int = Field(default=1000, ge=1)
+    max_findings_per_module: int = Field(default=500, ge=1)
+
+
+class ScannerLimitsConfig(BaseModel):
+    """
+    Scanner limits configuration.
+
+    Centralizes all hardcoded limits from scanner modules.
+    Adjust based on target size, time budget, and thoroughness.
+    """
+    idor: IDORLimitsConfig = Field(default_factory=IDORLimitsConfig)
+    business_logic: BusinessLogicLimitsConfig = Field(default_factory=BusinessLogicLimitsConfig)
+    injection: InjectionLimitsConfig = Field(default_factory=InjectionLimitsConfig)
+    lfi: LFILimitsConfig = Field(default_factory=LFILimitsConfig)
+    race_condition: RaceConditionLimitsConfig = Field(default_factory=RaceConditionLimitsConfig)
+    auth: AuthLimitsConfig = Field(default_factory=AuthLimitsConfig)
+    discovery: DiscoveryLimitsConfig = Field(default_factory=DiscoveryLimitsConfig)
+    proof_engine: ProofEngineLimitsConfig = Field(default_factory=ProofEngineLimitsConfig)
+    amplification: AmplificationLimitsConfig = Field(default_factory=AmplificationLimitsConfig)
+    chains: ChainLimitsConfig = Field(default_factory=ChainLimitsConfig)
+    validation: ValidationLimitsConfig = Field(default_factory=ValidationLimitsConfig)
+    concurrency: ConcurrencyLimitsConfig = Field(default_factory=ConcurrencyLimitsConfig)
 
 
 # =============================================================================
@@ -763,6 +901,58 @@ class GDPRConfig(BaseModel):
     legal_basis: GDPRLegalBasisConfig = Field(default_factory=GDPRLegalBasisConfig)
 
 
+# =============================================================================
+# L1-L3 Fix: Scan Execution Configuration
+# =============================================================================
+
+class JitterConfig(BaseModel):
+    """Jitter configuration for module execution timing."""
+    min: float = Field(default=0.1, ge=0.0)
+    max: float = Field(default=0.5, ge=0.0)
+    gaussian_sigma: float = Field(default=0.2, ge=0.0)
+
+
+class CircuitBreakerConfig(BaseModel):
+    """Circuit breaker configuration for rate limiting protection."""
+    max_consecutive_blocks: int = Field(default=3, ge=1)
+    pause_duration: int = Field(default=30, ge=1)
+    max_backoff_multiplier: int = Field(default=8, ge=1)
+    reset_on_success: bool = True
+
+
+class ScanConcurrencyConfig(BaseModel):
+    """Module concurrency configuration."""
+    default: int = Field(default=5, ge=1)
+    waf_reduction: int = Field(default=2, ge=1)
+
+
+class ScanExecutionConfig(BaseModel):
+    """Scan execution parameters (L1-L3 fix)."""
+    jitter: JitterConfig = Field(default_factory=JitterConfig)
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    concurrency: ScanConcurrencyConfig = Field(default_factory=ScanConcurrencyConfig)
+
+
+# =============================================================================
+# L10 Fix: Module Categories Configuration
+# =============================================================================
+
+class ModuleCategoriesConfig(BaseModel):
+    """
+    Configurable module categories (L10 fix).
+
+    Allows defining custom module presets in settings.yaml that override
+    the hardcoded CATEGORIES in full_scanner.py.
+    """
+    # Custom categories - all optional
+    custom: list[str] = Field(default_factory=list)
+    fast_api: list[str] = Field(default_factory=list)
+    legacy_web: list[str] = Field(default_factory=list)
+
+    class Config:
+        extra = "allow"  # Allow arbitrary category names
+
+
 class Settings(BaseSettings):
     """
     Main settings class that loads and validates all configuration.
@@ -779,6 +969,7 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     reconnaissance: ReconnaissanceConfig = Field(default_factory=ReconnaissanceConfig)
     scanning: ScanningConfig = Field(default_factory=ScanningConfig)
+    scanner_limits: ScannerLimitsConfig = Field(default_factory=ScannerLimitsConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -794,6 +985,28 @@ class Settings(BaseSettings):
     quality_assurance: QualityAssuranceConfig = Field(default_factory=QualityAssuranceConfig)
     compliance: ComplianceConfig = Field(default_factory=ComplianceConfig)
     gdpr: GDPRConfig = Field(default_factory=GDPRConfig)
+
+    # L1-L3 Fix: Scan execution parameters (jitter, circuit breaker, concurrency)
+    scan_execution: ScanExecutionConfig | None = Field(default_factory=ScanExecutionConfig)
+
+    # L10 Fix: Configurable module categories
+    module_categories: ModuleCategoriesConfig | None = Field(default_factory=ModuleCategoriesConfig)
+
+    @field_validator('scan_execution', mode='before')
+    @classmethod
+    def validate_scan_execution(cls, v):
+        """Convert None to default config."""
+        if v is None:
+            return ScanExecutionConfig()
+        return v
+
+    @field_validator('module_categories', mode='before')
+    @classmethod
+    def validate_module_categories(cls, v):
+        """Convert None to default config."""
+        if v is None:
+            return ModuleCategoriesConfig()
+        return v
 
     class Config:
         env_prefix = "PENTEST_"
@@ -873,6 +1086,62 @@ def get_settings(config_path: str = "config/settings.yaml") -> Settings:
         Settings instance
     """
     return Settings.from_yaml(config_path)
+
+
+def get_scanner_limits(config_path: str = "config/settings.yaml") -> ScannerLimitsConfig:
+    """
+    Get scanner limits configuration.
+
+    Convenience function for scanner modules to access limits.
+
+    Args:
+        config_path: Path to configuration file
+
+    Returns:
+        ScannerLimitsConfig instance
+    """
+    return get_settings(config_path).scanner_limits
+
+
+def get_limit(category: str, limit_name: str, default: int | float = 10) -> int | float:
+    """
+    Get a specific scanner limit by category and name.
+
+    Convenience function for quick limit lookups.
+
+    Args:
+        category: Limit category (e.g., "idor", "business_logic", "proof_engine")
+        limit_name: Specific limit name (e.g., "max_ids_per_endpoint")
+        default: Default value if limit not found
+
+    Returns:
+        The configured limit value or default
+
+    Examples:
+        >>> get_limit("idor", "max_ids_per_endpoint")
+        10
+        >>> get_limit("proof_engine", "aggressive.max_requests")
+        50
+    """
+    try:
+        limits = get_scanner_limits()
+        category_config = getattr(limits, category, None)
+        if category_config is None:
+            return default
+
+        # Handle nested access (e.g., "aggressive.max_requests")
+        if "." in limit_name:
+            parts = limit_name.split(".")
+            value = category_config
+            for part in parts:
+                value = getattr(value, part, None)
+                if value is None:
+                    return default
+            return value
+
+        return getattr(category_config, limit_name, default)
+    except Exception:
+        return default
 
 
 def validate_configuration(settings: Settings) -> tuple[bool, list[str], list[str]]:

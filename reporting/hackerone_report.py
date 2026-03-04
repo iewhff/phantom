@@ -621,10 +621,10 @@ def convert_finding_to_report(
         # Extract details
         title = finding.get("title", f"{vuln_type.value} in {finding.get('url', 'Unknown')}")
         target = finding.get("target", "")
-        endpoint = finding.get("url", finding.get("endpoint", ""))
+        endpoint = finding.get("endpoint", finding.get("url", finding.get("matched_at", "")))
         description = finding.get("description", "")
         impact = finding.get("impact", "Security impact pending assessment.")
-        confidence = finding.get("confidence", 70.0)
+        confidence = finding.get("confidence_score", finding.get("confidence", 70.0))
 
         # Build steps from evidence
         steps = []

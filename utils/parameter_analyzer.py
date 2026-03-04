@@ -17,10 +17,9 @@ Princípio: id=1 → NÃO METAS <script>!
 import re
 import json
 import math
-import hashlib
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Optional, List, Dict, Set, Any, Tuple, Union
+from enum import Enum
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse, parse_qs, unquote
 from collections import Counter
 

@@ -29,16 +29,17 @@ from __future__ import annotations
 
 import re
 import json
-import asyncio
-from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlparse, parse_qs
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -130,9 +131,15 @@ class CommunicationsAPIScanner(ScanModule):
 
     name = "communications_api_scanner"
 
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.discovered_endpoints: list[CommunicationsEndpoint] = []
 
     async def scan(
@@ -142,6 +149,11 @@ class CommunicationsAPIScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Main scan entry point."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
 
         base_url = f"https://{host}" if not host.startswith("http") else host
@@ -302,16 +314,16 @@ class CommunicationsAPIScanner(ScanModule):
                     if enumeration_detected and r1["status"] not in [401, 403]:
                         findings.append(Finding(
                             name="Phone Number Enumeration",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description=(
                                 "API endpoint reveals phone number registration status. "
                                 "This is similar to CVE-2024-39891 which affected Twilio Authy "
                                 "and led to enumeration of 33M phone numbers."
                             ),
-                            matched_at=url,
+                            endpoint=url,
                             evidence=evidence,
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=7.5,
                             remediation=(
                                 "Return identical responses regardless of phone status. "
@@ -380,19 +392,19 @@ class CommunicationsAPIScanner(ScanModule):
                                (cred_type == "api_key" and match.startswith("SK")):
                                 findings.append(Finding(
                                     name=f"Twilio {cred_type.replace('_', ' ').title()} Exposure",
-                                    severity="CRITICAL",
-                                    confidence="HIGH",
+                                    severity=Severity.CRITICAL,
+                                    confidence_score=85.0,
                                     description=(
                                         f"Twilio {cred_type} found in API response. "
                                         "This credential can be used to access the Twilio account, "
                                         "send SMS/calls, and potentially incur toll fraud charges."
                                     ),
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Found: {match[:8]}...{match[-4:]}",
                                         f"Endpoint: {endpoint}",
                                     ],
-                                    cwe="CWE-798",
+                                    cwe_id="CWE-798",
                                     cvss_score=9.8,
                                     remediation=(
                                         "Remove credentials from responses immediately. "
@@ -406,17 +418,17 @@ class CommunicationsAPIScanner(ScanModule):
                 for match in SENDGRID_PATTERNS["api_key"].findall(content):
                     findings.append(Finding(
                         name="SendGrid API Key Exposure",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=(
                             "SendGrid API key found in response. "
                             "This can be used to send emails as the account owner."
                         ),
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"Found: SG.{match[3:10]}...{match[-4:]}",
                         ],
-                        cwe="CWE-798",
+                        cwe_id="CWE-798",
                         cvss_score=9.1,
                         remediation="Rotate API key immediately. Remove from response.",
                     ))
@@ -469,20 +481,20 @@ class CommunicationsAPIScanner(ScanModule):
                     if get_response.status_code == 200:
                         findings.append(Finding(
                             name="Unprotected SMS/Voice API Endpoint",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description=(
                                 "SMS/Voice API endpoint accessible without authentication. "
                                 "This could enable SMS pumping (IRSF) attacks causing "
                                 "significant financial damage via premium rate fraud."
                             ),
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Status: {get_response.status_code}",
                                 f"Endpoint: {endpoint}",
                                 "No authentication required",
                             ],
-                            cwe="CWE-287",
+                            cwe_id="CWE-287",
                             cvss_score=8.6,
                             remediation=(
                                 "Require authentication for all SMS/Voice endpoints. "
@@ -496,18 +508,18 @@ class CommunicationsAPIScanner(ScanModule):
                             # Endpoint returns parameter hints - exists but may need params
                             findings.append(Finding(
                                 name="SMS/Voice Endpoint Parameter Exposure",
-                                severity="MEDIUM",
-                                confidence="MEDIUM",
+                                severity=Severity.MEDIUM,
+                                confidence_score=65.0,
                                 description=(
                                     "SMS/Voice endpoint reveals parameter information. "
                                     "This aids in understanding the API structure for abuse."
                                 ),
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Status: {get_response.status_code}",
                                     "Parameter hints in response",
                                 ],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=5.3,
                                 remediation="Return generic error messages.",
                             ))
@@ -584,19 +596,19 @@ class CommunicationsAPIScanner(ScanModule):
                             if indicator in content:
                                 findings.append(Finding(
                                     name="Authentication Bypass via Null Injection",
-                                    severity="CRITICAL",
-                                    confidence="HIGH",
+                                    severity=Severity.CRITICAL,
+                                    confidence_score=85.0,
                                     description=(
                                         "Authentication bypassed using null/empty value injection. "
                                         "This is similar to CVE-2020-24655 which affected Authy."
                                     ),
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Payload: {json.dumps(payload)}",
                                         f"Status: {response.status_code}",
                                         f"Success indicator: '{indicator}'",
                                     ],
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     cvss_score=9.8,
                                     remediation=(
                                         "Validate all authentication inputs. "
@@ -673,20 +685,20 @@ class CommunicationsAPIScanner(ScanModule):
                 if not rate_limited and success_count >= 8:
                     findings.append(Finding(
                         name="Missing Rate Limit on Verification Endpoint",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=(
                             "Verification endpoint lacks rate limiting, enabling "
                             "SMS pumping attacks and potential toll fraud. "
                             "Attackers can trigger mass SMS delivery to premium numbers."
                         ),
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"{success_count} requests without throttling",
                             "SMS pumping (IRSF) attack possible",
                             "Twilio Fraud Guard saved $62.7M from such attacks",
                         ],
-                        cwe="CWE-770",
+                        cwe_id="CWE-770",
                         cvss_score=7.5,
                         remediation=(
                             "Implement strict rate limiting per IP and phone number. "
@@ -742,18 +754,18 @@ class CommunicationsAPIScanner(ScanModule):
 
                         findings.append(Finding(
                             name="API Documentation Exposure",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description=(
                                 "API documentation publicly accessible, revealing "
                                 "internal endpoint structure and parameters."
                             ),
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Documentation type: {'OpenAPI' if 'openapi' in content else 'Swagger'}",
                                 f"Endpoints exposed: {len(paths_match)}",
                             ],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=5.3,
                             remediation="Restrict API documentation to authenticated users.",
                         ))
@@ -772,18 +784,18 @@ class CommunicationsAPIScanner(ScanModule):
                         if gql_response.status_code == 200 and "__schema" in gql_response.text:
                             findings.append(Finding(
                                 name="GraphQL Introspection Enabled",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description=(
                                     "GraphQL introspection is enabled, allowing "
                                     "full schema discovery including hidden mutations."
                                 ),
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "Introspection query successful",
                                     "Full schema exposed",
                                 ],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=5.3,
                                 remediation="Disable introspection in production.",
                             ))

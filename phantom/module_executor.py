@@ -20,16 +20,13 @@ Version: 3.0.0
 import asyncio
 import logging
 import time
-import hashlib
-from enum import Enum, auto
+from enum import Enum
 from dataclasses import dataclass, field
 from typing import (
-    Dict, List, Optional, Set, Any, Callable, TypeVar,
-    Coroutine, Union, Type
+    Dict, List, Optional, Set, Any, Callable, Type
 )
 from collections import defaultdict
 from abc import ABC, abstractmethod
-import traceback
 
 logger = logging.getLogger("phantom.module_executor")
 
@@ -706,8 +703,8 @@ class ModuleExecutor:
                 if self.config.progress_callback:
                     try:
                         self.config.progress_callback(self._progress)
-                    except Exception:
-                        pass
+                    except (TypeError, ValueError) as e:
+                        logger.debug(f"Progress callback error: {e}")
 
                 # Execute with retries
                 result = await self._execute_with_retry(

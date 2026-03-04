@@ -40,18 +40,19 @@ from __future__ import annotations
 import secrets
 import time
 import asyncio
-import re
-import ipaddress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urljoin, urlparse, quote
 from enum import Enum
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -294,7 +295,7 @@ class DNSRebindingScanner(ScanModule):
             path="/latest/meta-data/",
             indicators=["ami-id", "instance-id", "instance-type", "local-ipv4", "public-keys"],
             description="AWS EC2 Instance Metadata Service (IMDS)",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.AWS_METADATA,
@@ -303,7 +304,7 @@ class DNSRebindingScanner(ScanModule):
             path="/latest/meta-data/iam/security-credentials/",
             indicators=["AccessKeyId", "SecretAccessKey", "Token"],
             description="AWS IAM Role Credentials",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.GCP_METADATA,
@@ -312,7 +313,7 @@ class DNSRebindingScanner(ScanModule):
             path="/computeMetadata/v1/",
             indicators=["project-id", "zone", "instance", "attributes"],
             description="GCP Metadata Service",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.GCP_METADATA,
@@ -321,7 +322,7 @@ class DNSRebindingScanner(ScanModule):
             path="/computeMetadata/v1/instance/service-accounts/",
             indicators=["email", "scopes", "token"],
             description="GCP Service Account Credentials",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.AZURE_METADATA,
@@ -330,7 +331,7 @@ class DNSRebindingScanner(ScanModule):
             path="/metadata/instance?api-version=2021-02-01",
             indicators=["compute", "network", "vmId", "subscriptionId"],
             description="Azure Instance Metadata Service",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Container/Orchestration APIs
@@ -341,7 +342,7 @@ class DNSRebindingScanner(ScanModule):
             path="/api/v1/",
             indicators=["namespaces", "pods", "services", "secrets"],
             description="Kubernetes API Server",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.KUBERNETES_API,
@@ -350,25 +351,29 @@ class DNSRebindingScanner(ScanModule):
             path="/api/v1/namespaces/",
             indicators=["kube-system", "default"],
             description="Kubernetes API (default gateway)",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
+        # FIX 2026-02-12: Made indicators more specific to avoid FPs
+        # Docker API returns JSON with specific structure, not HTML
         InternalService(
             service_type=InternalServiceType.DOCKER_API,
             host="127.0.0.1",
             port=2375,
             path="/version",
-            indicators=["ApiVersion", "Version", "Os", "Arch"],
+            # More specific: require JSON-like patterns, not just "Os"
+            indicators=['"ApiVersion":', '"GoVersion":', '"GitCommit":', '"KernelVersion":'],
             description="Docker Remote API (unauthenticated)",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         InternalService(
             service_type=InternalServiceType.DOCKER_API,
             host="127.0.0.1",
             port=2376,
             path="/containers/json",
-            indicators=["Names", "Image", "State", "Ports"],
+            # More specific: require JSON array structure
+            indicators=['"Id":', '"Names":[', '"ImageID":', '"HostConfig":'],
             description="Docker TLS API",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Database Services
@@ -379,7 +384,7 @@ class DNSRebindingScanner(ScanModule):
             path="/",
             indicators=["redis_version", "PONG", "ERR"],
             description="Redis Database",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         InternalService(
             service_type=InternalServiceType.ELASTICSEARCH,
@@ -388,7 +393,7 @@ class DNSRebindingScanner(ScanModule):
             path="/",
             indicators=["cluster_name", "cluster_uuid", "version", "lucene_version"],
             description="Elasticsearch",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         InternalService(
             service_type=InternalServiceType.MONGODB,
@@ -397,7 +402,7 @@ class DNSRebindingScanner(ScanModule):
             path="/",
             indicators=["mongodb", "ismaster"],
             description="MongoDB",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Service Discovery
@@ -408,7 +413,7 @@ class DNSRebindingScanner(ScanModule):
             path="/v1/agent/services",
             indicators=["Services", "ID", "Tags"],
             description="Consul Agent",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         InternalService(
             service_type=InternalServiceType.ETCD,
@@ -417,7 +422,7 @@ class DNSRebindingScanner(ScanModule):
             path="/v2/keys/",
             indicators=["action", "node", "key", "value"],
             description="etcd Key-Value Store",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Monitoring
@@ -428,7 +433,7 @@ class DNSRebindingScanner(ScanModule):
             path="/api/v1/targets",
             indicators=["activeTargets", "droppedTargets", "status"],
             description="Prometheus Monitoring",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         InternalService(
             service_type=InternalServiceType.GRAFANA,
@@ -437,7 +442,7 @@ class DNSRebindingScanner(ScanModule):
             path="/api/admin/settings",
             indicators=["DEFAULT", "database", "security"],
             description="Grafana Dashboard",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
     ]
     
@@ -495,11 +500,44 @@ class DNSRebindingScanner(ScanModule):
         "/ws/v2",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    # SPA indicators - SPAs don't make server-side fetches, so SSRF is unlikely
+    SPA_INDICATORS = [
+        # Framework scripts
+        "angular", "react", "vue", "svelte", "__NUXT__", "__NEXT_DATA__",
+        "ng-app", "ng-controller", "data-ng-", "v-app", "data-v-",
+        # SPA routing
+        "router-view", "router-link", "ui-view", "app-root", "__APP_ROOT__",
+        # Bundle patterns
+        "bundle.js", "main.js", "app.js", "vendor.js", "chunk.",
+        # State management
+        "__REDUX__", "__PRELOADED_STATE__", "window.__STATE__",
+    ]
+
+    # FIX 2026-02-13: Overall scan timeout to prevent 5+ minute hangs
+    MAX_SCAN_DURATION = 90.0  # 90 seconds max for entire module (10 phases)
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.tested_combinations: set[str] = set()
-    
+        self._is_spa: bool = False  # Set during scan
+        self._scan_start: float = 0.0
+
+    def _time_remaining(self) -> float:
+        """Returns time remaining in scan budget."""
+        import time
+        return max(0, self.MAX_SCAN_DURATION - (time.time() - self._scan_start))
+
+    def _should_continue(self) -> bool:
+        """Check if we should continue scanning (time budget remaining)."""
+        return self._time_remaining() > 5.0  # Need at least 5s for a phase
+
     async def scan(
         self,
         host: str,
@@ -508,91 +546,124 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """
         Comprehensive DNS rebinding vulnerability scan - Enterprise Edition.
-        
-        Scan Phases:
-        1. Host header validation bypass
-        2. DNS manipulation detection
-        3. Internal service discovery
-        4. WebSocket origin bypass
-        5. CORS misconfiguration
-        6. SSRF chain exploitation
-        7. Cloud metadata access
-        8. Container API access
+
+        Scan Phases (run with time budget):
+        1. Host header validation bypass (priority: HIGH)
+        2. CORS misconfiguration (priority: HIGH)
+        3. Internal service discovery (priority: MEDIUM)
+        4. Cloud metadata access (priority: MEDIUM)
+        5-10. Other phases (priority: LOW - run only if time permits)
         """
+        import time
+        self._scan_start = time.time()
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
-        
+
         base_url = f"https://{host}" if not host.startswith("http") else host
         parsed = urlparse(base_url)
         original_host = parsed.netloc
-        
-        logger.info(f"[DNS Rebinding Enterprise v2.0] Starting comprehensive scan on {base_url}")
-        
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
-            # Phase 1: Host Header Validation Testing
-            host_findings = await self._test_host_validation_enterprise(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(host_findings)
-            
-            # Phase 2: DNS Rebinding Services Testing
-            dns_findings = await self._test_dns_rebinding_services(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(dns_findings)
-            
-            # Phase 3: Internal Service Access via SSRF
-            internal_findings = await self._test_internal_service_access(
-                client, base_url, rate_limiter
-            )
-            findings.extend(internal_findings)
-            
-            # Phase 4: Cloud Metadata Access
-            cloud_findings = await self._test_cloud_metadata_access(
-                client, base_url, rate_limiter
-            )
-            findings.extend(cloud_findings)
-            
-            # Phase 5: WebSocket Origin Validation
-            ws_findings = await self._test_websocket_rebinding_enterprise(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(ws_findings)
-            
-            # Phase 6: CORS Misconfiguration
-            cors_findings = await self._test_cors_rebinding_enterprise(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(cors_findings)
-            
-            # Phase 7: Redirect-based Rebinding
-            redirect_findings = await self._test_redirect_rebinding_enterprise(
-                client, base_url, rate_limiter
-            )
-            findings.extend(redirect_findings)
-            
-            # Phase 8: Container/Kubernetes API Access
-            container_findings = await self._test_container_api_access(
-                client, base_url, rate_limiter
-            )
-            findings.extend(container_findings)
-            
-            # Phase 9: IP Representation Bypass
-            ip_findings = await self._test_ip_representation_bypass(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(ip_findings)
-            
-            # Phase 10: DNS TTL Manipulation Detection
-            ttl_findings = await self._test_ttl_rebinding(
-                client, base_url, original_host, rate_limiter
-            )
-            findings.extend(ttl_findings)
-        
+
+        logger.info(f"[DNS Rebinding] Starting scan on {base_url} (budget: {self.MAX_SCAN_DURATION}s)")
+
+        # FIX: Pass auth headers for authenticated endpoint testing
+        async with get_scan_client(
+            verify_ssl=False,
+            timeout=min(self.timeout, 10.0),  # Cap per-request timeout to 10s
+            custom_headers=self._auth_headers,
+        ) as client:
+            # FIX 2026-02-12: Detect SPA - SPAs don't make server-side fetches
+            self._is_spa = await self._detect_spa(client, base_url, rate_limiter)
+            if self._is_spa:
+                logger.info(f"[DNS Rebinding] SPA detected - skipping server-side SSRF phases")
+                # For SPAs, only test client-side vectors (Host header, CORS)
+
+            # PRIORITY 1: Host Header Validation (fast, high-value)
+            if self._should_continue():
+                host_findings = await self._test_host_validation_enterprise(
+                    client, base_url, original_host, rate_limiter
+                )
+                findings.extend(host_findings)
+
+            # PRIORITY 2: CORS Misconfiguration (fast, high-value)
+            if self._should_continue():
+                cors_findings = await self._test_cors_rebinding_enterprise(
+                    client, base_url, original_host, rate_limiter
+                )
+                findings.extend(cors_findings)
+
+            # Skip server-side phases for SPAs
+            if not self._is_spa:
+                # PRIORITY 3: Internal Service Access (medium)
+                if self._should_continue():
+                    internal_findings = await self._test_internal_service_access(
+                        client, base_url, rate_limiter
+                    )
+                    findings.extend(internal_findings)
+
+                # PRIORITY 4: Cloud Metadata Access (medium)
+                if self._should_continue():
+                    cloud_findings = await self._test_cloud_metadata_access(
+                        client, base_url, rate_limiter
+                    )
+                    findings.extend(cloud_findings)
+
+                # PRIORITY 5: Container API Access (low - only if time permits)
+                if self._should_continue():
+                    container_findings = await self._test_container_api_access(
+                        client, base_url, rate_limiter
+                    )
+                    findings.extend(container_findings)
+
+            # Lower priority phases - only run if significant time remains
+            if self._time_remaining() > 30:
+                # DNS Rebinding Services
+                if self._should_continue():
+                    dns_findings = await self._test_dns_rebinding_services(
+                        client, base_url, original_host, rate_limiter
+                    )
+                    findings.extend(dns_findings)
+
+                # WebSocket Origin Validation
+                if self._should_continue():
+                    ws_findings = await self._test_websocket_rebinding_enterprise(
+                        client, base_url, original_host, rate_limiter
+                    )
+                    findings.extend(ws_findings)
+
+                # Redirect-based Rebinding
+                if self._should_continue():
+                    redirect_findings = await self._test_redirect_rebinding_enterprise(
+                        client, base_url, rate_limiter
+                    )
+                    findings.extend(redirect_findings)
+
+                # IP Representation Bypass
+                if self._should_continue():
+                    ip_findings = await self._test_ip_representation_bypass(
+                        client, base_url, original_host, rate_limiter
+                    )
+                    findings.extend(ip_findings)
+
+                # DNS TTL Manipulation (slowest - last)
+                if self._should_continue():
+                    ttl_findings = await self._test_ttl_rebinding(
+                        client, base_url, original_host, rate_limiter
+                    )
+                    findings.extend(ttl_findings)
+
         # Deduplicate findings
         findings = self._deduplicate_findings(findings)
-        
-        logger.info(f"[DNS Rebinding Enterprise v2.0] Found {len(findings)} vulnerabilities")
-        
+
+        elapsed = time.time() - self._scan_start
+        if elapsed >= self.MAX_SCAN_DURATION:
+            logger.info(f"[DNS Rebinding] Scan timeout ({elapsed:.1f}s) - partial results ({len(findings)} findings)")
+        else:
+            logger.info(f"[DNS Rebinding] Completed in {elapsed:.1f}s - {len(findings)} findings")
+
         return findings
     
     async def _test_host_validation_enterprise(
@@ -604,11 +675,26 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """Enterprise Host header validation bypass testing."""
         findings = []
-        
+
+        # FP1 FIX 2026-02-18: Get baseline response with original Host header
+        # Many apps ignore Host header entirely - we need to detect this
+        import hashlib
+        baseline_hash = None
+        baseline_length = 0
+        try:
+            await rate_limiter.acquire()
+            baseline_resp = await client.get(base_url, headers={"Host": original_host})
+            if baseline_resp.status_code == 200:
+                baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest()
+                baseline_length = len(baseline_resp.text)
+                logger.debug(f"[DNS Rebinding] Baseline: {baseline_length} bytes, hash={baseline_hash[:8]}")
+        except Exception as e:
+            logger.debug(f"[DNS Rebinding] Baseline request failed: {e}")
+
         for internal_ip, ip_desc in self.INTERNAL_IP_TARGETS:
             for technique in self.HOST_BYPASS_TECHNIQUES[:15]:
                 await rate_limiter.acquire()
-                
+
                 try:
                     # Build malicious Host header
                     malicious_host = technique.format(
@@ -616,35 +702,60 @@ class DNSRebindingScanner(ScanModule):
                         original=original_host,
                         internal_encoded=quote(internal_ip)
                     )
-                    
+
                     # Skip if already tested
                     test_key = f"host:{malicious_host}"
                     if test_key in self.tested_combinations:
                         continue
                     self.tested_combinations.add(test_key)
-                    
+
                     response = await client.get(
                         base_url,
                         headers={"Host": malicious_host}
                     )
-                    
+
                     # Check if request was accepted
                     if response.status_code == 200 and len(response.text) > 100:
+                        # FP1 FIX 2026-02-18: Compare with baseline to detect apps that ignore Host
+                        response_hash = hashlib.md5(response.text.encode()).hexdigest()
+
+                        if baseline_hash and response_hash == baseline_hash:
+                            # Response identical to baseline - app ignores Host header
+                            # This is NOT a vulnerability (no rebinding possible)
+                            logger.debug(f"[DNS Rebinding] Host {malicious_host} ignored (same as baseline)")
+                            continue
+
+                        # FP1 FIX: Also check for meaningful difference (not just length variance)
+                        # If response differs but doesn't contain internal indicators, it's suspicious
+                        response_text_lower = response.text.lower()
+                        internal_indicators = [
+                            internal_ip.lower(), 'internal', 'localhost', '127.0.0.1',
+                            'admin', 'config', 'debug', 'env', 'secret', 'metadata'
+                        ]
+                        has_internal_indicator = any(ind in response_text_lower for ind in internal_indicators)
+
+                        # If baseline exists and response is identical (no rebinding), skip
+                        # If response differs AND has internal indicators, it's real
+                        if baseline_hash and not has_internal_indicator:
+                            # Different response but no internal data - likely just error page
+                            logger.debug(f"[DNS Rebinding] Host {malicious_host} different but no internal data")
+                            continue
+
                         severity = "CRITICAL" if internal_ip in ["127.0.0.1", "169.254.169.254", "localhost"] else "HIGH"
-                        
+
                         findings.append(Finding(
                             name=f"DNS Rebinding - Host Header Bypass ({ip_desc})",
                             severity=severity,
-                            confidence="HIGH",
+                            confidence_score=85.0,
                             description=f"Application accepts manipulated Host header pointing to {ip_desc}",
-                            matched_at=base_url,
+                            endpoint=base_url,
                             evidence=[
                                 f"Host header: {malicious_host}",
                                 f"Target: {ip_desc}",
                                 f"Response code: {response.status_code}",
                                 f"Response size: {len(response.text)} bytes",
                             ],
-                            cwe="CWE-350",
+                            cwe_id="CWE-350",
                             cvss_score=9.1 if severity == "CRITICAL" else 7.5,
                             remediation=(
                                 "1. Implement strict Host header validation against whitelist\n"
@@ -653,6 +764,8 @@ class DNSRebindingScanner(ScanModule):
                                 "4. Implement DNS pinning\n"
                                 "5. Use HTTPS with proper certificate validation"
                             ),
+                            vuln_type=VulnType.DNS_REBINDING,
+                            scanner="dns_rebinding_scanner",
                         ))
                         
                         if severity == "CRITICAL":
@@ -672,7 +785,18 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """Test DNS rebinding via nip.io, xip.io, sslip.io services."""
         findings = []
-        
+        import hashlib
+
+        # FP1 FIX 2026-02-18: Get baseline response for comparison
+        baseline_hash = None
+        try:
+            await rate_limiter.acquire()
+            baseline_resp = await client.get(base_url, headers={"Host": original_host})
+            if baseline_resp.status_code == 200:
+                baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest()
+        except Exception:
+            pass
+
         rebinding_domains = [
             f"127.0.0.1.nip.io",
             f"127.0.0.1.xip.io",
@@ -685,37 +809,58 @@ class DNSRebindingScanner(ScanModule):
             f"localhost.nip.io",
             f"{original_host}.127.0.0.1.nip.io",
         ]
-        
+
         for domain in rebinding_domains:
             await rate_limiter.acquire()
-            
+
             try:
                 response = await client.get(
                     base_url,
                     headers={"Host": domain}
                 )
-                
+
                 if response.status_code == 200 and len(response.text) > 100:
+                    # FP1 FIX 2026-02-18: Compare with baseline
+                    response_hash = hashlib.md5(response.text.encode()).hexdigest()
+
+                    if baseline_hash and response_hash == baseline_hash:
+                        # Same response as baseline - app ignores Host header
+                        logger.debug(f"[DNS Rebinding] Service {domain} ignored (same as baseline)")
+                        continue
+
+                    # FP1 FIX: Check for internal data indicators
+                    response_lower = response.text.lower()
+                    internal_indicators = ['localhost', '127.0.0.1', 'internal', 'admin', 'metadata']
+                    has_internal_data = any(ind in response_lower for ind in internal_indicators)
+
+                    if baseline_hash and not has_internal_data:
+                        # Different response but no internal data - likely error page
+                        logger.debug(f"[DNS Rebinding] Service {domain} different but no internal data")
+                        continue
+
                     findings.append(Finding(
                         name="DNS Rebinding via Dynamic DNS Service",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Application accepts Host header using DNS rebinding service: {domain}",
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"Rebinding domain: {domain}",
                             "Dynamic DNS service resolves to internal IP",
+                            f"Response differs from baseline: {response_hash[:8]} vs {baseline_hash[:8] if baseline_hash else 'N/A'}",
                         ],
-                        cwe="CWE-350",
+                        cwe_id="CWE-350",
                         cvss_score=8.1,
                         remediation=(
                             "1. Block requests with dynamic DNS service domains\n"
                             "2. Implement DNS pinning\n"
                             "3. Validate Host header against explicit whitelist"
                         ),
+                        vuln_type=VulnType.DNS_REBINDING,
+                        scanner="dns_rebinding_scanner",
                     ))
                     return findings  # One finding is sufficient
-                    
+
             except Exception as e:
                 logger.debug(f"[DNS Rebinding] Service test error: {e}")
         
@@ -729,33 +874,39 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """Test for internal service access via SSRF parameters."""
         findings = []
-        
+
+        # FIX 2026-02-12: SPAs don't make server-side fetches
+        # If SPA detected, demote SSRF findings (likely FP from client-side reflection)
+        if self._is_spa:
+            logger.debug("[DNS Rebinding] SPA detected - skipping server-side SSRF tests")
+            return findings
+
         for service in self.INTERNAL_SERVICES[:8]:  # Limit to most critical
             for param in self.SSRF_PARAMETERS[:10]:
                 await rate_limiter.acquire()
-                
+
                 try:
                     target_url = f"http://{service.host}:{service.port}{service.path}"
                     test_url = f"{base_url}?{param}={quote(target_url)}"
-                    
+
                     response = await client.get(test_url)
-                    
+
                     # Check for service indicators
                     for indicator in service.indicators:
                         if indicator.lower() in response.text.lower():
                             findings.append(Finding(
                                 name=f"DNS Rebinding/SSRF - {service.description} Access",
                                 severity=service.severity,
-                                confidence="HIGH",
+                                confidence_score=85.0,
                                 description=f"Internal {service.description} accessible via {param} parameter",
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Parameter: {param}",
                                     f"Target: {target_url}",
                                     f"Service: {service.description}",
                                     f"Indicator: {indicator}",
                                 ],
-                                cwe="CWE-918",
+                                cwe_id="CWE-918",
                                 cvss_score=9.8 if service.severity == "CRITICAL" else 8.0,
                                 remediation=(
                                     "1. Block requests to internal IP ranges\n"
@@ -764,9 +915,11 @@ class DNSRebindingScanner(ScanModule):
                                     "4. Disable cloud metadata access (IMDSv2 on AWS)\n"
                                     "5. Network segmentation for sensitive services"
                                 ),
+                                vuln_type=VulnType.SSRF,
+                                scanner="dns_rebinding_scanner",
                             ))
                             return findings  # Critical finding
-                            
+
                 except Exception as e:
                     logger.debug(f"[DNS Rebinding] Service access error: {e}")
         
@@ -780,7 +933,12 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """Specifically test cloud metadata service access."""
         findings = []
-        
+
+        # FIX 2026-02-12: SPAs don't make server-side fetches
+        if self._is_spa:
+            logger.debug("[DNS Rebinding] SPA detected - skipping cloud metadata SSRF tests")
+            return findings
+
         metadata_targets = [
             # AWS IMDS
             ("http://169.254.169.254/latest/meta-data/", "AWS Metadata", ["ami-id", "instance-id"]),
@@ -819,17 +977,17 @@ class DNSRebindingScanner(ScanModule):
                         if indicator.lower() in response.text.lower():
                             findings.append(Finding(
                                 name=f"Cloud Metadata Access via DNS Rebinding/SSRF - {service_name}",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description=f"{service_name} exposed via SSRF parameter. Cloud credentials may be compromised.",
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Target: {target_url}",
                                     f"Service: {service_name}",
                                     f"Indicator found: {indicator}",
                                     "CRITICAL: Cloud credentials may be accessible",
                                 ],
-                                cwe="CWE-918",
+                                cwe_id="CWE-918",
                                 cvss_score=10.0,
                                 remediation=(
                                     "1. IMMEDIATE: Rotate all cloud credentials/tokens\n"
@@ -838,6 +996,8 @@ class DNSRebindingScanner(ScanModule):
                                     "4. Implement strict URL validation\n"
                                     "5. Use VPC endpoints instead of public metadata"
                                 ),
+                                vuln_type=VulnType.SSRF,
+                                scanner="dns_rebinding_scanner",
                             ))
                             return findings  # Critical finding
                             
@@ -893,15 +1053,15 @@ class DNSRebindingScanner(ScanModule):
                         findings.append(Finding(
                             name="WebSocket DNS Rebinding - Origin Bypass",
                             severity=severity,
-                            confidence="HIGH",
+                            confidence_score=85.0,
                             description=f"WebSocket endpoint accepts connections from untrusted origin: {origin}",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"WebSocket path: {path}",
                                 f"Malicious origin: {origin}",
                                 "Upgrade to WebSocket accepted",
                             ],
-                            cwe="CWE-346",
+                            cwe_id="CWE-346",
                             cvss_score=8.5 if severity == "CRITICAL" else 7.0,
                             remediation=(
                                 "1. Implement strict Origin header validation\n"
@@ -909,6 +1069,8 @@ class DNSRebindingScanner(ScanModule):
                                 "3. Reject null and localhost origins in production\n"
                                 "4. Use CSRF tokens for WebSocket handshake"
                             ),
+                            vuln_type=VulnType.WEBSOCKET_VULNERABILITY,
+                            scanner="dns_rebinding_scanner",
                         ))
                         return findings  # One critical finding is enough
                         
@@ -990,15 +1152,15 @@ class DNSRebindingScanner(ScanModule):
                     findings.append(Finding(
                         name=f"CORS DNS Rebinding Misconfiguration",
                         severity=severity,
-                        confidence="HIGH",
+                        confidence_score=85.0,
                         description=f"CORS allows requests from potentially malicious origin: {origin}",
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"Origin tested: {origin}",
                             f"Access-Control-Allow-Origin: {acao}",
                             f"Access-Control-Allow-Credentials: {acac}",
                         ],
-                        cwe="CWE-942",
+                        cwe_id="CWE-942",
                         cvss_score=9.1 if severity == "CRITICAL" else (7.5 if severity == "HIGH" else 5.3),
                         remediation=(
                             "1. Implement strict origin whitelist (never use *)\n"
@@ -1007,6 +1169,8 @@ class DNSRebindingScanner(ScanModule):
                             "4. Be careful with Access-Control-Allow-Credentials\n"
                             "5. Validate origin against allowed domains list"
                         ),
+                        vuln_type=VulnType.DNS_REBINDING,
+                        scanner="dns_rebinding_scanner",
                     ))
                     
                     if severity == "CRITICAL":
@@ -1057,16 +1221,16 @@ class DNSRebindingScanner(ScanModule):
                         if any(indicator in location for indicator in internal_indicators):
                             findings.append(Finding(
                                 name="DNS Rebinding via Open Redirect",
-                                severity="HIGH",
-                                confidence="HIGH",
+                                severity=Severity.HIGH,
+                                confidence_score=85.0,
                                 description=f"Open redirect allows rebinding to internal services via {param}",
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Parameter: {param}",
                                     f"Target: {target}",
                                     f"Redirect location: {location}",
                                 ],
-                                cwe="CWE-601",
+                                cwe_id="CWE-601",
                                 cvss_score=8.1,
                                 remediation=(
                                     "1. Validate redirect URLs against strict whitelist\n"
@@ -1074,6 +1238,8 @@ class DNSRebindingScanner(ScanModule):
                                     "3. Use relative paths for redirects\n"
                                     "4. Implement redirect confirmation page"
                                 ),
+                                vuln_type=VulnType.DNS_REBINDING,
+                                scanner="dns_rebinding_scanner",
                             ))
                             return findings
                         
@@ -1081,18 +1247,20 @@ class DNSRebindingScanner(ScanModule):
                         if location.startswith(("gopher://", "dict://", "file://", "ldap://")):
                             findings.append(Finding(
                                 name="SSRF via Protocol Handler in Redirect",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description=f"Redirect allows dangerous protocol handler: {location.split(':')[0]}://",
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Parameter: {param}",
                                     f"Protocol: {location.split(':')[0]}",
                                     f"Location: {location}",
                                 ],
-                                cwe="CWE-918",
+                                cwe_id="CWE-918",
                                 cvss_score=9.8,
                                 remediation="Block all non-HTTP(S) protocol handlers in redirects",
+                                vuln_type=VulnType.SSRF,
+                                scanner="dns_rebinding_scanner",
                             ))
                             return findings
                             
@@ -1109,7 +1277,12 @@ class DNSRebindingScanner(ScanModule):
     ) -> list[Finding]:
         """Test for container/orchestration API access."""
         findings = []
-        
+
+        # FIX 2026-02-12: SPAs don't make server-side fetches
+        if self._is_spa:
+            logger.debug("[DNS Rebinding] SPA detected - skipping container API SSRF tests")
+            return findings
+
         container_targets = [
             # Docker
             ("http://127.0.0.1:2375/version", "Docker API", ["ApiVersion", "Version"]),
@@ -1136,16 +1309,16 @@ class DNSRebindingScanner(ScanModule):
                         if indicator.lower() in response.text.lower():
                             findings.append(Finding(
                                 name=f"Container API Access via DNS Rebinding - {service}",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description=f"{service} exposed via SSRF. Container escape or cluster takeover possible.",
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Target: {target}",
                                     f"Service: {service}",
                                     f"Indicator: {indicator}",
                                 ],
-                                cwe="CWE-918",
+                                cwe_id="CWE-918",
                                 cvss_score=9.8,
                                 remediation=(
                                     "1. Disable Docker remote API or require TLS auth\n"
@@ -1153,6 +1326,8 @@ class DNSRebindingScanner(ScanModule):
                                     "3. Implement strict SSRF protection\n"
                                     "4. Enable Kubernetes RBAC and network policies"
                                 ),
+                                vuln_type=VulnType.SSRF,
+                                scanner="dns_rebinding_scanner",
                             ))
                             return findings
                             
@@ -1199,21 +1374,23 @@ class DNSRebindingScanner(ScanModule):
                 if response.status_code == 200 and len(response.text) > 100:
                     findings.append(Finding(
                         name=f"DNS Rebinding - IP Representation Bypass ({description})",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Host validation bypassed using {description}: {ip_repr}",
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"IP representation: {ip_repr}",
                             f"Technique: {description}",
                         ],
-                        cwe="CWE-350",
+                        cwe_id="CWE-350",
                         cvss_score=8.0,
                         remediation=(
                             "1. Normalize IP addresses before validation\n"
                             "2. Parse and validate all IP formats (decimal, hex, octal)\n"
                             "3. Use IP parsing library that handles all representations"
                         ),
+                        vuln_type=VulnType.DNS_REBINDING,
+                        scanner="dns_rebinding_scanner",
                     ))
                     return findings
                     
@@ -1254,22 +1431,24 @@ class DNSRebindingScanner(ScanModule):
             if time2 < time1 * 0.5:
                 findings.append(Finding(
                     name="Potential TTL-Based DNS Rebinding Susceptibility",
-                    severity="INFO",
-                    confidence="LOW",
+                    severity=Severity.INFO,
+                    confidence_score=40.0,
                     description="Application may be susceptible to TTL-based DNS rebinding (requires further testing)",
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[
                         f"First request: {time1:.3f}s",
                         f"Second request: {time2:.3f}s",
                         "DNS caching detected - rebinding may be possible with controlled DNS",
                     ],
-                    cwe="CWE-350",
+                    cwe_id="CWE-350",
                     cvss_score=0.0,
                     remediation=(
                         "1. Implement DNS pinning\n"
                         "2. Validate Host header on every request\n"
                         "3. Use static IP configuration where possible"
                     ),
+                    vuln_type=VulnType.DNS_REBINDING,
+                    scanner="dns_rebinding_scanner",
                 ))
                 
         except Exception as e:
@@ -1281,11 +1460,50 @@ class DNSRebindingScanner(ScanModule):
         """Remove duplicate findings."""
         seen = set()
         unique = []
-        
+
         for finding in findings:
-            key = (finding.name, finding.matched_at)
+            key = (finding.name, finding.endpoint)
             if key not in seen:
                 seen.add(key)
                 unique.append(finding)
-        
+
         return unique
+
+    async def _detect_spa(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        rate_limiter: RateLimiter,
+    ) -> bool:
+        """Detect if target is a Single Page Application.
+
+        SPAs don't make server-side fetches, so SSRF via DNS rebinding
+        is unlikely. This reduces false positives for SPA targets.
+        """
+        await rate_limiter.acquire()
+
+        try:
+            response = await client.get(base_url)
+            if response.status_code != 200:
+                return False
+
+            body = response.text.lower()
+            content_type = response.headers.get("content-type", "").lower()
+
+            # Must be HTML
+            if "text/html" not in content_type:
+                return False
+
+            # Check for SPA indicators
+            spa_score = 0
+            for indicator in self.SPA_INDICATORS:
+                if indicator.lower() in body:
+                    spa_score += 1
+                    if spa_score >= 2:  # Need 2+ indicators
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[DNS Rebinding] SPA detection error: {e}")
+            return False

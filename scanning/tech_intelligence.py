@@ -34,8 +34,11 @@ import re
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from core.config_manager import Settings
 
 import httpx
 
@@ -1755,7 +1758,7 @@ class ModuleRecommendationEngine:
         "joomla": {"requires_joomla": True},
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.tech_fingerprints = TECH_FINGERPRINTS
         self.stack_profiles = TECH_STACK_PROFILES
 
@@ -1867,7 +1870,7 @@ class TechIntelligence:
 
     VERSION = "2.0.0-ENTERPRISE"
 
-    def __init__(self, settings: Any = None):
+    def __init__(self, settings: "Settings | None" = None) -> None:
         self.settings = settings
         self.fingerprints = TECH_FINGERPRINTS
         self.recommendation_engine = ModuleRecommendationEngine()
@@ -1936,7 +1939,8 @@ class TechIntelligence:
                     httpx_count = 0
                     for finding in result.findings:
                         metadata = finding.get("metadata", {})
-                        technologies = metadata.get("technologies", [])
+                        if isinstance(data, dict):
+                            technologies = metadata.get("technologies", [])
                         for tech_name in technologies:
                             tech = self._convert_external_tech(tech_name, "", "httpx")
                             if tech and not self._is_duplicate_tech(tech, detected):

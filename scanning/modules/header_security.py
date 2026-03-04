@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, VulnCategory, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -127,8 +129,14 @@ class HeaderSecurityChecker(ScanModule):
         },
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
         # Enterprise style: aggregate all missing headers into one finding
         module_config = settings.scanning.modules.get("headers", {}) if hasattr(settings, 'scanning') else {}
         self.aggregate_findings = module_config.get("aggregate_findings", True)  # Default: enterprise style
@@ -140,7 +148,10 @@ class HeaderSecurityChecker(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Check security headers on host."""
-        logger.info(f"[headers] Checking security headers on {host}")
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
 
         findings = []
         info_items = []
@@ -148,44 +159,68 @@ class HeaderSecurityChecker(ScanModule):
         # Build URL
         url = host if host.startswith(('http://', 'https://')) else f"https://{host}"
 
-        try:
-            await rate_limiter.acquire()
-            headers = await self._fetch_headers(url)
+        # Get multiple endpoints to test - different endpoints may have different headers
+        test_urls = [url]
+        if isinstance(asset_data, dict):
+            all_endpoints = asset_data.get("endpoints", [])
 
-            if headers is None:
-                # Try HTTP
-                http_url = url.replace("https://", "http://")
+        # Add API endpoints (may have different security headers)
+        for ep in all_endpoints[:20]:
+            if isinstance(ep, str) and any(p in ep.lower() for p in ["/api", "/v1", "/graphql", "/rest"]):
+                test_urls.append(ep)
+                if len(test_urls) >= 10:  # Limit to 10 endpoints
+                    break
+
+        test_urls = list(set(test_urls))
+        logger.info(f"[headers] Checking security headers on {len(test_urls)} endpoints")
+
+        # Track unique header issues to avoid duplicates
+        seen_issues = set()
+
+        for test_url in test_urls:
+            try:
                 await rate_limiter.acquire()
-                headers = await self._fetch_headers(http_url)
+                headers = await self._fetch_headers(test_url)
 
-            if headers:
-                # Check for missing headers
-                missing = self._check_missing_headers(headers, host)
+                if headers is None and test_url == url:
+                    # Try HTTP only for main URL
+                    http_url = test_url.replace("https://", "http://")
+                    await rate_limiter.acquire()
+                    headers = await self._fetch_headers(http_url)
 
-                # Check for dangerous values
-                dangerous = self._check_dangerous_values(headers, host)
+                if headers:
+                    # Check for missing headers
+                    missing = self._check_missing_headers(headers, test_url)
 
-                # Enterprise style: aggregate missing headers into single finding
-                if self.aggregate_findings and missing:
-                    aggregated = self._aggregate_header_findings(missing, host)
-                    findings.append(aggregated)
-                else:
-                    findings.extend(missing)
+                    # Check for dangerous values
+                    dangerous = self._check_dangerous_values(headers, test_url)
 
-                findings.extend(dangerous)
+                    # Add only unique issues (by header name + issue type)
+                    for f in missing + dangerous:
+                        issue_key = (f.metadata.get("header", ""), f.vuln_type)
+                        if issue_key not in seen_issues:
+                            seen_issues.add(issue_key)
+                            if test_url == url:
+                                findings.append(f)
+                            else:
+                                # For API endpoints, just note the URL differs
+                                if isinstance(asset_data, dict):
+                                    f.metadata["also_affects"] = test_url
+                                findings.append(f)
 
-                # Collect info
-                info_items.append({
-                    "type": "headers_info",
-                    "host": host,
-                    "headers": dict(headers),
-                })
+                    # Collect info for main URL only
+                    if test_url == url:
+                        info_items.append({
+                            "type": "headers_info",
+                            "host": host,
+                            "headers": dict(headers),
+                        })
 
-        except Exception as e:
-            logger.error(f"[headers] Failed to check {host}: {e}")
+            except Exception as e:
+                logger.debug(f"[headers] Failed to check {test_url}: {e}")
 
         logger.info(f"[headers] Found {len(findings)} issues on {host}")
-        return {"vulns": [f.to_dict() for f in findings], "info": info_items}
+        return {"findings": [f.to_dict() for f in findings], "info": info_items}
 
     def _aggregate_header_findings(
         self,
@@ -201,11 +236,11 @@ class HeaderSecurityChecker(ScanModule):
 
         for f in findings:
             header = f.metadata.get("header", "Unknown")
-            if f.severity == "CRITICAL":
+            if f.severity == Severity.CRITICAL:
                 critical_headers.append(header)
-            elif f.severity == "HIGH":
+            elif f.severity == Severity.HIGH:
                 high_headers.append(header)
-            elif f.severity == "MEDIUM":
+            elif f.severity == Severity.MEDIUM:
                 medium_headers.append(header)
             else:
                 low_headers.append(header)
@@ -223,14 +258,18 @@ class HeaderSecurityChecker(ScanModule):
         # Build sub-items list
         sub_items = []
         for f in findings:
-            header = f.metadata.get("header", "Unknown")
+            # Prepara os valores condicionais antes
+            header = f.metadata.get("header", "Unknown") if isinstance(f.metadata, dict) else "Unknown"
+            business_impact = f.metadata.get("business_impact", "") if isinstance(f.metadata, dict) else ""
+
             sub_items.append({
                 "header": header,
-                "severity": f.severity,
+                "severity": f.severity.value,  # Convert enum to string for JSON
                 "description": f.description,
                 "remediation": f.remediation,
-                "business_impact": f.metadata.get("business_impact", ""),
+                "business_impact": business_impact,
             })
+
 
         # Build consolidated evidence
         evidence = [
@@ -251,24 +290,26 @@ class HeaderSecurityChecker(ScanModule):
         ])
 
         return Finding(
-            type="missing_browser_hardening",
+            vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+            category=VulnCategory.CONFIGURATION,
             name="Missing Browser Hardening Headers",
-            severity=severity,
+            severity=Severity(severity),
             description=(
                 f"The application is missing {len(findings)} security headers that provide "
                 f"defense-in-depth against client-side attacks. These headers help mitigate "
                 f"XSS, clickjacking, and other browser-based attacks IF vulnerabilities exist."
             ),
             host=host,
-            matched_at=host,
+            endpoint=host,
             evidence=evidence,
             cvss_score=max(f.cvss_score for f in findings),
-            cwe="CWE-693",  # Protection Mechanism Failure
+            cwe_id="CWE-693",  # Protection Mechanism Failure
             remediation=(
                 "Add the missing security headers to your web server or CDN configuration. "
                 "See sub-items for specific header values and priorities."
             ),
-            confidence=100,
+            confidence_score=100.0,
+            scanner="headers",
             metadata={
                 "aggregated": True,
                 "sub_findings_count": len(findings),
@@ -337,17 +378,19 @@ class HeaderSecurityChecker(ScanModule):
                 business_impact = self._get_business_impact(header)
 
                 findings.append(Finding(
-                    type="missing_header",
+                    vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+                    category=VulnCategory.CONFIGURATION,
                     name=f"Missing {header} Header",
-                    severity=config["severity"],
+                    severity=Severity(config["severity"]),
                     description=config["description"],
                     host=host,
-                    matched_at=host,
+                    endpoint=host,
                     evidence=evidence,
                     cvss_score=config["cvss"],
-                    cwe=config["cwe"],
+                    cwe_id=config["cwe"],
                     remediation=config["remediation"],
-                    confidence=100,
+                    confidence_score=100.0,
+                    scanner="headers",
                     metadata={
                         "header": header,
                         "example": config.get("example", ""),
@@ -441,17 +484,19 @@ class HeaderSecurityChecker(ScanModule):
             for dangerous, config in dangerous_values.items():
                 if dangerous.lower() in value.lower():
                     findings.append(Finding(
-                        type="insecure_header",
+                        vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+                        category=VulnCategory.CONFIGURATION,
                         name=f"Insecure {header} Configuration",
-                        severity=config["severity"],
+                        severity=Severity(config["severity"]),
                         description=config["description"],
                         host=host,
-                        matched_at=host,
+                        endpoint=host,
                         evidence=[f"{header}: {value}"],
                         cvss_score=5.0,
-                        cwe="CWE-16",
+                        cwe_id="CWE-16",
                         remediation=f"Review and restrict {header} header value",
-                        confidence=100,  # Deterministic finding - dangerous value found
+                        confidence_score=100.0,  # Deterministic finding - dangerous value found
+                        scanner="headers",
                         metadata={
                             "header": header,
                             "value": value,

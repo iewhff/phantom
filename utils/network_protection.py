@@ -22,15 +22,11 @@ from __future__ import annotations
 
 import os
 import random
-import socket
 import asyncio
-import hashlib
-import time
 from dataclasses import dataclass, field
-from typing import Optional, Any, Callable
+from typing import Optional, Any
 from enum import Enum
 from urllib.parse import urlparse
-from datetime import datetime, timedelta
 
 import httpx
 
@@ -138,41 +134,68 @@ ACCEPT_LANGUAGE = [
 class NetworkProtection:
     """
     Network protection manager for secure pentesting.
-    
+
     Features:
     - Proxy/SOCKS/Tor support
-    - User-Agent rotation
+    - User-Agent rotation (session-based, not per-request)
     - Header randomization
     - IP leak protection
     - DNS leak prevention
+
+    OPSEC Note: UA is kept consistent within a session to avoid fingerprinting.
+    Rotation happens after ua_rotation_interval requests (default: 100).
     """
-    
+
     proxy_config: ProxyConfig = field(default_factory=ProxyConfig)
     rotate_user_agent: bool = True
     randomize_headers: bool = True
     check_ip_leaks: bool = True
-    
+    ua_rotation_interval: int = 100  # Rotate UA every N requests (0 = never)
+
     # Internal state
     _current_user_agent: str = ""
+    _current_accept: str = ""
+    _current_accept_language: str = ""
     _original_ip: Optional[str] = None
     _proxied_ip: Optional[str] = None
-    
+    _request_count: int = 0
+
     def __post_init__(self):
-        """Initialize protection."""
+        """Initialize protection with session-consistent headers."""
+        self._rotate_session_headers()
+
+    def _rotate_session_headers(self) -> None:
+        """Rotate all session headers together for consistency."""
         self._current_user_agent = random.choice(USER_AGENTS)
-    
+        self._current_accept = random.choice(ACCEPT_HEADERS)
+        self._current_accept_language = random.choice(ACCEPT_LANGUAGE)
+        self._request_count = 0
+
     def get_random_user_agent(self) -> str:
-        """Get a random realistic user agent."""
-        if self.rotate_user_agent:
-            self._current_user_agent = random.choice(USER_AGENTS)
+        """
+        Get session-consistent user agent.
+
+        OPSEC: Returns the same UA for the entire session unless rotation
+        interval is reached. This prevents fingerprinting from UA changes
+        within a session.
+        """
+        if self.rotate_user_agent and self.ua_rotation_interval > 0:
+            self._request_count += 1
+            if self._request_count >= self.ua_rotation_interval:
+                self._rotate_session_headers()
         return self._current_user_agent
     
     def get_randomized_headers(self) -> dict[str, str]:
-        """Get randomized HTTP headers that look like a real browser."""
+        """
+        Get session-consistent HTTP headers that look like a real browser.
+
+        OPSEC: Headers stay consistent within the session to avoid fingerprinting.
+        A real browser doesn't change Accept-Language mid-session.
+        """
         headers = {
             "User-Agent": self.get_random_user_agent(),
-            "Accept": random.choice(ACCEPT_HEADERS),
-            "Accept-Language": random.choice(ACCEPT_LANGUAGE),
+            "Accept": self._current_accept,
+            "Accept-Language": self._current_accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -182,17 +205,21 @@ class NetworkProtection:
             "Sec-Fetch-User": "?1",
             "Cache-Control": "max-age=0",
         }
-        
-        # Add some randomization
-        if random.random() > 0.5:
+
+        # DNT is typically consistent per browser - set once per session
+        if not hasattr(self, "_session_dnt"):
+            self._session_dnt = random.random() > 0.5
+        if self._session_dnt:
             headers["DNT"] = "1"
-        
+
         return headers
     
     def get_httpx_client_kwargs(self) -> dict[str, Any]:
         """Get kwargs for httpx.AsyncClient with protection enabled."""
         kwargs: dict[str, Any] = {
-            "verify": False,  # SSL verification (can be enabled)
+            # FIX P0-006: SSL verification enabled by default for security
+            # Set PHANTOM_INSECURE_SSL=1 or use --insecure to disable
+            "verify": not os.environ.get("PHANTOM_INSECURE_SSL"),
             "follow_redirects": True,
             "timeout": 30.0,
         }

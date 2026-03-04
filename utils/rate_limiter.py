@@ -5,10 +5,11 @@ Rate limiter with token bucket algorithm.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -115,6 +116,7 @@ class RateLimiter:
     # Class-level counter for all instances (for compliance reporting)
     _global_request_count: int = 0
     _global_lock: asyncio.Lock | None = None
+    _global_sync_lock: threading.Lock = threading.Lock()  # Thread-safe for counter
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class RateLimiter:
         self._buckets: dict[str, TokenBucket] = {}
         self._domain_rates: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()  # For sync methods - prevents bucket race
         self._request_count: int = 0  # Instance-level counter
     
     async def acquire(self, domain: str = "default") -> None:
@@ -152,9 +155,13 @@ class RateLimiter:
         bucket = await self._get_bucket(domain)
         await bucket.wait_and_consume()
 
-        # Increment request counters
-        self._request_count += 1
-        RateLimiter._global_request_count += 1
+        # Increment instance counter (protected by instance lock)
+        async with self._lock:
+            self._request_count += 1
+
+        # Increment global counter (protected by class-level lock for cross-instance safety)
+        with RateLimiter._global_sync_lock:
+            RateLimiter._global_request_count += 1
 
     @property
     def request_count(self) -> int:
@@ -188,8 +195,7 @@ class RateLimiter:
         """
         Try to acquire without waiting (non-async, for backwards compatibility).
 
-        WARNING: This method has potential race conditions. Use try_acquire()
-        in async contexts when possible.
+        Thread-safe: Uses sync lock to prevent race conditions during bucket creation.
 
         Args:
             domain: Domain or identifier
@@ -197,13 +203,14 @@ class RateLimiter:
         Returns:
             True if acquired, False otherwise
         """
-        bucket = self._buckets.get(domain)
-        if bucket is None:
-            bucket = TokenBucket(
-                capacity=self.default_burst,
-                rate=self._domain_rates.get(domain, self.default_rate),
-            )
-            self._buckets[domain] = bucket
+        with self._sync_lock:
+            bucket = self._buckets.get(domain)
+            if bucket is None:
+                bucket = TokenBucket(
+                    capacity=self.default_burst,
+                    rate=self._domain_rates.get(domain, self.default_rate),
+                )
+                self._buckets[domain] = bucket
 
         return bucket.consume_sync()
 
@@ -231,6 +238,85 @@ class RateLimiter:
 
             if domain in self._buckets:
                 self._buckets[domain].rate = rate
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RATE-02 FIX: Adaptive rate on 429 responses
+    # Implements exponential backoff when rate limited
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def signal_rate_limited(self, domain: str = "default") -> float:
+        """
+        Signal that a 429 was received - reduce rate by 50%.
+
+        RATE-02 FIX: Adaptive rate limiting based on server response.
+        Implements exponential backoff when 429s are received.
+
+        Args:
+            domain: Domain that returned 429
+
+        Returns:
+            New rate after reduction
+        """
+        async with self._lock:
+            current_rate = self._domain_rates.get(domain, self.default_rate)
+            # Reduce rate by 50%, minimum 0.5 req/s
+            new_rate = max(0.5, current_rate * 0.5)
+            self._domain_rates[domain] = new_rate
+
+            if domain in self._buckets:
+                self._buckets[domain].rate = new_rate
+
+            logger.warning(
+                f"[RATE-02] 429 received for {domain}, "
+                f"reducing rate: {current_rate:.1f} → {new_rate:.1f} req/s"
+            )
+
+            return new_rate
+
+    async def signal_success(self, domain: str = "default") -> None:
+        """
+        Signal successful request - gradually recover rate.
+
+        Call this after successful requests to slowly restore rate
+        after a 429-triggered backoff.
+
+        Args:
+            domain: Domain that succeeded
+        """
+        async with self._lock:
+            current_rate = self._domain_rates.get(domain, self.default_rate)
+            # Only recover if we're below default rate
+            if current_rate < self.default_rate:
+                # Recover by 10%, capped at default
+                new_rate = min(self.default_rate, current_rate * 1.1)
+                self._domain_rates[domain] = new_rate
+
+                if domain in self._buckets:
+                    self._buckets[domain].rate = new_rate
+
+                if new_rate >= self.default_rate * 0.9:
+                    logger.debug(f"[RATE-02] Rate recovered to {new_rate:.1f} req/s for {domain}")
+
+    async def get_wait_time_after_429(self, domain: str = "default") -> float:
+        """
+        Get recommended wait time after 429.
+
+        Uses exponential backoff based on current rate reduction.
+
+        Returns:
+            Seconds to wait before retrying
+        """
+        async with self._lock:
+            current_rate = self._domain_rates.get(domain, self.default_rate)
+            # Lower rate = longer wait
+            if current_rate <= 1.0:
+                return 30.0  # Very slow, wait 30s
+            elif current_rate <= 2.0:
+                return 15.0  # Slow, wait 15s
+            elif current_rate <= 5.0:
+                return 5.0   # Moderate, wait 5s
+            else:
+                return 2.0   # Still okay, wait 2s
 
 
 class ConcurrencyLimiter:
@@ -427,6 +513,7 @@ class ScanRateCoordination:
     allocated_rate: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
     active: bool = True
+    domain_allocations: dict[str, float] = field(default_factory=dict)  # Per-domain allocations
 
 
 @dataclass
@@ -444,7 +531,7 @@ class RateStatistics:
     global_rate_limit: float = 0.0
     average_rate: float = 0.0
 
-    def to_dict(self) -> dict[str, any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "total_requests": self.total_requests,
@@ -492,6 +579,7 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
     _global_scans: dict[str, ScanRateCoordination] = {}
     _global_domain_allocations: dict[str, float] = defaultdict(float)
     _coordination_lock: asyncio.Lock | None = None
+    _init_lock: threading.Lock = threading.Lock()  # Protects _coordination_lock init
 
     def __init__(
         self,
@@ -525,9 +613,10 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
         self._total_waits: int = 0
         self._total_wait_time_ms: float = 0.0
 
-        # Ensure coordination lock exists
-        if PhantomRateLimiter._coordination_lock is None:
-            PhantomRateLimiter._coordination_lock = asyncio.Lock()
+        # Ensure coordination lock exists (thread-safe initialization)
+        with PhantomRateLimiter._init_lock:
+            if PhantomRateLimiter._coordination_lock is None:
+                PhantomRateLimiter._coordination_lock = asyncio.Lock()
 
     async def get_optimal_rate(self, domain: str) -> float:
         """
@@ -671,6 +760,7 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
                 scan_id=scan_id,
                 domains=set(domains),
                 allocated_rate=sum(allocations.values()),
+                domain_allocations=allocations.copy(),  # Track per-domain for cleanup
             )
 
             logger.info(
@@ -694,15 +784,16 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
             if not scan:
                 return
 
-            # Release allocations
-            for domain in scan.domains:
+            # Release allocations using tracked per-domain values
+            for domain, allocation in scan.domain_allocations.items():
                 if domain in PhantomRateLimiter._global_domain_allocations:
-                    # Note: This is a simplified release - in production
-                    # you'd track allocations per scan per domain
-                    pass
+                    PhantomRateLimiter._global_domain_allocations[domain] -= allocation
+                    # Remove domain entry if allocation is zero or negative
+                    if PhantomRateLimiter._global_domain_allocations[domain] <= 0:
+                        del PhantomRateLimiter._global_domain_allocations[domain]
 
             scan.active = False
-            logger.info(f"Unregistered scan {scan_id}")
+            logger.info(f"Unregistered scan {scan_id}, released {len(scan.domain_allocations)} domain allocations")
 
     async def coordinate_parallel_scans(self, scan_id: str) -> dict[str, float]:
         """
@@ -781,16 +872,17 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
             response_time_ms: Response time in milliseconds
             rate_limited: Whether request was rate limited (429)
         """
-        # Use sync lock for non-async context
-        if domain not in self._domain_history:
-            self._domain_history[domain] = DomainRateHistory(domain=domain)
+        # BUG-FIX 2026-02-08: Add lock protection to prevent race condition on _domain_history
+        with self._global_sync_lock:
+            if domain not in self._domain_history:
+                self._domain_history[domain] = DomainRateHistory(domain=domain)
 
-        history = self._domain_history[domain]
+            history = self._domain_history[domain]
 
-        if success:
-            history.record_success(response_time_ms)
-        else:
-            history.record_failure(rate_limited=rate_limited)
+            if success:
+                history.record_success(response_time_ms)
+            else:
+                history.record_failure(rate_limited=rate_limited)
 
     def get_rate_statistics(self) -> RateStatistics:
         """
@@ -799,12 +891,17 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
         Returns:
             RateStatistics object with all metrics
         """
-        # Calculate average rate across all domains
-        total_rate = 0.0
-        for bucket in self._buckets.values():
+        # BUG-FIX 2026-02-08: Use lock to prevent dict modification during iteration
+        # which would cause RuntimeError: dictionary changed size during iteration
+        with self._global_sync_lock:
+            # Calculate average rate across all domains
+            total_rate = 0.0
+            buckets_snapshot = list(self._buckets.values())
+
+        for bucket in buckets_snapshot:
             total_rate += bucket.rate
 
-        avg_rate = total_rate / len(self._buckets) if self._buckets else self.default_rate
+        avg_rate = total_rate / len(buckets_snapshot) if buckets_snapshot else self.default_rate
 
         return RateStatistics(
             total_requests=self._request_count,
@@ -887,7 +984,8 @@ class PhantomRateLimiter(AdaptiveRateLimiter):
 # =============================================================================
 
 _phantom_limiter_instance: PhantomRateLimiter | None = None
-_phantom_limiter_lock = asyncio.Lock()
+_phantom_limiter_lock: asyncio.Lock | None = None
+_phantom_limiter_init_lock = threading.Lock()  # Protects lazy asyncio.Lock init
 
 
 async def get_phantom_rate_limiter(
@@ -904,7 +1002,13 @@ async def get_phantom_rate_limiter(
     Returns:
         PhantomRateLimiter singleton instance
     """
-    global _phantom_limiter_instance
+    global _phantom_limiter_instance, _phantom_limiter_lock
+
+    # Lazy-init asyncio.Lock (can't create at module level outside event loop)
+    if _phantom_limiter_lock is None:
+        with _phantom_limiter_init_lock:
+            if _phantom_limiter_lock is None:
+                _phantom_limiter_lock = asyncio.Lock()
 
     async with _phantom_limiter_lock:
         if _phantom_limiter_instance is None:

@@ -47,9 +47,12 @@ from enum import Enum
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -399,9 +402,15 @@ class CloudScanner(ScanModule):
         "public", "staging", "static", "test", "testing", "uploads", "www"
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.discovered_resources: list[CloudResource] = []
     
     async def scan(
@@ -425,6 +434,11 @@ class CloudScanner(ScanModule):
         9. Container registry analysis
         10. Permission and policy analysis
         """
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
@@ -436,7 +450,7 @@ class CloudScanner(ScanModule):
         # Collect content for analysis
         all_content = await self._collect_content(base_url, asset_data)
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Phase 1: AWS Resource Analysis
             aws_findings = await self._scan_aws_resources(
                 client, base_url, domain, all_content, rate_limiter
@@ -504,36 +518,36 @@ class CloudScanner(ScanModule):
         """Collect page and JS content for analysis."""
         content_parts = []
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             # Get main page
             try:
                 response = await client.get(base_url)
                 content_parts.append(response.text)
             except Exception as e:
                 logger.debug(f"Failed to get page content: {e}")
-            
+
             # Get JS files
-            js_files = asset_data.get("js_files", [])
+            js_files = asset_data.get("js_files", []) if isinstance(asset_data, dict) else []
             for js_url in js_files[:15]:
                 try:
                     response = await client.get(js_url)
                     content_parts.append(response.text)
-                except Exception:
+                except (httpx.HTTPError, httpx.TimeoutException):
                     continue
-            
+
             # Get common API config endpoints
             config_paths = [
                 "/config.js", "/app/config.js", "/static/js/config.js",
                 "/env.js", "/.env.js", "/settings.js",
                 "/api/config", "/api/v1/config",
             ]
-            
+
             for path in config_paths:
                 try:
                     response = await client.get(urljoin(base_url, path))
                     if response.status_code == 200:
                         content_parts.append(response.text)
-                except Exception:
+                except (httpx.HTTPError, httpx.TimeoutException):
                     continue
         
         return "\n".join(content_parts)
@@ -595,12 +609,12 @@ class CloudScanner(ScanModule):
         if cognito_pools:
             findings.append(Finding(
                 name="AWS Cognito User Pool Exposed",
-                severity="MEDIUM",
-                confidence="HIGH",
+                severity=Severity.MEDIUM,
+                confidence_score=85.0,
                 description="AWS Cognito endpoints discovered in application code",
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Cognito pools: {list(cognito_pools)[:3]}"],
-                cwe="CWE-200",
+                cwe_id="CWE-200",
                 cvss_score=5.3,
                 remediation="Ensure Cognito pools are properly configured with strong security settings",
             ))
@@ -626,16 +640,16 @@ class CloudScanner(ScanModule):
                     
                     return Finding(
                         name="Public S3 Bucket with Directory Listing",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"S3 bucket '{bucket}' allows public listing. All objects are enumerable.",
-                        matched_at=bucket_url,
+                        endpoint=bucket_url,
                         evidence=[
                             f"Bucket: {bucket}",
                             "Directory listing enabled",
                             f"Sample objects: {keys}",
                         ],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=9.1,
                         remediation=(
                             "1. Enable S3 Block Public Access at account level\n"
@@ -648,12 +662,12 @@ class CloudScanner(ScanModule):
                 else:
                     return Finding(
                         name="Public S3 Bucket Access",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"S3 bucket '{bucket}' is publicly accessible",
-                        matched_at=bucket_url,
+                        endpoint=bucket_url,
                         evidence=[f"Bucket: {bucket}", "HTTP 200 response"],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=7.5,
                         remediation="Review bucket access policies and restrict as needed",
                     )
@@ -665,27 +679,27 @@ class CloudScanner(ScanModule):
                     if acl_response.status_code == 200 and "<AccessControlList>" in acl_response.text:
                         return Finding(
                             name="S3 Bucket ACL Publicly Readable",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description=f"S3 bucket '{bucket}' ACL is publicly readable",
-                            matched_at=f"{bucket_url}?acl",
+                            endpoint=f"{bucket_url}?acl",
                             evidence=[f"Bucket: {bucket}", "ACL exposed"],
-                            cwe="CWE-732",
+                            cwe_id="CWE-732",
                             cvss_score=5.3,
                             remediation="Disable public ACL access",
                         )
-                except Exception:
+                except (httpx.HTTPError, httpx.TimeoutException):
                     pass
                 
                 # Bucket exists but is private - info only
                 return Finding(
                     name="S3 Bucket Discovered",
-                    severity="INFO",
-                    confidence="HIGH",
+                    severity=Severity.INFO,
+                    confidence_score=85.0,
                     description=f"S3 bucket '{bucket}' exists (access denied)",
-                    matched_at=bucket_url,
+                    endpoint=bucket_url,
                     evidence=[f"Bucket: {bucket}"],
-                    cwe="CWE-200",
+                    cwe_id="CWE-200",
                     cvss_score=0.0,
                     remediation="No action needed if intentionally private",
                 )
@@ -710,15 +724,15 @@ class CloudScanner(ScanModule):
             if response.status_code != 403:
                 return Finding(
                     name="AWS Lambda Function URL Exposed",
-                    severity="MEDIUM",
-                    confidence="HIGH",
+                    severity=Severity.MEDIUM,
+                    confidence_score=85.0,
                     description=f"Lambda function URL is publicly accessible: {lambda_url}",
-                    matched_at=full_url,
+                    endpoint=full_url,
                     evidence=[
                         f"Function URL: {lambda_url}",
                         f"Response code: {response.status_code}",
                     ],
-                    cwe="CWE-284",
+                    cwe_id="CWE-284",
                     cvss_score=5.3,
                     remediation="Configure Lambda function URL authentication (AWS_IAM or custom auth)",
                 )
@@ -748,12 +762,12 @@ class CloudScanner(ScanModule):
                     if response.status_code == 200 and ("swagger" in response.text.lower() or "openapi" in response.text.lower()):
                         return Finding(
                             name="API Gateway Documentation Exposed",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description=f"API documentation is publicly accessible at {full_url}{path}",
-                            matched_at=f"{full_url}{path}",
+                            endpoint=f"{full_url}{path}",
                             evidence=[f"Endpoint: {endpoint}", f"Docs at: {path}"],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=5.3,
                             remediation="Restrict API documentation access in production",
                         )
@@ -806,12 +820,12 @@ class CloudScanner(ScanModule):
         if keyvaults:
             findings.append(Finding(
                 name="Azure Key Vault Reference Discovered",
-                severity="INFO",
-                confidence="HIGH",
+                severity=Severity.INFO,
+                confidence_score=85.0,
                 description="Azure Key Vault references found in application",
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Key Vaults: {list(keyvaults)[:3]}"],
-                cwe="CWE-200",
+                cwe_id="CWE-200",
                 cvss_score=0.0,
                 remediation="Ensure Key Vault access policies are properly configured",
             ))
@@ -848,15 +862,15 @@ class CloudScanner(ScanModule):
                     
                     return Finding(
                         name="Azure Blob Storage Public Container Enumeration",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"Azure storage account '{account}' allows public container enumeration",
-                        matched_at=blob_url,
+                        endpoint=blob_url,
                         evidence=[
                             f"Account: {account}",
                             f"Containers: {containers}",
                         ],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=9.1,
                         remediation=(
                             "1. Disable public blob access at storage account level\n"
@@ -887,12 +901,12 @@ class CloudScanner(ScanModule):
                 if "Your Azure Function App is up and running" in response.text:
                     return Finding(
                         name="Azure Function App Default Page Exposed",
-                        severity="LOW",
-                        confidence="HIGH",
+                        severity=Severity.LOW,
+                        confidence_score=85.0,
                         description=f"Azure Function App default page is accessible: {app}",
-                        matched_at=func_url,
+                        endpoint=func_url,
                         evidence=[f"Function App: {app}"],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         cvss_score=3.1,
                         remediation="Configure function authorization levels appropriately",
                     )
@@ -902,12 +916,12 @@ class CloudScanner(ScanModule):
                 if scm_response.status_code != 401:
                     return Finding(
                         name="Azure Function App SCM (Kudu) Exposed",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Azure Function App SCM endpoint accessible without auth: {app}",
-                        matched_at=f"https://{app}.scm.azurewebsites.net",
+                        endpoint=f"https://{app}.scm.azurewebsites.net",
                         evidence=[f"Function App: {app}", "SCM endpoint accessible"],
-                        cwe="CWE-306",
+                        cwe_id="CWE-306",
                         cvss_score=8.1,
                         remediation="Restrict SCM site access using IP restrictions or authentication",
                     )
@@ -931,25 +945,27 @@ class CloudScanner(ScanModule):
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    repositories = data.get("repositories", [])[:5]
+                    repositories = []
+                    if isinstance(asset_data, dict):
+                        repositories = data.get("repositories", [])[:5]
                     
                     return Finding(
                         name="Azure Container Registry Public Access",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"Azure Container Registry '{registry}' is publicly accessible",
-                        matched_at=acr_url,
+                        endpoint=acr_url,
                         evidence=[
                             f"Registry: {registry}",
                             f"Repositories: {repositories}",
                         ],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=9.1,
                         remediation="Disable anonymous pull access and use Azure AD authentication",
                     )
-                except Exception:
+                except (httpx.HTTPError, httpx.TimeoutException, KeyError):
                     pass
-        except Exception as e:
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.debug(f"ACR test error: {e}")
         
         return None
@@ -986,12 +1002,12 @@ class CloudScanner(ScanModule):
         for func in list(functions)[:5]:
             findings.append(Finding(
                 name="GCP Cloud Function Discovered",
-                severity="INFO",
-                confidence="HIGH",
+                severity=Severity.INFO,
+                confidence_score=85.0,
                 description=f"GCP Cloud Function endpoint discovered: {func}",
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Function: {func}"],
-                cwe="CWE-200",
+                cwe_id="CWE-200",
                 cvss_score=0.0,
                 remediation="Ensure Cloud Functions have appropriate authentication",
             ))
@@ -1028,15 +1044,15 @@ class CloudScanner(ScanModule):
                     
                     return Finding(
                         name="GCP Storage Bucket Public Listing",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"GCP bucket '{bucket}' allows public listing",
-                        matched_at=bucket_url,
+                        endpoint=bucket_url,
                         evidence=[
                             f"Bucket: {bucket}",
                             f"Sample objects: {keys}",
                         ],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=9.1,
                         remediation=(
                             "1. Remove public access using gsutil or Console\n"
@@ -1048,12 +1064,12 @@ class CloudScanner(ScanModule):
             elif response.status_code == 403:
                 return Finding(
                     name="GCP Storage Bucket Discovered",
-                    severity="INFO",
-                    confidence="HIGH",
+                    severity=Severity.INFO,
+                    confidence_score=85.0,
                     description=f"GCP bucket '{bucket}' exists (access denied)",
-                    matched_at=bucket_url,
+                    endpoint=bucket_url,
                     evidence=[f"Bucket: {bucket}"],
-                    cwe="CWE-200",
+                    cwe_id="CWE-200",
                     cvss_score=0.0,
                     remediation="No action needed if intentionally private",
                 )
@@ -1077,12 +1093,12 @@ class CloudScanner(ScanModule):
             if response.status_code == 200:
                 return Finding(
                     name="GCP Container Registry Public Access",
-                    severity="HIGH",
-                    confidence="HIGH",
+                    severity=Severity.HIGH,
+                    confidence_score=85.0,
                     description=f"GCR project '{project}' is publicly accessible",
-                    matched_at=gcr_url,
+                    endpoint=gcr_url,
                     evidence=[f"Project: {project}"],
-                    cwe="CWE-732",
+                    cwe_id="CWE-732",
                     cvss_score=7.5,
                     remediation="Configure IAM policies to restrict GCR access",
                 )
@@ -1123,15 +1139,15 @@ class CloudScanner(ScanModule):
                             
                             findings.append(Finding(
                                 name="Firebase Realtime Database Public Read",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description=f"Firebase database '{project}' is publicly readable",
-                                matched_at=db_url,
+                                endpoint=db_url,
                                 evidence=[
                                     f"Project: {project}",
                                     f"Data preview: {data_preview}...",
                                 ],
-                                cwe="CWE-306",
+                                cwe_id="CWE-306",
                                 cvss_score=9.8,
                                 remediation=(
                                     "1. Configure Firebase Security Rules\n"
@@ -1160,19 +1176,19 @@ class CloudScanner(ScanModule):
                             
                             findings.append(Finding(
                                 name="Firebase Realtime Database Public Write",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description=f"Firebase database '{project}' allows public writes",
-                                matched_at=test_path,
+                                endpoint=test_path,
                                 evidence=[f"Project: {project}", "Write successful"],
-                                cwe="CWE-306",
+                                cwe_id="CWE-306",
                                 cvss_score=10.0,
                                 remediation="IMMEDIATELY configure Firebase Security Rules to require authentication",
                             ))
-                    except Exception:
+                    except (httpx.HTTPError, httpx.TimeoutException):
                         pass
-                    
-            except Exception as e:
+
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
                 logger.debug(f"Firebase test error: {e}")
         
         return findings
@@ -1203,18 +1219,18 @@ class CloudScanner(ScanModule):
                 if response.status_code == 200 and "<ListBucketResult" in response.text:
                     findings.append(Finding(
                         name="DigitalOcean Space Public Listing",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"DigitalOcean Space '{space}' allows public listing",
-                        matched_at=space_url,
+                        endpoint=space_url,
                         evidence=[f"Space: {space}"],
-                        cwe="CWE-732",
+                        cwe_id="CWE-732",
                         cvss_score=7.5,
                         remediation="Disable public file listing in Space settings",
                     ))
-            except Exception:
+            except (httpx.HTTPError, httpx.TimeoutException):
                 pass
-        
+
         # Heroku apps
         heroku_apps = set()
         for pattern in self.HEROKU_PATTERNS:
@@ -1224,12 +1240,12 @@ class CloudScanner(ScanModule):
         for app in list(heroku_apps)[:3]:
             findings.append(Finding(
                 name="Heroku Application Discovered",
-                severity="INFO",
-                confidence="HIGH",
+                severity=Severity.INFO,
+                confidence_score=85.0,
                 description=f"Heroku application '{app}' referenced in code",
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"App: {app}.herokuapp.com"],
-                cwe="CWE-200",
+                cwe_id="CWE-200",
                 cvss_score=0.0,
                 remediation="Ensure Heroku app is properly secured",
             ))
@@ -1272,14 +1288,14 @@ class CloudScanner(ScanModule):
                         findings.append(Finding(
                             name=f"Exposed {description}",
                             severity=severity,
-                            confidence="HIGH",
+                            confidence_score=85.0,
                             description=f"{description} found in application code/response",
-                            matched_at=base_url,
+                            endpoint=base_url,
                             evidence=[
                                 f"Credential type: {description}",
                                 f"Masked value: {masked}",
                             ],
-                            cwe="CWE-312",
+                            cwe_id="CWE-312",
                             cvss_score=9.8 if severity == "CRITICAL" else (7.5 if severity == "HIGH" else 5.3),
                             remediation=(
                                 "1. IMMEDIATELY rotate the exposed credential\n"
@@ -1301,7 +1317,19 @@ class CloudScanner(ScanModule):
     ) -> list[Finding]:
         """Enumerate potential S3 buckets based on domain."""
         findings = []
-        
+
+        # Skip S3 enumeration for localhost/local targets - makes no sense!
+        local_indicators = [
+            "localhost", "127.0.0.1", "::1", "0.0.0.0",
+            "192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.",
+            "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+            "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+            ".local", ".internal", ".lan", ".home"
+        ]
+        if any(indicator in domain.lower() for indicator in local_indicators):
+            logger.debug(f"[Cloud Scanner] Skipping S3 enumeration for local target: {domain}")
+            return findings
+
         # Generate potential bucket names
         domain_parts = domain.replace(".", "-").split("-")
         base_names = [domain.replace(".", "-"), domain.replace(".", "")]
@@ -1359,16 +1387,16 @@ class CloudScanner(ScanModule):
                     if any(indicator in response.text for indicator in indicators):
                         findings.append(Finding(
                             name=f"Cloud Metadata Access via SSRF - {provider}",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description=f"{provider} accessible via SSRF in {param} parameter",
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Parameter: {param}",
                                 f"Target: {target}",
                                 f"Provider: {provider}",
                             ],
-                            cwe="CWE-918",
+                            cwe_id="CWE-918",
                             cvss_score=10.0,
                             remediation=(
                                 "1. CRITICAL: Cloud credentials may be compromised\n"
@@ -1407,12 +1435,12 @@ class CloudScanner(ScanModule):
             if re.search(pattern, content, re.IGNORECASE):
                 findings.append(Finding(
                     name=f"Serverless Configuration Exposed - {indicator}",
-                    severity="MEDIUM",
-                    confidence="MEDIUM",
+                    severity=Severity.MEDIUM,
+                    confidence_score=65.0,
                     description=f"Serverless function configuration ({indicator}) may be exposed",
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"Pattern: {pattern}"],
-                    cwe="CWE-200",
+                    cwe_id="CWE-200",
                     cvss_score=5.3,
                     remediation="Remove infrastructure configuration from public-facing code",
                 ))
@@ -1502,7 +1530,7 @@ class CloudScanner(ScanModule):
         unique = []
         
         for finding in findings:
-            key = (finding.name, finding.matched_at)
+            key = (finding.name, finding.endpoint)
             if key not in seen:
                 seen.add(key)
                 unique.append(finding)

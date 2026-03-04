@@ -26,7 +26,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
@@ -47,7 +48,7 @@ class OAuthScanner:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.oauth_config: OAuthConfig | None = None
 
     async def scan(
@@ -62,7 +63,7 @@ class OAuthScanner:
         findings = []
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 # Check for OpenID configuration
                 await rate_limiter.acquire()
 
@@ -82,16 +83,16 @@ class OAuthScanner:
                                 response_types = config.get("response_types_supported", [])
                                 if "token" in response_types:
                                     findings.append(Finding(
-                                        type="authentication",
+                                        vuln_type=VulnType.AUTH_BYPASS,
                                         name="OAuth Implicit Flow Supported",
-                                        severity="MEDIUM",
+                                        severity=Severity.MEDIUM,
                                         description="OAuth server supports implicit flow (response_type=token). "
                                                    "This is deprecated and can leak tokens via browser history.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[f"response_types_supported: {response_types}"],
                                         cvss_score=5.3,
-                                        cwe="CWE-319",
+                                        cwe_id="CWE-319",
                                         remediation="Disable implicit flow. Use authorization code flow with PKCE.",
                                     ).to_dict())
 
@@ -99,16 +100,16 @@ class OAuthScanner:
                                 pkce_methods = config.get("code_challenge_methods_supported", [])
                                 if not pkce_methods or "S256" not in pkce_methods:
                                     findings.append(Finding(
-                                        type="authentication",
+                                        vuln_type=VulnType.AUTH_BYPASS,
                                         name="OAuth Missing PKCE Support",
-                                        severity="LOW",
+                                        severity=Severity.LOW,
                                         description="OAuth server does not advertise PKCE support. "
                                                    "Authorization code flow may be vulnerable to interception.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[f"code_challenge_methods_supported: {pkce_methods}"],
                                         cvss_score=3.7,
-                                        cwe="CWE-287",
+                                        cwe_id="CWE-287",
                                         remediation="Enable PKCE with S256 method for all clients.",
                                     ).to_dict())
 
@@ -116,16 +117,16 @@ class OAuthScanner:
                                 grant_types = config.get("grant_types_supported", [])
                                 if "password" in grant_types:
                                     findings.append(Finding(
-                                        type="authentication",
+                                        vuln_type=VulnType.AUTH_BYPASS,
                                         name="OAuth Resource Owner Password Grant Supported",
-                                        severity="LOW",
+                                        severity=Severity.LOW,
                                         description="OAuth server supports password grant. "
                                                    "This exposes user credentials to the client application.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[f"grant_types_supported: {grant_types}"],
                                         cvss_score=4.0,
-                                        cwe="CWE-287",
+                                        cwe_id="CWE-287",
                                         remediation="Disable password grant for public clients. "
                                                    "Use authorization code flow instead.",
                                     ).to_dict())
@@ -152,16 +153,16 @@ class OAuthScanner:
                         if parsed.scheme and parsed.netloc:
                             if parsed.netloc != urlparse(base_url).netloc:
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="OAuth Open Redirect Risk",
-                                    severity="MEDIUM",
+                                    severity=Severity.MEDIUM,
                                     description="OAuth redirect_uri may be vulnerable to open redirect. "
                                                "Attackers could steal authorization codes.",
                                     host=base_url,
-                                    matched_at=base_url,
+                                    endpoint=base_url,
                                     evidence=[f"Redirect found: {match[:100]}"],
                                     cvss_score=6.1,
-                                    cwe="CWE-601",
+                                    cwe_id="CWE-601",
                                     remediation="Whitelist redirect URIs. "
                                                "Do not allow arbitrary redirect destinations.",
                                 ).to_dict())
@@ -207,16 +208,16 @@ class OAuthScanner:
                     for pattern in secret_patterns:
                         if re.search(pattern, resp.text, re.I):
                             findings.append(Finding(
-                                type="authentication",
+                                vuln_type=VulnType.AUTH_BYPASS,
                                 name="OAuth Client Secret Exposed",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description="OAuth client secret found in response. "
                                            "This allows attackers to impersonate the client.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[f"Secret pattern found at: {url}"],
                                 cvss_score=7.5,
-                                cwe="CWE-798",
+                                cwe_id="CWE-798",
                                 remediation="Remove client secrets from public responses. "
                                            "Use PKCE for public clients instead of secrets.",
                             ).to_dict())
@@ -225,16 +226,16 @@ class OAuthScanner:
                     # Check for missing state parameter
                     if "authorize" in path and "state" not in content:
                         findings.append(Finding(
-                            type="authentication",
+                            vuln_type=VulnType.AUTH_BYPASS,
                             name="OAuth State Parameter Missing",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description="OAuth authorization endpoint may not require state parameter. "
                                        "This enables CSRF attacks on OAuth flow.",
                             host=base_url,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[f"No state parameter found at: {url}"],
                             cvss_score=5.3,
-                            cwe="CWE-352",
+                            cwe_id="CWE-352",
                             remediation="Require and validate state parameter on all OAuth requests.",
                         ).to_dict())
 

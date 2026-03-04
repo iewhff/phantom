@@ -44,6 +44,14 @@ from scanning.modules.dns_rebinding_scanner import DNSRebindingScanner
 from scanning.modules.email_security_scanner import EmailSecurityScanner
 from scanning.modules.sse_scanner import SSEScanner
 from scanning.modules.rate_limit_scanner import RateLimitScanner
+# Coverage Gaps v2.0 (2026-02-19)
+from scanning.modules.graphql_subscription_scanner import GraphQLSubscriptionScanner
+from scanning.modules.llm_security_scanner import LLMSecurityScanner
+from scanning.modules.rsc_scanner import RSCScanner
+from scanning.modules.edge_function_scanner import EdgeFunctionScanner
+from scanning.modules.grpc_web_scanner import GRPCWebScanner
+from scanning.modules.http3_scanner import HTTP3Scanner
+from scanning.modules.webtransport_scanner import WebTransportScanner
 
 __all__ = [
     # Original modules
@@ -93,4 +101,12 @@ __all__ = [
     "EmailSecurityScanner",
     "SSEScanner",
     "RateLimitScanner",
+    # Coverage Gaps v2.0 (2026-02-19)
+    "GraphQLSubscriptionScanner",
+    "LLMSecurityScanner",
+    "RSCScanner",
+    "EdgeFunctionScanner",
+    "GRPCWebScanner",
+    "HTTP3Scanner",
+    "WebTransportScanner",
 ]

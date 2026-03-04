@@ -294,10 +294,11 @@ class StateManager:
                     latest_time = timestamp
                     phase_name = data["phase"]
                     latest_phase = ScanPhase[phase_name] if phase_name in ScanPhase.__members__ else None
-                    
-            except Exception:
+
+            except (json.JSONDecodeError, OSError, KeyError) as e:
+                logger.debug(f"Error loading state: {e}")
                 continue
-        
+
         return latest_phase
     
     def _update_scan_status(
@@ -675,7 +676,7 @@ class StateManager:
                         events.append(event)
 
                     except (json.JSONDecodeError, KeyError):
-                        continue
+                        continue  # FIX 2026-02-12: Expected - malformed event entry
 
         except Exception as e:
             logger.error(f"Failed to read timeline: {e}")
@@ -926,7 +927,7 @@ class StateManager:
                 scan_id="abc123",
                 event_type="MODULE_COMPLETED",
                 data={"module": "sqli_scanner", "findings": 3},
-                severity="info"
+                severity="INFO"
             )
         """
         event_data = {

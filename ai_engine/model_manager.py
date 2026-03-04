@@ -408,9 +408,10 @@ class ModelManager:
                 if response.status_code == 200:
                     data = response.json()
                     return [m["name"] for m in data.get("models", [])]
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log model listing error
+            logger.debug(f"[ModelManager] Error listing models: {e}")
+
         return []
     
     def parse_json_response(

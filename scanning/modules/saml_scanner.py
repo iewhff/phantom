@@ -6,17 +6,19 @@ Tests for SAML/SSO Federation vulnerabilities.
 from __future__ import annotations
 
 import base64
-import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin, parse_qs, urlparse, quote
+from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -83,9 +85,15 @@ class SAMLScanner(ScanModule):
         "/sso/discovery",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -94,18 +102,26 @@ class SAMLScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for SAML security vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
-        
+
         base_url = f"https://{host}" if not host.startswith("http") else host
-        
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+
+        # DIAG 2026-03-02: Log scan entry for debugging silent failures
+        logger.warning(f"[SAML] SCAN START — host={host}, base_url={base_url}")
+
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Discover SAML endpoints
             saml_endpoints = await self._discover_saml_endpoints(
                 client, base_url, rate_limiter
             )
-            
+
             if not saml_endpoints:
-                logger.info(f"No SAML endpoints found for {host}")
+                logger.warning(f"[SAML] SCAN END — no SAML endpoints found for {host} (0 findings)")
                 return findings
             
             # Check SAML metadata exposure
@@ -155,7 +171,11 @@ class SAMLScanner(ScanModule):
                 client, base_url, saml_endpoints, rate_limiter
             )
             findings.extend(xxe_findings)
-        
+
+        # DIAG 2026-03-02: Log scan exit with summary
+        logger.warning(f"[SAML] SCAN END — {len(saml_endpoints)} endpoints discovered, "
+                       f"{len(findings)} findings")
+
         return findings
     
     async def _discover_saml_endpoints(
@@ -164,32 +184,77 @@ class SAMLScanner(ScanModule):
         base_url: str,
         rate_limiter: RateLimiter,
     ) -> list[str]:
-        """Discover SAML endpoints."""
+        """Discover SAML endpoints.
+
+        FIX 2026-03-02: Two-phase discovery.
+        Phase 1: GET — check for SAML content markers (metadata, IdP discovery).
+        Phase 2: POST with dummy SAMLResponse — check for SAML-specific error
+                 response (ACS endpoints only respond to POST, not GET).
+        """
         endpoints = []
-        
+
+        saml_indicators = [
+            "samlrequest", "samlresponse", "entityid",
+            "assertionconsumerservice", "singlesignonservice",
+            "x509certificate", "saml:assertion", "saml2:",
+            "urn:oasis:names:tc:saml", "samlp:",
+        ]
+        # ACS-type paths that only accept POST
+        acs_keywords = ("acs", "consume", "callback")
+
         all_endpoints = self.SAML_ENDPOINTS + self.METADATA_ENDPOINTS + self.IDP_DISCOVERY
-        
+        logger.warning(f"[SAML] Discovery: probing {len(all_endpoints)} candidate paths")
+
         for path in all_endpoints:
             await rate_limiter.acquire()
-            
+
             try:
                 url = urljoin(base_url, path)
                 response = await client.get(url, follow_redirects=False)
-                
-                # Check for SAML indicators
+
                 if response.status_code != 404:
-                    # Check response content for SAML indicators
                     content = response.text.lower()
-                    if any(ind in content for ind in [
-                        "saml", "entityid", "assertionconsumerservice",
-                        "singlesignonservice", "x509certificate"
-                    ]) or response.status_code in [200, 302, 400]:
+                    has_saml_content = any(ind in content for ind in saml_indicators)
+                    if has_saml_content:
                         endpoints.append(url)
-                        logger.info(f"SAML endpoint found: {url}")
-                        
+                        logger.info(f"SAML endpoint found (content verified): {url}")
+                        continue
+
+                    # Phase 2: For ACS-type endpoints, try POST with dummy SAMLResponse.
+                    # Real ACS endpoints return SAML-specific errors; non-SAML apps
+                    # return generic HTML/JSON responses.
+                    path_lower = path.lower()
+                    if any(kw in path_lower for kw in acs_keywords):
+                        await rate_limiter.acquire()
+                        try:
+                            post_resp = await client.post(
+                                url,
+                                data={"SAMLResponse": "dGVzdA=="},  # base64("test")
+                            )
+                            post_body = post_resp.text.lower()
+                            # SAML-specific error = endpoint processes SAML
+                            saml_error_indicators = [
+                                "saml", "assertion", "signature",
+                                "xml", "certificate", "issuer",
+                                "invalid_response", "malformed",
+                            ]
+                            has_saml_error = any(
+                                ind in post_body for ind in saml_error_indicators
+                            )
+                            # Reject: SPA shell or generic HTML
+                            is_generic = (
+                                "<!doctype" in post_body or "<html" in post_body
+                            ) and not has_saml_error
+                            if has_saml_error and not is_generic:
+                                endpoints.append(url)
+                                logger.info(f"SAML ACS endpoint found (POST verified): {url}")
+                        except Exception:
+                            pass
+
             except Exception as e:
                 logger.debug(f"Error checking SAML endpoint {path}: {e}")
-        
+
+        logger.warning(f"[SAML] Discovery done: {len(endpoints)} confirmed SAML endpoints out of {len(all_endpoints)} probed")
         return endpoints
     
     async def _test_metadata_exposure(
@@ -211,14 +276,16 @@ class SAMLScanner(ScanModule):
                 if response.status_code == 200 and "xml" in response.headers.get("content-type", ""):
                     findings.append(Finding(
                         name="SAML Metadata Exposed",
-                        severity="INFO",
-                        confidence="HIGH",
+                        severity=Severity.INFO,
+                        confidence_score=85.0,
                         description="SAML SP metadata is publicly accessible",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=["SAML metadata XML returned"],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         remediation="Review if metadata should be public. "
                                    "Ensure sensitive configuration is not exposed.",
+                        vuln_type=VulnType.INFO_DISCLOSURE,
+                        scanner="saml_scanner",
                     ))
                     
                     # Parse and check metadata
@@ -229,41 +296,47 @@ class SAMLScanner(ScanModule):
                         if "X509Certificate" in response.text:
                             findings.append(Finding(
                                 name="SAML Certificate in Metadata",
-                                severity="INFO",
-                                confidence="HIGH",
+                                severity=Severity.INFO,
+                                confidence_score=85.0,
                                 description="X509 certificate exposed in SAML metadata",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Certificate found in metadata"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 remediation="This is normal but verify certificate is not private key.",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
+                                scanner="saml_scanner",
                             ))
                         
                         # Check for weak encryption
                         if "http://www.w3.org/2001/04/xmlenc#tripledes-cbc" in response.text:
                             findings.append(Finding(
                                 name="Weak Encryption in SAML",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="SAML metadata specifies weak encryption (3DES)",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Triple-DES encryption algorithm found"],
-                                cwe="CWE-327",
+                                cwe_id="CWE-327",
                                 cvss_score=5.3,
                                 remediation="Use AES-256 or stronger encryption.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                         # Check for SHA-1
                         if "http://www.w3.org/2000/09/xmldsig#sha1" in response.text:
                             findings.append(Finding(
                                 name="Weak Hash Algorithm in SAML (SHA-1)",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="SAML uses SHA-1 which is cryptographically weak",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["SHA-1 algorithm in SAML configuration"],
-                                cwe="CWE-328",
+                                cwe_id="CWE-328",
                                 cvss_score=5.3,
                                 remediation="Upgrade to SHA-256 or SHA-512.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                     except ET.ParseError:
@@ -330,20 +403,22 @@ class SAMLScanner(ScanModule):
                            "assertion" in response.text.lower():
                             findings.append(Finding(
                                 name="Potential XSW Vulnerability - Manual Test Required",
-                                severity="HIGH",
-                                confidence="LOW",
+                                severity=Severity.HIGH,
+                                confidence_score=40.0,
                                 description="Server processed SAML with multiple assertions. "
                                            "Manual testing required for XML Signature Wrapping.",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     "Multiple assertion SAML was processed",
                                     "XSW attack surface detected",
                                 ],
-                                cwe="CWE-347",
+                                cwe_id="CWE-347",
                                 cvss_score=8.1,
                                 remediation="Implement strict signature validation. "
                                            "Ensure only signed assertions are trusted. "
                                            "Use XPath to validate exact assertion location.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                 except Exception as e:
@@ -403,17 +478,19 @@ class SAMLScanner(ScanModule):
                         if response.status_code in [200, 302]:
                             findings.append(Finding(
                                 name=f"SAML {manipulation['name']} Possible",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description=f"SAML endpoint may not properly validate {manipulation['name']}",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     f"Manipulation type: {manipulation['name']}",
                                     f"Response status: {response.status_code}",
                                 ],
-                                cwe="CWE-287",
+                                cwe_id="CWE-287",
                                 cvss_score=8.1,
                                 remediation="Implement strict SAML response validation.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                     except Exception as e:
@@ -474,32 +551,54 @@ class SAMLScanner(ScanModule):
                         data={"SAMLResponse": encoded},
                     )
                     
-                    # Check for authentication success indicators
-                    success_indicators = [
-                        "welcome", "dashboard", "logged in", "session",
-                        "authenticated", "success"
+                    # FIX 2026-03-01: Require strong evidence of authentication success.
+                    # A 200/302 alone is NOT proof — SPAs return 200 for everything,
+                    # and 302 redirects to / are normal error handling.
+                    auth_indicators = [
+                        "welcome", "dashboard", "logged in", "session_id",
+                        "authenticated", "set-cookie",
                     ]
-                    
+
                     if response.status_code in [200, 302]:
                         response_text = response.text.lower()
-                        
-                        if any(ind in response_text for ind in success_indicators) or \
-                           (response.status_code == 302 and "login" not in response.headers.get("location", "").lower()):
+                        resp_headers = str(response.headers).lower()
+
+                        # Require ACTUAL auth evidence: session cookie set or auth content
+                        has_session_cookie = any(
+                            cookie_name in resp_headers
+                            for cookie_name in ["set-cookie", "session", "jsessionid", "phpsessid"]
+                        )
+                        has_auth_content = any(ind in response_text for ind in auth_indicators)
+                        # Reject: generic 200 (SPA shell) or redirect to root/home
+                        is_spa_shell = (
+                            response.status_code == 200
+                            and ("<!doctype" in response_text or "<html" in response_text)
+                            and not has_auth_content
+                        )
+                        is_generic_redirect = (
+                            response.status_code == 302
+                            and response.headers.get("location", "").rstrip("/") in ("", "/", "/#")
+                        )
+
+                        if (has_session_cookie or has_auth_content) and not is_spa_shell and not is_generic_redirect:
                             findings.append(Finding(
                                 name="Unsigned SAML Response Accepted",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description="SAML endpoint accepts unsigned assertions. "
                                            "Full authentication bypass possible.",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     "Unsigned SAML assertion accepted",
                                     f"Response: {response.status_code}",
+                                    f"Auth evidence: session_cookie={has_session_cookie}, auth_content={has_auth_content}",
                                 ],
-                                cwe="CWE-347",
+                                cwe_id="CWE-347",
                                 cvss_score=9.8,
                                 remediation="ALWAYS require and validate XML signatures. "
                                            "Reject any unsigned SAML assertions.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                 except Exception as e:
@@ -542,23 +641,37 @@ class SAMLScanner(ScanModule):
                         data={"SAMLResponse": encoded},
                     )
                     
-                    # Check if comment was processed
-                    if response.status_code not in [400, 500]:
-                        findings.append(Finding(
-                            name="SAML Comment Injection Possible",
-                            severity="HIGH",
-                            confidence="LOW",
-                            description="SAML endpoint may be vulnerable to comment injection "
-                                       "(CVE-2017-11427 style attack)",
-                            matched_at=endpoint,
-                            evidence=[
-                                "Comment-injected SAML was processed",
-                                "Manual verification required",
-                            ],
-                            cwe="CWE-91",
+                    # FIX 2026-03-01: Require evidence of SAML processing,
+                    # not just "not error". Non-SAML endpoints return 200/302 trivially.
+                    if response.status_code in [200, 302]:
+                        resp_text = response.text.lower()
+                        resp_headers = str(response.headers).lower()
+                        # Evidence: response shows SAML processing or sets auth cookies
+                        saml_processed = (
+                            "evil.com" in resp_text  # Comment injection actually parsed
+                            or "set-cookie" in resp_headers
+                            or any(s in resp_text for s in ["saml", "assertion", "authenticated"])
+                        )
+                        is_generic = "<!doctype" in resp_text or "<html" in resp_text
+                        if saml_processed and not is_generic:
+                            findings.append(Finding(
+                                name="SAML Comment Injection Possible",
+                                severity=Severity.HIGH,
+                                confidence_score=40.0,
+                                description="SAML endpoint may be vulnerable to comment injection "
+                                           "(CVE-2017-11427 style attack)",
+                                endpoint=endpoint,
+                                evidence=[
+                                    "Comment-injected SAML was processed",
+                                    "Server accepted modified assertion without signature rejection",
+                                    f"Response: {response.status_code}",
+                                ],
+                            cwe_id="CWE-91",
                             cvss_score=8.1,
                             remediation="Use XML canonicalization before signature verification. "
                                        "Update SAML libraries to latest versions.",
+                            vuln_type=VulnType.SAML_VULNERABILITY,
+                            scanner="saml_scanner",
                         ))
                         
                 except Exception as e:
@@ -601,25 +714,35 @@ class SAMLScanner(ScanModule):
                         data={"SAMLResponse": encoded},
                     )
                     
-                    # If old assertion wasn't rejected
-                    if response.status_code not in [400, 403, 500]:
-                        if "expired" not in response.text.lower() and \
-                           "invalid" not in response.text.lower():
+                    # FIX 2026-03-01: Require evidence of SAML processing.
+                    if response.status_code in [200, 302]:
+                        resp_text = response.text.lower()
+                        resp_headers = str(response.headers).lower()
+                        # Must NOT contain rejection keywords AND show processing
+                        is_rejected = any(w in resp_text for w in ["expired", "invalid", "error"])
+                        shows_processing = (
+                            "set-cookie" in resp_headers
+                            or any(s in resp_text for s in ["saml", "assertion", "authenticated", "session"])
+                        )
+                        is_generic = "<!doctype" in resp_text or "<html" in resp_text
+                        if not is_rejected and shows_processing and not is_generic:
                             findings.append(Finding(
                                 name="SAML Assertion Replay Possible",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description="SAML endpoint may accept expired assertions. "
                                            "Replay attacks possible.",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     f"30-day old assertion not rejected",
                                     f"Status: {response.status_code}",
                                 ],
-                                cwe="CWE-294",
+                                cwe_id="CWE-294",
                                 cvss_score=7.4,
                                 remediation="Implement strict NotOnOrAfter validation. "
                                            "Store and check assertion IDs for replay.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                 except Exception as e:
@@ -663,25 +786,36 @@ class SAMLScanner(ScanModule):
                         data={"SAMLResponse": encoded},
                     )
                     
-                    # If unknown IdP wasn't immediately rejected
-                    if response.status_code not in [400, 403, 500]:
-                        if "unknown" not in response.text.lower() and \
-                           "invalid issuer" not in response.text.lower():
+                    # FIX 2026-03-01: Require SAML processing evidence.
+                    if response.status_code in [200, 302]:
+                        resp_text = response.text.lower()
+                        resp_headers = str(response.headers).lower()
+                        is_rejected = any(w in resp_text for w in [
+                            "unknown", "invalid issuer", "error", "not configured"
+                        ])
+                        shows_processing = (
+                            "set-cookie" in resp_headers
+                            or any(s in resp_text for s in ["saml", "assertion", "authenticated"])
+                        )
+                        is_generic = "<!doctype" in resp_text or "<html" in resp_text
+                        if not is_rejected and shows_processing and not is_generic:
                             findings.append(Finding(
                                 name="SAML IdP Confusion Possible",
-                                severity="HIGH",
-                                confidence="LOW",
+                                severity=Severity.HIGH,
+                                confidence_score=40.0,
                                 description="SP may not properly validate IdP issuer. "
                                            "IdP confusion attack possible.",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     "Unknown IdP issuer not rejected",
-                                    "Manual verification required",
+                                    "Server accepted assertion from unknown IdP",
                                 ],
-                                cwe="CWE-287",
+                                cwe_id="CWE-287",
                                 cvss_score=8.1,
                                 remediation="Implement strict IdP issuer validation. "
                                            "Maintain allowlist of trusted IdPs.",
+                                vuln_type=VulnType.SAML_VULNERABILITY,
+                                scanner="saml_scanner",
                             ))
                             
                 except Exception as e:
@@ -730,31 +864,46 @@ class SAMLScanner(ScanModule):
                     if "root:" in response.text or "/bin/bash" in response.text:
                         findings.append(Finding(
                             name="XXE in SAML Processing",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description="SAML processor is vulnerable to XML External Entity injection",
-                            matched_at=endpoint,
+                            endpoint=endpoint,
                             evidence=[
                                 "XXE payload executed",
                                 "File contents in response",
                             ],
-                            cwe="CWE-611",
+                            cwe_id="CWE-611",
                             cvss_score=9.1,
                             remediation="Disable external entity processing. "
                                        "Use secure XML parser configuration.",
+                            vuln_type=VulnType.XXE,
+                            scanner="saml_scanner",
                         ))
-                    elif response.status_code not in [400, 500]:
-                        # DTD was processed without immediate error
-                        findings.append(Finding(
-                            name="SAML XXE - DTD Processing Enabled",
-                            severity="HIGH",
-                            confidence="MEDIUM",
-                            description="SAML processor may allow DTD/entity processing",
-                            matched_at=endpoint,
-                            evidence=["XXE payload not rejected immediately"],
-                            cwe="CWE-611",
+                    elif response.status_code in [200, 302]:
+                        # FIX 2026-03-01: Require SAML processing evidence.
+                        resp_text = response.text.lower()
+                        resp_headers = str(response.headers).lower()
+                        shows_processing = (
+                            "set-cookie" in resp_headers
+                            or any(s in resp_text for s in ["saml", "entity", "dtd", "xxe"])
+                        )
+                        is_generic = "<!doctype" in resp_text or "<html" in resp_text
+                        if shows_processing and not is_generic:
+                            findings.append(Finding(
+                                name="SAML XXE - DTD Processing Enabled",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
+                                description="SAML processor may allow DTD/entity processing",
+                                endpoint=endpoint,
+                                evidence=[
+                                    "XXE payload not rejected",
+                                    f"Response: {response.status_code}",
+                                ],
+                            cwe_id="CWE-611",
                             cvss_score=7.5,
                             remediation="Disable DTD and external entity processing.",
+                            vuln_type=VulnType.XXE,
+                            scanner="saml_scanner",
                         ))
                         
                 except Exception as e:

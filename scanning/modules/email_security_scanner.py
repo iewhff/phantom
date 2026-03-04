@@ -5,16 +5,17 @@ Tests for email-related security vulnerabilities including SPF, DKIM, DMARC.
 
 from __future__ import annotations
 
-import re
-import socket
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -58,9 +59,15 @@ class EmailSecurityScanner(ScanModule):
         "test@test.com\nDATA\nInjected",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -69,17 +76,33 @@ class EmailSecurityScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for email security vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         # Extract domain from host
         domain = host.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
-        
+
+        # Skip DNS checks for localhost, IPs, and training apps — they have no real DNS
+        _skip_dns = (
+            domain in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            or domain.endswith(".local")
+            or domain.endswith(".internal")
+            or domain.startswith("10.")
+            or domain.startswith("172.")
+            or domain.startswith("192.168.")
+        )
+
         base_url = f"https://{host}" if not host.startswith("http") else host
-        
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
-            # Check DNS records (SPF, DKIM, DMARC)
-            dns_findings = await self._check_email_dns(domain, rate_limiter)
-            findings.extend(dns_findings)
+
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
+            # Check DNS records (SPF, DKIM, DMARC) — skip for non-DNS hosts
+            if not _skip_dns:
+                dns_findings = await self._check_email_dns(domain, rate_limiter)
+                findings.extend(dns_findings)
             
             # Test email header injection in forms
             injection_findings = await self._test_email_injection(
@@ -151,12 +174,12 @@ class EmailSecurityScanner(ScanModule):
                 if not spf_record:
                     findings.append(Finding(
                         name="Missing SPF Record",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="No SPF record found - email spoofing possible",
-                        matched_at=domain,
+                        endpoint=domain,
                         evidence=["No TXT record with v=spf1"],
-                        cwe="CWE-290",
+                        cwe_id="CWE-290",
                         cvss_score=5.3,
                         remediation="Add SPF record: v=spf1 include:_spf.domain.com -all",
                     ))
@@ -165,36 +188,36 @@ class EmailSecurityScanner(ScanModule):
                     if "+all" in spf_record:
                         findings.append(Finding(
                             name="Weak SPF Record (+all)",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description="SPF record with +all allows any sender",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=[f"SPF: {spf_record}"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             cvss_score=7.5,
                             remediation="Change +all to -all or ~all",
                         ))
                     elif "~all" in spf_record:
                         findings.append(Finding(
                             name="Soft SPF Fail (~all)",
-                            severity="LOW",
-                            confidence="HIGH",
+                            severity=Severity.LOW,
+                            confidence_score=85.0,
                             description="SPF uses soft fail (~all) instead of hard fail",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=[f"SPF: {spf_record}"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             cvss_score=3.7,
                             remediation="Consider using -all for stricter policy",
                         ))
                     elif "?all" in spf_record:
                         findings.append(Finding(
                             name="Neutral SPF Record (?all)",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description="SPF record uses neutral (?all) - no protection",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=[f"SPF: {spf_record}"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             cvss_score=5.3,
                             remediation="Change ?all to -all",
                         ))
@@ -204,12 +227,12 @@ class EmailSecurityScanner(ScanModule):
             except dns.resolver.NoAnswer:
                 findings.append(Finding(
                     name="Missing SPF Record",
-                    severity="MEDIUM",
-                    confidence="HIGH",
+                    severity=Severity.MEDIUM,
+                    confidence_score=85.0,
                     description="No SPF record configured",
-                    matched_at=domain,
+                    endpoint=domain,
                     evidence=["No TXT records"],
-                    cwe="CWE-290",
+                    cwe_id="CWE-290",
                     remediation="Configure SPF record",
                 ))
                 
@@ -242,12 +265,12 @@ class EmailSecurityScanner(ScanModule):
                     if "p=none" in dmarc_record:
                         findings.append(Finding(
                             name="DMARC Policy None",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description="DMARC policy is 'none' - monitoring only, no protection",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=[f"DMARC: {dmarc_record}"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             cvss_score=5.3,
                             remediation="Change p=none to p=quarantine or p=reject",
                         ))
@@ -256,12 +279,12 @@ class EmailSecurityScanner(ScanModule):
                     if "rua=" not in dmarc_record:
                         findings.append(Finding(
                             name="DMARC Missing Reporting",
-                            severity="LOW",
-                            confidence="HIGH",
+                            severity=Severity.LOW,
+                            confidence_score=85.0,
                             description="DMARC record has no aggregate reporting (rua)",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=[f"DMARC: {dmarc_record}"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             remediation="Add rua=mailto:dmarc@domain.com for reporting",
                         ))
                     
@@ -269,24 +292,24 @@ class EmailSecurityScanner(ScanModule):
                     if "sp=" not in dmarc_record:
                         findings.append(Finding(
                             name="DMARC Missing Subdomain Policy",
-                            severity="LOW",
-                            confidence="MEDIUM",
+                            severity=Severity.LOW,
+                            confidence_score=65.0,
                             description="DMARC has no explicit subdomain policy",
-                            matched_at=domain,
+                            endpoint=domain,
                             evidence=["No sp= tag in DMARC"],
-                            cwe="CWE-290",
+                            cwe_id="CWE-290",
                             remediation="Add sp=reject to protect subdomains",
                         ))
                         
             except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
                 findings.append(Finding(
                     name="Missing DMARC Record",
-                    severity="MEDIUM",
-                    confidence="HIGH",
+                    severity=Severity.MEDIUM,
+                    confidence_score=85.0,
                     description="No DMARC record found - email spoofing easier",
-                    matched_at=domain,
+                    endpoint=domain,
                     evidence=[f"No record at _dmarc.{domain}"],
-                    cwe="CWE-290",
+                    cwe_id="CWE-290",
                     cvss_score=5.3,
                     remediation="Add DMARC record: v=DMARC1; p=reject; rua=mailto:dmarc@domain.com",
                 ))
@@ -342,16 +365,17 @@ class EmailSecurityScanner(ScanModule):
                         if response.status_code == 200:
                             if any(ind in response.text.lower() for ind in success_indicators):
                                 findings.append(Finding(
+                                    vuln_type=VulnType.CRLF,
                                     name="Email Header Injection",
-                                    severity="HIGH",
-                                    confidence="MEDIUM",
+                                    severity=Severity.HIGH,
+                                    confidence_score=65.0,
                                     description=f"Possible email header injection in '{param}'",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Parameter: {param}",
                                         f"Payload accepted",
                                     ],
-                                    cwe="CWE-93",
+                                    cwe_id="CWE-93",
                                     cvss_score=7.5,
                                     remediation="Sanitize email inputs. Block newlines in email fields. "
                                                "Use email library instead of string concatenation.",
@@ -423,14 +447,14 @@ class EmailSecurityScanner(ScanModule):
                            (wrong_pass in text1 and wrong_pass not in text2):
                             findings.append(Finding(
                                 name="Email Enumeration",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Different responses reveal if email exists",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "Different error messages for existing vs non-existing emails",
                                 ],
-                                cwe="CWE-204",
+                                cwe_id="CWE-204",
                                 cvss_score=5.3,
                                 remediation="Use generic error messages. "
                                            "Same response for existing and non-existing accounts.",
@@ -441,15 +465,15 @@ class EmailSecurityScanner(ScanModule):
                     if abs(len(response1.text) - len(response2.text)) > 50:
                         findings.append(Finding(
                             name="Email Enumeration (Response Length)",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="Response length differs for existing vs non-existing emails",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Existing email response: {len(response1.text)} bytes",
                                 f"Non-existing email response: {len(response2.text)} bytes",
                             ],
-                            cwe="CWE-204",
+                            cwe_id="CWE-204",
                             cvss_score=5.3,
                             remediation="Ensure identical response sizes.",
                         ))
@@ -501,16 +525,17 @@ class EmailSecurityScanner(ScanModule):
                         
                         if any(ind in response.text.lower() for ind in success_indicators):
                             findings.append(Finding(
+                                vuln_type=VulnType.HOST_HEADER_INJECTION,
                                 name="Password Reset Host Header Poisoning",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description="Password reset accepts manipulated Host header",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "Reset email may contain attacker's domain",
                                     "Host: evil.com was accepted",
                                 ],
-                                cwe="CWE-640",
+                                cwe_id="CWE-640",
                                 cvss_score=8.1,
                                 remediation="Use absolute URLs from configuration, not Host header. "
                                            "Validate Host header against whitelist.",
@@ -559,15 +584,15 @@ class EmailSecurityScanner(ScanModule):
                         if any(err in response.text.lower() for err in smtp_errors):
                             findings.append(Finding(
                                 name="SMTP Injection",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description="SMTP injection possible in contact form",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Payload: {payload[:50]}...",
                                     "SMTP-related error or response",
                                 ],
-                                cwe="CWE-93",
+                                cwe_id="CWE-93",
                                 cvss_score=7.5,
                                 remediation="Use mail library APIs instead of raw commands. "
                                            "Sanitize all email-related inputs.",

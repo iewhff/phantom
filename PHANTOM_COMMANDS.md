@@ -813,7 +813,6 @@ PHANTOM_ALLOW_AGGRESSIVE=authorized \
     --compliance all \
     -f pdf
 ```
-
 ### Cenário 4: Reconhecimento Inicial (Sem Testes)
 
 ```bash
@@ -1002,3 +1001,12 @@ phantom scan https://example.com --preset my-program
 | Relatório HackerOne | `phantom hackerone-report <id>` |
 | Compliance PCI-DSS | `phantom compliance <id> -f pci-dss` |
 | GDPR cleanup | `phantom gdpr cleanup` |
+
+
+
+
+PHANTOM_NO_TOR=1 \
+PHANTOM_NO_CIRCUIT_BREAKER=1 \
+PHANTOM_ALLOW_AGGRESSIVE=authorized \
+PHANTOM_UNRESTRICTED=i-understand-the-risks \
+  phantom scan http://localhost:3000 --safe-mode aggressive -r 30 -c 10

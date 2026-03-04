@@ -1,15 +1,18 @@
 """
-Response Analyzer - False Positive Prevention Engine v1.0.0
+Response Analyzer - False Positive Prevention Engine v1.1.0
 
 This module provides intelligent response analysis to prevent false positives:
 1. Response Fingerprinting - baseline per endpoint for comparison
 2. Payload Echo Detection - detect escaped/reflected payloads
 3. Confidence Engine - real scoring system with +/- points
+4. SPA Normalization (GAP-1) - handles SPAs that return 200+homepage for any path
+5. Framework-Aware Analysis - adapts to modern frameworks (Next.js, Nuxt, etc.)
 
 Without this, scanners would flag any 200 OK as a finding.
 
 Author: PenTester AI
 Date: Janeiro 2026
+Updated: 2026-02-13 (GAP-1 Sprint 4 - SPA Normalization)
 """
 
 from __future__ import annotations
@@ -23,8 +26,7 @@ import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
-from urllib.parse import unquote, urlparse
+from typing import Any
 
 import httpx
 
@@ -37,12 +39,34 @@ logger = get_logger(__name__)
 # VERSION & CONSTANTS
 # =============================================================================
 
-RESPONSE_ANALYZER_VERSION = "1.0.0-ENTERPRISE"
+RESPONSE_ANALYZER_VERSION = "1.1.0-ENTERPRISE"
 
 # Similarity thresholds
 BODY_SIMILARITY_THRESHOLD = 0.95  # 95% similar = same response
 TIMING_ANOMALY_THRESHOLD = 3.0    # 3x baseline = timing anomaly
 CONTENT_LENGTH_TOLERANCE = 0.10   # 10% tolerance
+
+# GAP-1 FIX: SPA Detection patterns
+SPA_INDICATORS = [
+    r"<div\s+id=['\"](?:root|app|__next|__nuxt)['\"]",
+    r"<script[^>]*type=['\"]module['\"]",
+    r"window\.__(?:NEXT|NUXT|INITIAL)_",
+    r"data-(?:react|vue|svelte|angular)",
+    r"<noscript>.*(?:enable|requires?).*javascript",
+    r"ng-version",  # Angular
+    r"<app-root",  # Angular root component
+    r"_nghost",  # Angular attribute
+]
+
+# GAP-1 FIX: Dynamic content patterns to strip for normalization
+DYNAMIC_CONTENT_PATTERNS = [
+    (r'name=["\']csrf[_-]?token["\'][^>]*value=["\'][^"\']+["\']', 'name="csrf_token" value="STRIPPED"'),
+    (r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', 'TIMESTAMP'),
+    (r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID'),
+    (r'nonce=["\'][^"\']+["\']', 'nonce="STRIPPED"'),
+    (r'"_csrf"\s*:\s*"[^"]+"', '"_csrf": "STRIPPED"'),
+    (r'"token"\s*:\s*"[^"]+"', '"token": "STRIPPED"'),
+]
 
 
 # =============================================================================
@@ -368,6 +392,10 @@ class ResponseFingerprinter:
         Returns:
             ResponseFingerprint baseline
         """
+        # Input validation - ensure at least 1 sample
+        if samples < 1:
+            samples = 1
+
         should_close = False
         if client is None:
             client = httpx.AsyncClient(
@@ -376,21 +404,29 @@ class ResponseFingerprinter:
                 verify=False,
             )
             should_close = True
-        
+
         try:
             # Collect samples
             responses: list[tuple[httpx.Response, float]] = []
-            
+
             for _ in range(samples):
-                start = time.time()
-                response = await client.request(method, url)
-                elapsed = (time.time() - start) * 1000
-                responses.append((response, elapsed))
-                
-                # Small delay between samples
-                if samples > 1:
-                    await asyncio.sleep(0.1)
-            
+                try:
+                    start = time.time()
+                    response = await client.request(method, url)
+                    elapsed = (time.time() - start) * 1000
+                    responses.append((response, elapsed))
+
+                    # Small delay between samples
+                    if samples > 1:
+                        await asyncio.sleep(0.1)
+                except (httpx.RequestError, httpx.TimeoutException) as e:
+                    logger.debug(f"Request failed during baseline sampling: {e}")
+                    continue
+
+            # Check if we have any successful responses
+            if not responses:
+                raise ValueError(f"Failed to collect any baseline samples for {url}")
+
             # Use first response for fingerprint
             response, elapsed = responses[0]
             
@@ -456,11 +492,35 @@ class ResponseFingerprinter:
             baseline=baseline,
         )
         
-        # Check status code
+        # Check status code - only flag MEANINGFUL status changes
         if response.status_code != baseline.status_code:
-            diff.diff_type = ResponseDiffType.STATUS_CHANGED
-            diff.status_diff = (baseline.status_code, response.status_code)
-            return diff
+            baseline_status = baseline.status_code
+            new_status = response.status_code
+            diff.status_diff = (baseline_status, new_status)
+
+            # Define meaningful security boundary crossings
+            is_meaningful = False
+
+            # 401/403 → 200/201/204 = authentication/authorization bypass
+            if baseline_status in (401, 403) and new_status in (200, 201, 204):
+                is_meaningful = True
+
+            # 200/201 → 500+ = server error triggered
+            elif baseline_status in (200, 201, 204) and new_status >= 500:
+                is_meaningful = True
+
+            # Any → 429 = rate limiting triggered
+            elif new_status == 429:
+                is_meaningful = True
+
+            # 2xx → 4xx (not 403/401) = potential validation bypass detection
+            elif 200 <= baseline_status < 300 and 400 <= new_status < 500:
+                is_meaningful = True
+
+            if is_meaningful:
+                diff.diff_type = ResponseDiffType.STATUS_CHANGED
+                return diff
+            # Non-meaningful status change (e.g., 200→201) - continue checking other diffs
         
         # Check content length
         test_length = len(response.content)
@@ -1115,6 +1175,186 @@ class ConfidenceEngine:
 
 
 # =============================================================================
+# SPA NORMALIZER (GAP-1 FIX)
+# =============================================================================
+
+class SPANormalizer:
+    """
+    GAP-1 FIX: Normalizes SPA responses for accurate comparison.
+
+    Problem: SPAs return 200 + homepage HTML for ANY path (client-side routing).
+    This causes massive false positives when scanner thinks "200 = accessible".
+
+    Solution: Detect SPA behavior and normalize responses for comparison.
+    """
+
+    def __init__(self):
+        self._homepage_hash: str | None = None
+        self._homepage_content: str | None = None
+        self._is_spa: bool = False
+        self._spa_indicators_compiled = [re.compile(p, re.IGNORECASE) for p in SPA_INDICATORS]
+        self._framework_detected: str = ""
+
+    def set_homepage(self, content: str) -> None:
+        """
+        Store homepage content for comparison.
+
+        Args:
+            content: Homepage HTML content
+        """
+        self._homepage_content = content
+        self._homepage_hash = hashlib.md5(content.encode()).hexdigest()
+        self._is_spa = self._detect_spa(content)
+        self._framework_detected = self._detect_framework(content)
+
+        if self._is_spa:
+            logger.debug(
+                f"[SPANormalizer] SPA detected: framework={self._framework_detected}, "
+                f"homepage_hash={self._homepage_hash[:8]}..."
+            )
+
+    def _detect_spa(self, content: str) -> bool:
+        """Check if content indicates a SPA."""
+        for pattern in self._spa_indicators_compiled:
+            if pattern.search(content):
+                return True
+
+        # Additional heuristic: minimal HTML + lots of scripts
+        html_without_scripts = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL)
+        script_count = len(re.findall(r'<script[^>]*src=', content))
+
+        if len(html_without_scripts) < 5000 and script_count > 3:
+            return True
+
+        return False
+
+    def _detect_framework(self, content: str) -> str:
+        """Detect the frontend framework."""
+        patterns = {
+            "nextjs": [r"__NEXT_DATA__", r"_next/"],
+            "nuxt": [r"__NUXT__", r"_nuxt/"],
+            "react": [r"react-root", r"data-reactroot"],
+            "vue": [r"data-v-", r"__VUE__"],
+            "angular": [r"ng-version", r"_nghost"],
+            "svelte": [r"data-svelte", r"__sveltekit"],
+        }
+
+        for framework, framework_patterns in patterns.items():
+            for pattern in framework_patterns:
+                if re.search(pattern, content, re.IGNORECASE):
+                    return framework
+
+        return "unknown"
+
+    @property
+    def is_spa(self) -> bool:
+        """Check if target is a SPA."""
+        return self._is_spa
+
+    @property
+    def framework(self) -> str:
+        """Get detected framework."""
+        return self._framework_detected
+
+    def is_homepage_clone(self, content: str) -> bool:
+        """
+        Check if response is a clone of the homepage.
+
+        SPAs return the same HTML for all routes and do client-side routing.
+        This detects that behavior.
+
+        Args:
+            content: Response content to check
+
+        Returns:
+            True if content matches homepage (SPA catch-all behavior)
+        """
+        if not self._homepage_hash:
+            return False
+
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        return content_hash == self._homepage_hash
+
+    def normalize(self, content: str, strip_scripts: bool = True) -> str:
+        """
+        Normalize response content for comparison.
+
+        Strips dynamic content that varies between requests:
+        - CSRF tokens
+        - Timestamps
+        - UUIDs
+        - Nonces
+
+        Args:
+            content: Raw response content
+            strip_scripts: Whether to strip inline scripts (for SPA comparison)
+
+        Returns:
+            Normalized content
+        """
+        normalized = content
+
+        # Strip dynamic content patterns
+        for pattern, replacement in DYNAMIC_CONTENT_PATTERNS:
+            normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+        # Strip inline scripts for SPA comparison (they contain hydration data)
+        if strip_scripts and self._is_spa:
+            normalized = re.sub(
+                r'<script[^>]*>.*?</script>',
+                '',
+                normalized,
+                flags=re.DOTALL | re.IGNORECASE
+            )
+
+        # Normalize whitespace
+        normalized = re.sub(r'\s+', ' ', normalized)
+
+        return normalized.strip()
+
+    def compare_normalized(self, content1: str, content2: str) -> float:
+        """
+        Compare two normalized responses.
+
+        Args:
+            content1: First response (normalized)
+            content2: Second response (normalized)
+
+        Returns:
+            Similarity score 0.0-1.0
+        """
+        norm1 = self.normalize(content1)
+        norm2 = self.normalize(content2)
+
+        return SequenceMatcher(None, norm1, norm2).ratio()
+
+    def should_skip_finding(self, response_content: str, path: str) -> tuple[bool, str]:
+        """
+        Determine if a finding should be skipped due to SPA behavior.
+
+        Args:
+            response_content: Response body
+            path: Request path
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        # Don't skip homepage findings
+        if path in ("/", "/index.html", ""):
+            return False, ""
+
+        # If not SPA, don't skip
+        if not self._is_spa:
+            return False, ""
+
+        # If response is homepage clone, skip
+        if self.is_homepage_clone(response_content):
+            return True, f"SPA catch-all: response identical to homepage (framework: {self._framework_detected})"
+
+        return False, ""
+
+
+# =============================================================================
 # MAIN RESPONSE ANALYZER
 # =============================================================================
 
@@ -1144,7 +1384,8 @@ class ResponseAnalyzer:
         self.fingerprinter = ResponseFingerprinter()
         self.echo_detector = PayloadEchoDetector()
         self.confidence_engine = ConfidenceEngine()
-        
+        self.spa_normalizer = SPANormalizer()  # GAP-1 FIX
+
         logger.info(f"ResponseAnalyzer v{RESPONSE_ANALYZER_VERSION} initialized")
     
     async def create_baseline(
@@ -1228,6 +1469,147 @@ class ResponseAnalyzer:
         
         return result
     
+    async def calibrate_for_target(
+        self,
+        homepage_url: str,
+        client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any]:
+        """
+        GAP-1 FIX: Calibrate analyzer for a specific target.
+
+        This should be called at scan start to:
+        1. Detect if target is a SPA
+        2. Store homepage hash for clone detection
+        3. Adjust thresholds based on target behavior
+
+        Args:
+            homepage_url: Target homepage URL
+            client: HTTP client
+
+        Returns:
+            Calibration info dict
+        """
+        should_close = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=False)
+            should_close = True
+
+        calibration_info = {
+            "is_spa": False,
+            "framework": "unknown",
+            "homepage_hash": None,
+            "calibrated": False,
+        }
+
+        try:
+            response = await client.get(homepage_url)
+            if response.status_code == 200:
+                content = response.text
+                self.spa_normalizer.set_homepage(content)
+
+                calibration_info["is_spa"] = self.spa_normalizer.is_spa
+                calibration_info["framework"] = self.spa_normalizer.framework
+                calibration_info["homepage_hash"] = hashlib.md5(content.encode()).hexdigest()[:16]
+                calibration_info["calibrated"] = True
+
+                logger.info(
+                    f"[ResponseAnalyzer] Calibrated for target: "
+                    f"SPA={calibration_info['is_spa']}, "
+                    f"framework={calibration_info['framework']}"
+                )
+
+        except Exception as e:
+            logger.warning(f"[ResponseAnalyzer] Calibration failed: {e}")
+        finally:
+            if should_close:
+                await client.aclose()
+
+        return calibration_info
+
+    def analyze_with_spa_check(
+        self,
+        url: str,
+        payload: str,
+        response: httpx.Response,
+        response_time_ms: float,
+        vuln_type: str,
+        baseline: ResponseFingerprint | None = None,
+        extra_indicators: dict[str, bool] | None = None,
+    ) -> AnalysisResult:
+        """
+        GAP-1 FIX: Analyze with SPA-aware checks.
+
+        Same as analyze() but also checks for SPA false positives.
+
+        Args:
+            url: Target URL
+            payload: Injected payload
+            response: HTTP response
+            response_time_ms: Response time in ms
+            vuln_type: Type of vulnerability being tested
+            baseline: Optional baseline fingerprint
+            extra_indicators: Additional indicators from scanner
+
+        Returns:
+            AnalysisResult with verdict (may be adjusted for SPA)
+        """
+        # First, do regular analysis
+        result = self.analyze(
+            url=url,
+            payload=payload,
+            response=response,
+            response_time_ms=response_time_ms,
+            vuln_type=vuln_type,
+            baseline=baseline,
+            extra_indicators=extra_indicators,
+        )
+
+        # Then check for SPA false positive
+        if result.is_finding:
+            from urllib.parse import urlparse
+            path = urlparse(url).path
+
+            body = response.content.decode("utf-8", errors="ignore")
+            should_skip, reason = self.spa_normalizer.should_skip_finding(body, path)
+
+            if should_skip:
+                # Demote to non-finding due to SPA behavior
+                result.is_finding = False
+                result.confidence.add_points(
+                    f"SPA false positive: {reason}",
+                    -50  # Heavy penalty
+                )
+                result.evidence.append(f"⚠️ Skipped: {reason}")
+                logger.debug(f"[ResponseAnalyzer] Finding demoted due to SPA: {reason}")
+
+        return result
+
+    def is_spa_homepage_clone(self, response_body: str) -> bool:
+        """
+        GAP-1 FIX: Check if response is a SPA homepage clone.
+
+        Args:
+            response_body: Response content
+
+        Returns:
+            True if response matches homepage (SPA catch-all)
+        """
+        return self.spa_normalizer.is_homepage_clone(response_body)
+
+    def normalize_response(self, response_body: str) -> str:
+        """
+        GAP-1 FIX: Normalize response for comparison.
+
+        Strips dynamic content (CSRF tokens, timestamps, etc.)
+
+        Args:
+            response_body: Raw response content
+
+        Returns:
+            Normalized content
+        """
+        return self.spa_normalizer.normalize(response_body)
+
     def quick_check(
         self,
         payload: str,
@@ -1329,26 +1711,31 @@ import asyncio  # noqa: E402 (imported here for _create_baseline async)
 __all__ = [
     # Version
     "RESPONSE_ANALYZER_VERSION",
-    
+
     # Enums
     "ConfidenceLevel",
     "EchoType",
     "ResponseDiffType",
-    
+
     # Data classes
     "ResponseFingerprint",
     "EchoAnalysis",
     "ResponseDiff",
     "ConfidenceScore",
     "AnalysisResult",
-    
+
     # Main classes
     "ResponseFingerprinter",
     "PayloadEchoDetector",
     "ConfidenceEngine",
     "ResponseAnalyzer",
-    
+    "SPANormalizer",  # GAP-1 FIX
+
     # Helper functions
     "should_report_finding",
     "get_confidence_color",
+
+    # GAP-1 Constants
+    "SPA_INDICATORS",
+    "DYNAMIC_CONTENT_PATTERNS",
 ]

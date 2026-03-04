@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import shlex
 from html import escape as html_escape
 from dataclasses import dataclass, field
@@ -31,6 +30,45 @@ from urllib.parse import urlparse, urlencode, parse_qs
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# PDF STYLING FOR HACKERONE REPORTS
+# =============================================================================
+H1_PDF_CSS = """
+@page {
+    size: A4;
+    margin: 2cm 2.5cm;
+    @top-right { content: "SECURITY REPORT"; font-size: 10px; color: #999; }
+    @bottom-center { content: counter(page) " / " counter(pages); font-size: 10px; }
+}
+
+body {
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #333;
+}
+
+h1 { color: #1a1a2e; border-bottom: 3px solid #494aa2; padding-bottom: 10px; }
+h2 { color: #16213e; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 25px; }
+h3 { color: #0f3460; }
+
+table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+th { background: #494aa2; color: white; font-weight: bold; }
+tr:nth-child(even) { background: #f9f9f9; }
+
+code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 10pt; }
+pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 5px; font-size: 9pt; overflow-x: auto; }
+
+blockquote { border-left: 4px solid #494aa2; padding-left: 15px; color: #666; font-style: italic; }
+
+.severity-critical { background: #dc3545; color: white; padding: 3px 8px; border-radius: 3px; font-weight: bold; }
+.severity-high { background: #fd7e14; color: white; padding: 3px 8px; border-radius: 3px; font-weight: bold; }
+.severity-medium { background: #ffc107; color: #333; padding: 3px 8px; border-radius: 3px; }
+.severity-low { background: #28a745; color: white; padding: 3px 8px; border-radius: 3px; }
+"""
 
 
 # =============================================================================
@@ -97,11 +135,14 @@ def fetch_hackerone_scope(program: str) -> List[Dict[str, Any]]:
         for edge in edges:
             node = edge.get("node", {})
             if node.get("eligible_for_submission", False):
-                entries.append({
-                    "asset_identifier": node["asset_identifier"],
-                    "asset_type": node["asset_type"],
-                    "eligible_for_bounty": node.get("eligible_for_bounty", False),
-                })
+                asset_id = node.get("asset_identifier")
+                asset_type = node.get("asset_type")
+                if asset_id and asset_type:  # Skip entries with missing required fields
+                    entries.append({
+                        "asset_identifier": asset_id,
+                        "asset_type": asset_type,
+                        "eligible_for_bounty": node.get("eligible_for_bounty", False),
+                    })
         return entries
     except Exception as e:
         logger.debug(f"Failed to fetch HackerOne scope for {program}: {e}")
@@ -421,6 +462,237 @@ VULN_CWE_MAPPING: Dict[str, Dict[str, Any]] = {
         "cvss_base": 6.1,
         "owasp": "A03:2021 - Injection",
     },
+
+    # Host Header Injection
+    "host_injection": {
+        "cwe": "CWE-644",
+        "cwe_name": "Improper Neutralization of HTTP Headers for Scripting Syntax",
+        "category": VulnCategory.SERVER_SIDE_INJECTION,
+        "cvss_base": 6.1,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # Enumeration
+    "enumeration": {
+        "cwe": "CWE-204",
+        "cwe_name": "Observable Response Discrepancy (User Enumeration)",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 5.3,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+
+    # Session Management
+    "session_abuse": {
+        "cwe": "CWE-613",
+        "cwe_name": "Insufficient Session Expiration",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 6.5,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+    "session": {
+        "cwe": "CWE-384",
+        "cwe_name": "Session Fixation",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 6.5,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+
+    # Cookie Security
+    "cookie_security": {
+        "cwe": "CWE-614",
+        "cwe_name": "Sensitive Cookie Without 'Secure' Attribute",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 4.3,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # Authorization / Access Control
+    "broken_access_control": {
+        "cwe": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "category": VulnCategory.AUTHORIZATION,
+        "cvss_base": 7.5,
+        "owasp": "A01:2021 - Broken Access Control",
+    },
+    "authorization": {
+        "cwe": "CWE-285",
+        "cwe_name": "Improper Authorization",
+        "category": VulnCategory.AUTHORIZATION,
+        "cvss_base": 7.5,
+        "owasp": "A01:2021 - Broken Access Control",
+    },
+
+    # Path Traversal
+    "path_traversal": {
+        "cwe": "CWE-22",
+        "cwe_name": "Path Traversal",
+        "category": VulnCategory.SERVER_SIDE_INJECTION,
+        "cvss_base": 7.5,
+        "owasp": "A01:2021 - Broken Access Control",
+    },
+
+    # Clickjacking
+    "clickjacking": {
+        "cwe": "CWE-1021",
+        "cwe_name": "Improper Restriction of Rendered UI Layers",
+        "category": VulnCategory.CLIENT_SIDE_INJECTION,
+        "cvss_base": 4.3,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # CRLF Injection
+    "crlf": {
+        "cwe": "CWE-113",
+        "cwe_name": "HTTP Response Splitting",
+        "category": VulnCategory.SERVER_SIDE_INJECTION,
+        "cvss_base": 6.1,
+        "owasp": "A03:2021 - Injection",
+    },
+
+    # GraphQL
+    "graphql": {
+        "cwe": "CWE-200",
+        "cwe_name": "Information Exposure Through GraphQL Introspection",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 5.3,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # WebSocket
+    "websocket": {
+        "cwe": "CWE-1385",
+        "cwe_name": "Missing Origin Validation in WebSocket",
+        "category": VulnCategory.CLIENT_SIDE_INJECTION,
+        "cvss_base": 6.1,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # SSL/TLS
+    "ssl": {
+        "cwe": "CWE-295",
+        "cwe_name": "Improper Certificate Validation",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 5.9,
+        "owasp": "A02:2021 - Cryptographic Failures",
+    },
+    "tls": {
+        "cwe": "CWE-326",
+        "cwe_name": "Inadequate Encryption Strength",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 5.3,
+        "owasp": "A02:2021 - Cryptographic Failures",
+    },
+
+    # Cloud / Kubernetes
+    "cloud_misconfiguration": {
+        "cwe": "CWE-1188",
+        "cwe_name": "Insecure Default Initialization of Resource",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 7.5,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+    "kubernetes": {
+        "cwe": "CWE-1188",
+        "cwe_name": "Kubernetes Misconfiguration",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 8.1,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # DNS Rebinding
+    "dns_rebinding": {
+        "cwe": "CWE-350",
+        "cwe_name": "Reliance on Reverse DNS Resolution for Authentication",
+        "category": VulnCategory.SERVER_SIDE_INJECTION,
+        "cvss_base": 7.5,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # Security Headers
+    "missing_security_header": {
+        "cwe": "CWE-693",
+        "cwe_name": "Protection Mechanism Failure",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 4.3,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+    "header_security": {
+        "cwe": "CWE-693",
+        "cwe_name": "Missing Security Headers",
+        "category": VulnCategory.SECURITY_MISCONFIGURATION,
+        "cvss_base": 4.3,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # Directory Listing / Sensitive Files
+    "directory": {
+        "cwe": "CWE-548",
+        "cwe_name": "Directory Listing",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 5.3,
+        "owasp": "A01:2021 - Broken Access Control",
+    },
+    "sensitive_file": {
+        "cwe": "CWE-538",
+        "cwe_name": "Sensitive Data Exposure via Accessible Files",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 5.3,
+        "owasp": "A01:2021 - Broken Access Control",
+    },
+
+    # Rate Limiting
+    "rate_limit": {
+        "cwe": "CWE-307",
+        "cwe_name": "Improper Restriction of Excessive Authentication Attempts",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 5.3,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+
+    # OAuth
+    "oauth": {
+        "cwe": "CWE-346",
+        "cwe_name": "OAuth Misconfiguration",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 7.5,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+
+    # SAML
+    "saml": {
+        "cwe": "CWE-347",
+        "cwe_name": "SAML Signature Validation Bypass",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 9.1,
+        "owasp": "A02:2021 - Cryptographic Failures",
+    },
+
+    # MFA Bypass
+    "mfa_bypass": {
+        "cwe": "CWE-308",
+        "cwe_name": "Multi-Factor Authentication Bypass",
+        "category": VulnCategory.BROKEN_AUTHENTICATION,
+        "cvss_base": 8.1,
+        "owasp": "A07:2021 - Identification and Authentication Failures",
+    },
+
+    # Subdomain Takeover
+    "subdomain_takeover": {
+        "cwe": "CWE-284",
+        "cwe_name": "Subdomain Takeover",
+        "category": VulnCategory.SENSITIVE_DATA,
+        "cvss_base": 7.5,
+        "owasp": "A05:2021 - Security Misconfiguration",
+    },
+
+    # NoSQL Injection
+    "nosql": {
+        "cwe": "CWE-943",
+        "cwe_name": "NoSQL Injection",
+        "category": VulnCategory.SERVER_SIDE_INJECTION,
+        "cvss_base": 8.1,
+        "owasp": "A03:2021 - Injection",
+    },
 }
 
 # Severity to CVSS mapping
@@ -561,6 +833,28 @@ class HackerOneReport:
     limitations: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
 
+    # Proof Engine results (from Phase 4.2)
+    # Keys: can_repeat, can_mutate, can_escalate, can_chain, proven_impact,
+    #        impact_narrative, mutations, escalation, chain_targets, requests_used
+    proof_data: Optional[Dict[str, Any]] = None
+
+    # For speculative chain findings
+    proof_status: str = ""  # "speculative" for chain findings, "" for normal
+    proof_note: str = ""
+    linked_scanner_findings: List[Dict[str, str]] = field(default_factory=list)
+
+    # Exploitability classification (from Phase 4.45)
+    # Keys: tier (exposure/partial/full), score (0-100), complexity, surface,
+    #       priority_rank (1-5), adjusted_severity, exploitation_narrative
+    exploitability: Optional[Dict[str, Any]] = None
+
+    # Proof Gate (from Phase 4.46a)
+    # Keys: level (detected/verified/exploited), reason, was_capped, original_severity
+    proof_gate: Optional[Dict[str, Any]] = None
+
+    # Full finding metadata (includes chain_confidence, validation_steps, etc.)
+    metadata: Optional[Dict[str, Any]] = None
+
     def to_markdown(self) -> str:
         """
         Generate HackerOne-ready markdown report.
@@ -589,6 +883,42 @@ class HackerOneReport:
         md.append(f"**Asset Type:** {asset_type_display}")
         md.append(f"**Weakness:** {self.cwe_name} ({self.cwe})")
         md.append(f"**Severity:** {self.severity.capitalize()} (CVSS {self.cvss_score})")
+
+        # Exploitability classification
+        if self.exploitability:
+            tier = self.exploitability.get("tier", "").upper()
+            score = self.exploitability.get("score", 0)
+            complexity = self.exploitability.get("complexity", "").replace("_", " ").title()
+            priority = self.exploitability.get("priority_rank", 0)
+
+            tier_labels = {
+                "FULL": "Fully Exploitable",
+                "PARTIAL": "Partially Exploitable",
+                "EXPOSURE": "Exposure Only",
+            }
+            tier_display = tier_labels.get(tier, tier)
+
+            md.append(f"**Exploitability:** {tier_display} (Score: {score}/100, Priority: P{priority})")
+            if complexity:
+                md.append(f"**Attack Complexity:** {complexity}")
+
+        # Proof Gate status (from Phase 4.46a)
+        if self.proof_gate:
+            gate_level = self.proof_gate.get("level", "")
+            gate_reason = self.proof_gate.get("reason", "")
+            was_capped = self.proof_gate.get("was_capped", False)
+            orig_sev = self.proof_gate.get("original_severity", "")
+
+            if gate_level == "exploited":
+                md.append(f"**Proof Status:** Proven — {gate_reason}")
+            elif gate_level == "verified":
+                md.append(f"**Proof Status:** Verified — vulnerability behavior confirmed.")
+            elif gate_level == "detected":
+                md.append(f"**Proof Status:** Detected — exploitation not independently verified.")
+
+            if was_capped and orig_sev:
+                md.append(f"_Severity adjusted: {orig_sev} → {self.severity.upper()} (proof level: {gate_level})_")
+
         md.append("")
 
         # Description
@@ -684,6 +1014,9 @@ class HackerOneReport:
                 md.append("```")
         md.append("")
 
+        # Verification Status — Proof Engine results
+        md.extend(self._render_verification_status())
+
         # Impact
         md.append("## Impact")
         md.append("")
@@ -720,9 +1053,173 @@ class HackerOneReport:
 
         return "\n".join(md)
 
+    def _render_verification_status(self) -> List[str]:
+        """Render Verification Status section from proof engine data."""
+        md: List[str] = []
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CHAIN CONFIDENCE LABELS — Visual separation by verification level
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Check for new chain_confidence metadata (from attack_chain_analyzer)
+        chain_confidence = ""
+        validation_steps = []
+        if hasattr(self, 'metadata') and self.metadata:
+            chain_confidence = self.metadata.get("chain_confidence", "")
+            validation_steps = self.metadata.get("validation_steps", [])
+
+        # Case 0: TECHNICAL chain (infrastructure-grade, needs validation)
+        if chain_confidence == "technical":
+            md.append("## Verification Status")
+            md.append("")
+            md.append("> 🟡 **TECHNICAL** — Infrastructure-grade attack chain. "
+                       "Technically realistic based on well-known exploitation patterns. "
+                       "Manual validation recommended before escalation.")
+            md.append("")
+            if self.linked_scanner_findings:
+                md.append("**Component findings:**")
+                for lf in self.linked_scanner_findings:
+                    name = lf.get("name", "Unknown")
+                    sev = lf.get("severity", "")
+                    md.append(f"- {name} ({sev})")
+                md.append("")
+            if validation_steps:
+                md.append("**Recommended Validation Steps:**")
+                for i, step in enumerate(validation_steps[:5], 1):
+                    md.append(f"{i}. {step}")
+                md.append("")
+            if self.proof_note:
+                md.append(f"_{self.proof_note}_")
+                md.append("")
+            return md
+
+        # Case 0b: PROVEN chain (fully validated)
+        if chain_confidence == "proven":
+            md.append("## Verification Status")
+            md.append("")
+            md.append("> 🟢 **PROVEN** — This attack chain has been fully validated. "
+                       "All steps were executed end-to-end by the Proof Engine.")
+            md.append("")
+            if self.linked_scanner_findings:
+                md.append("**Validated chain steps:**")
+                for lf in self.linked_scanner_findings:
+                    name = lf.get("name", "Unknown")
+                    sev = lf.get("severity", "")
+                    md.append(f"- ✓ {name} ({sev})")
+                md.append("")
+            return md
+
+        # Case 1a: Speculative chain finding (single-source, theoretical)
+        if self.proof_status == "speculative" or chain_confidence == "theoretical":
+            md.append("## Verification Status")
+            md.append("")
+            md.append("> ⚪ **THEORETICAL** — Attack path based on single confirmed finding. "
+                       "Entry point verified; chain steps follow established exploitation patterns.")
+            md.append("")
+            if self.linked_scanner_findings:
+                md.append("**Source finding:**")
+                for lf in self.linked_scanner_findings:
+                    name = lf.get("name", "Unknown")
+                    sev = lf.get("severity", "")
+                    md.append(f"- {name} ({sev})")
+                md.append("")
+            if self.proof_note:
+                md.append(f"_{self.proof_note}_")
+                md.append("")
+            return md
+
+        # Case 1b: Derivable chain finding (cross-module, multiple confirmed sources)
+        if self.proof_status == "derivable" or chain_confidence in ("high", "medium"):
+            label = "🟢 HIGH" if chain_confidence == "high" else "🟠 MEDIUM"
+            md.append("## Verification Status")
+            md.append("")
+            md.append(f"> {label} — Logically composed from confirmed findings "
+                       "across independent scanner modules. High confidence but not "
+                       "replay-verified by the Proof Engine.")
+            md.append("")
+            if self.linked_scanner_findings:
+                md.append("**Confirmed source findings:**")
+                for lf in self.linked_scanner_findings:
+                    name = lf.get("name", "Unknown")
+                    sev = lf.get("severity", "")
+                    md.append(f"- {name} ({sev})")
+                md.append("")
+            if self.proof_note:
+                md.append(f"_{self.proof_note}_")
+                md.append("")
+            return md
+
+        # Case 2: Proven finding (proof engine ran)
+        if self.proof_data:
+            p = self.proof_data
+            proven_impact = p.get("proven_impact", "Unproven")
+            score = sum([
+                p.get("can_repeat", False),
+                p.get("can_mutate", False),
+                p.get("can_escalate", False),
+                p.get("can_chain", False),
+            ])
+
+            md.append("## Verification Status")
+            md.append("")
+            md.append(f"**Proven Impact:** {proven_impact} ({score}/4 verified)")
+            md.append("")
+
+            # Proof scorecard
+            md.append("| Question | Result | Detail |")
+            md.append("|----------|--------|--------|")
+
+            # Repeatable
+            if p.get("can_repeat"):
+                count = p.get("repeat_count", 1)
+                md.append(f"| Repeatable? | YES | {count}x confirmed |")
+            else:
+                md.append("| Repeatable? | NO | -- |")
+
+            # Mutable
+            if p.get("can_mutate"):
+                muts = p.get("mutations", [])
+                detail = "; ".join(m[:50] for m in muts[:3]) if muts else "Payload variations tested"
+                md.append(f"| Mutable? | YES | {detail} |")
+            else:
+                md.append("| Mutable? | NO | -- |")
+
+            # Escalatable
+            if p.get("can_escalate"):
+                esc = p.get("escalation", "")
+                md.append(f"| Escalatable? | YES | {esc[:80]} |")
+            else:
+                md.append("| Escalatable? | NO | -- |")
+
+            # Chainable
+            if p.get("can_chain"):
+                targets = p.get("chain_targets", [])
+                detail = "; ".join(t[:40] for t in targets[:3]) if targets else "Unlocks further attacks"
+                md.append(f"| Chainable? | YES | {detail} |")
+            else:
+                md.append("| Chainable? | NO | -- |")
+
+            md.append("")
+
+            # Impact narrative
+            narrative = p.get("impact_narrative", "")
+            if narrative:
+                md.append(f"**Attack Narrative:** {narrative}")
+                md.append("")
+
+            reqs = p.get("requests_used", 0)
+            if reqs > 0:
+                md.append(f"_Verification performed with {reqs} HTTP requests._")
+                md.append("")
+
+            return md
+
+        # Case 3: No proof data (engine didn't run or finding was MEDIUM/LOW)
+        return md
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        d = {
             "title": self.title,
             "vulnerability_type": self.vulnerability_type,
             "cwe": self.cwe,
@@ -758,6 +1255,15 @@ class HackerOneReport:
             "generated_at": self.generated_at,
             "report_id": self.report_id,
         }
+        if self.proof_data:
+            d["proof_data"] = self.proof_data
+        if self.proof_status:
+            d["proof_status"] = self.proof_status
+            d["proof_note"] = self.proof_note
+            d["linked_scanner_findings"] = self.linked_scanner_findings
+        if self.proof_gate:
+            d["proof_gate"] = self.proof_gate
+        return d
 
 
 # =============================================================================
@@ -783,6 +1289,7 @@ class HackerOneReportGenerator:
         output_dir: Optional[Path] = None,
         bounty_header: Optional[str] = None,
         program: Optional[str] = None,
+        redaction_level: str = "standard",
     ):
         """
         Initialize the report generator.
@@ -792,11 +1299,28 @@ class HackerOneReportGenerator:
             bounty_header: Program-required header value (e.g., "youruser-twilio")
                           Will be included as X-Bug-Bounty in all curl commands
             program: Bug bounty program name (e.g., "twilio") for scope matching
+            redaction_level: Level of PII redaction (none, minimal, standard, strict, paranoid)
         """
         self.output_dir = output_dir or Path("evidence")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.bounty_header = bounty_header
         self.program = program
+        self.redaction_level = redaction_level
+        self._evidence_redactor = None
+
+    def _get_evidence_redactor(self):
+        """Lazy-load EvidenceRedactor for PII protection."""
+        if self._evidence_redactor is None:
+            try:
+                from phantom.evidence_redactor import EvidenceRedactor, RedactionConfig, RedactionLevel
+                level = RedactionLevel(self.redaction_level)
+                config = RedactionConfig.from_level(level)
+                self._evidence_redactor = EvidenceRedactor(config)
+            except ImportError:
+                pass  # EvidenceRedactor not available
+            except ValueError:
+                pass  # Invalid redaction level
+        return self._evidence_redactor
 
     def generate_report(
         self,
@@ -815,12 +1339,22 @@ class HackerOneReportGenerator:
         Returns:
             HackerOneReport ready for submission
         """
+        # ═══════════════════════════════════════════════════════════════════════════
+        # P0 FIX: Apply PII redaction to finding before processing
+        # ═══════════════════════════════════════════════════════════════════════════
+        redactor = self._get_evidence_redactor()
+        if redactor:
+            finding = redactor.redact_finding(finding)
+            if evidence:
+                evidence = redactor.redact_dict(evidence).content
+
         # Get vulnerability type and classification
         raw_type = finding.get("type", finding.get("vulnerability_type", "unknown"))
         vuln_type = self._normalize_vuln_type(raw_type)
         # Fallback to module_name if vulnerability_type is generic (e.g., "other")
-        if vuln_type not in VULN_CWE_MAPPING and finding.get("module_name"):
-            vuln_type = self._normalize_vuln_type(finding["module_name"])
+        module_name = finding.get("module_name")
+        if vuln_type not in VULN_CWE_MAPPING and module_name:
+            vuln_type = self._normalize_vuln_type(module_name)
         classification = VULN_CWE_MAPPING.get(vuln_type, VULN_CWE_MAPPING.get("info_disclosure"))
 
         # Extract asset info (with program scope matching)
@@ -884,6 +1418,18 @@ class HackerOneReportGenerator:
             vuln_type, metadata, asset
         )
 
+        # Extract proof engine data from finding metadata
+        proof_data = metadata.get("proof")
+        proof_status = metadata.get("proof_status", "")
+        proof_note = metadata.get("proof_note", "")
+        linked_findings = metadata.get("linked_scanner_findings", [])
+
+        # Extract exploitability classification (from Phase 4.45)
+        exploitability = metadata.get("exploitability")
+
+        # Extract proof gate data (from Phase 4.46a)
+        proof_gate = metadata.get("proof_gate")
+
         return HackerOneReport(
             title=title,
             vulnerability_type=classification.get("cwe_name", vuln_type),
@@ -906,6 +1452,13 @@ class HackerOneReportGenerator:
             references=references,
             limitations=limitations,
             assumptions=assumptions,
+            proof_data=proof_data,
+            proof_status=proof_status,
+            proof_note=proof_note,
+            linked_scanner_findings=linked_findings,
+            exploitability=exploitability,
+            proof_gate=proof_gate,
+            metadata=metadata,  # Pass full metadata for chain_confidence access
         )
 
     def _build_exploit_evidence(
@@ -992,6 +1545,7 @@ class HackerOneReportGenerator:
             "authentication_bypass": "auth_bypass",
             "broken_authentication": "auth_bypass",
             "insecure_direct_object_reference": "idor",
+            "insecure_object_reference": "idor",
             "cors_misconfiguration": "cors",
             "cross_origin_resource_sharing": "cors",
             "cors_wildcard": "cors",
@@ -1014,9 +1568,76 @@ class HackerOneReportGenerator:
             "local_file_inclusion": "lfi",
             "remote_file_inclusion": "rfi",
             "xml_external_entity": "xxe",
+            "xml_bomb": "xxe",
+            "billion_laughs": "xxe",
             "cross_site_request_forgery": "csrf",
             "http_request_smuggling": "request_smuggling",
             "web_cache_poisoning": "cache_poisoning",
+            "host_header_injection": "host_injection",
+            "host_header_attack": "host_injection",
+            "account_enumeration": "enumeration",
+            "user_enumeration": "enumeration",
+            "username_enumeration": "enumeration",
+            "email_enumeration": "enumeration",
+            "race_condition": "race_condition",
+            "toctou": "race_condition",
+            # Session/Cookie
+            "session_management": "session_abuse",
+            "session_fixation": "session",
+            "insufficient_session_expiration": "session_abuse",
+            "cookie": "cookie_security",
+            "cookie_vulnerability": "cookie_security",
+            # Access Control
+            "bac": "broken_access_control",
+            "improper_access_control": "broken_access_control",
+            "authz": "authorization",
+            "vertical_privilege_escalation": "authorization",
+            "horizontal_privilege_escalation": "idor",
+            # Path Traversal
+            "directory_traversal": "path_traversal",
+            "file_path_traversal": "path_traversal",
+            # Headers/Config
+            "missing_headers": "missing_security_header",
+            "security_headers": "header_security",
+            "missing_csp": "header_security",
+            "missing_hsts": "header_security",
+            # GraphQL/API
+            "graphql_introspection": "graphql",
+            "graphql_injection": "graphql",
+            # SSL/TLS
+            "ssl_tls": "ssl",
+            "weak_cipher": "tls",
+            "weak_ssl": "tls",
+            "expired_certificate": "ssl",
+            # Cloud
+            "cloud": "cloud_misconfiguration",
+            "aws_misconfiguration": "cloud_misconfiguration",
+            "gcp_misconfiguration": "cloud_misconfiguration",
+            "azure_misconfiguration": "cloud_misconfiguration",
+            "s3_bucket": "cloud_misconfiguration",
+            "k8s": "kubernetes",
+            # Directory/Files
+            "directory_listing": "directory",
+            "vcs_exposure": "sensitive_file",
+            "git_exposure": "sensitive_file",
+            "backup_file": "sensitive_file",
+            "config_file": "sensitive_file",
+            # NoSQL
+            "nosql_injection": "nosql",
+            "mongodb_injection": "nosql",
+            # Others
+            "crlf_injection": "crlf",
+            "header_injection": "crlf",
+            "ws": "websocket",
+            "websocket_hijacking": "websocket",
+            "rate_limiting": "rate_limit",
+            "brute_force": "rate_limit",
+            "oauth_misconfiguration": "oauth",
+            "saml_injection": "saml",
+            "mfa": "mfa_bypass",
+            "2fa_bypass": "mfa_bypass",
+            "subdomain": "subdomain_takeover",
+            "dangling_cname": "subdomain_takeover",
         }
 
         result = aliases.get(vuln_type, vuln_type)
@@ -1099,8 +1720,9 @@ class HackerOneReportGenerator:
             return templates[vuln_type]
 
         # Fall back to finding description or generic template
-        if finding.get("description"):
-            return finding["description"]
+        description = finding.get("description")
+        if description:
+            return description
 
         return templates.get(vuln_type, (
             f"A {cwe_name} vulnerability was identified at `{asset.url}`. "
@@ -1133,12 +1755,23 @@ class HackerOneReportGenerator:
         finding: Dict[str, Any],
     ) -> str:
         """Generate detailed impact assessment."""
-        # Template impacts for common vulnerabilities
+        # P2-1/P2-2 FIX: Check proof status to qualify language
+        metadata = finding.get("metadata", {})
+        proof = metadata.get("proof", {})
+        has_proven_exploit = proof.get("can_repeat", False) or proof.get("can_mutate", False)
+        has_escalation_proof = proof.get("can_escalate", False)
+
+        # Use qualified language unless exploit is proven
+        # "can" = proven, "may be able to" = theoretical
+        verb = "can" if has_proven_exploit else "may be able to"
+        verb_escalate = "can" if has_escalation_proof else "may potentially"
+
+        # Template impacts for common vulnerabilities - P2-1/P2-2: qualified language
         impacts = {
             "cors": (
                 "### Direct Impact\n"
-                f"1. **Authenticated Data Theft:** Untrusted origins can read API responses from {asset.domain} containing user data\n"
-                "2. **Session Information:** If session tokens are exposed in API responses, they can be stolen\n"
+                f"1. **Authenticated Data Theft:** Untrusted origins {verb} read API responses from {asset.domain} containing user data\n"
+                f"2. **Session Information:** If session tokens are exposed in API responses, they {verb} be stolen\n"
                 "3. **Sensitive Configuration:** API responses may contain sensitive account or configuration data\n\n"
                 "### Attack Scenario\n"
                 "1. Attacker hosts a page on their own domain\n"
@@ -1150,30 +1783,30 @@ class HackerOneReportGenerator:
             ),
             "sqli": (
                 "### Direct Impact\n"
-                "1. **Data Breach:** Attacker can extract all data from the database\n"
-                "2. **Authentication Bypass:** Attacker can log in as any user\n"
-                "3. **Data Modification:** Attacker can modify or delete database records\n"
+                f"1. **Data Breach:** Attacker {verb} extract data from the database\n"
+                f"2. **Authentication Bypass:** Attacker {verb_escalate} log in as any user\n"
+                f"3. **Data Modification:** Attacker {verb_escalate} modify or delete database records\n"
                 "4. **Potential RCE:** Depending on database configuration, may lead to OS command execution"
             ),
             "xss": (
                 "### Direct Impact\n"
-                "1. **Session Hijacking:** Attacker can steal session cookies\n"
-                "2. **Account Takeover:** Attacker can perform actions as the victim\n"
-                "3. **Credential Theft:** Attacker can inject fake login forms\n"
-                "4. **Malware Distribution:** Attacker can redirect users to malicious sites"
+                f"1. **Session Hijacking:** Attacker {verb} steal session cookies (if HttpOnly not set)\n"
+                f"2. **Account Takeover:** Attacker {verb} perform actions as the victim\n"
+                f"3. **Credential Theft:** Attacker {verb} inject fake login forms\n"
+                f"4. **Malware Distribution:** Attacker {verb} redirect users to malicious sites"
             ),
             "idor": (
                 "### Direct Impact\n"
-                "1. **Data Exposure:** Attacker can access other users' private data\n"
-                "2. **Privacy Violation:** Personal information of users can be leaked\n"
+                f"1. **Data Exposure:** Attacker {verb} access other users' data\n"
+                "2. **Privacy Violation:** Personal information of users may be exposed\n"
                 "3. **Regulatory Impact:** May constitute a GDPR/privacy regulation violation"
             ),
             "ssrf": (
                 "### Direct Impact\n"
-                "1. **Internal Network Access:** Attacker can probe and access internal services\n"
-                "2. **Cloud Metadata Exposure:** Can access cloud instance metadata (credentials, tokens)\n"
-                "3. **Port Scanning:** Can map internal network topology\n"
-                "4. **Service Exploitation:** Can attack internal services not exposed to internet"
+                f"1. **Internal Network Access:** Attacker {verb} probe internal services\n"
+                f"2. **Cloud Metadata Exposure:** {verb.capitalize()} access cloud instance metadata (credentials, tokens)\n"
+                f"3. **Port Scanning:** {verb.capitalize()} map internal network topology\n"
+                f"4. **Service Exploitation:** {verb_escalate.capitalize()} attack internal services not exposed to internet"
             ),
         }
 
@@ -1492,7 +2125,8 @@ class HackerOneReportGenerator:
 
         if headers:
             for key, value in headers.items():
-                parts.append(f'-H "{key}: {value}"')
+                # Use shlex.quote to prevent header injection via quotes/newlines
+                parts.append(f'-H {shlex.quote(f"{key}: {value}")}')
 
         if data:
             parts.append(f"-d {shlex.quote(data)}")
@@ -1524,6 +2158,7 @@ class HackerOneReportGenerator:
             "sqli": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
             "xss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
             "stored_xss": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N",
+            "dom_xss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
             "idor": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
             "ssrf": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
             "cmdi": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
@@ -1533,6 +2168,26 @@ class HackerOneReportGenerator:
             "xxe": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
             "lfi": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
             "ssti": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            # Additional vectors
+            "nosql": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+            "jwt_vuln": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+            "session_abuse": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+            "session": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N",
+            "business_logic": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N",
+            "race_condition": "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:H/A:N",
+            "clickjacking": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N",
+            "header_security": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N",
+            "crlf": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+            "path_traversal": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+            "broken_access_control": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+            "authorization": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
+            "insecure_deserialization": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "cache_poisoning": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+            "request_smuggling": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N",
+            "subdomain_takeover": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:H/A:N",
+            "mfa_bypass": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+            "oauth": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:L/A:N",
+            "saml": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
         }
 
         return vectors.get(vuln_type, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N")
@@ -1594,15 +2249,149 @@ class HackerOneReportGenerator:
                 "3. **Disable unnecessary URL schemes** (file://, gopher://, etc.)\n"
                 "4. **Use a dedicated service** for external requests with strict controls\n"
             ),
+            "xxe": (
+                "### Recommended Fix\n"
+                "1. **Disable external entity processing** in XML parsers\n"
+                "2. **Use less complex data formats** (JSON) when possible\n"
+                "3. **Validate and sanitize XML input** against a schema\n\n"
+                "```python\n"
+                "# Python (defusedxml)\n"
+                "import defusedxml.ElementTree as ET\n"
+                "tree = ET.parse(xml_file)  # Safe by default\n"
+                "```\n\n"
+                "```java\n"
+                "// Java\n"
+                "factory.setFeature(\"http://xml.org/sax/features/external-general-entities\", false);\n"
+                "factory.setFeature(\"http://xml.org/sax/features/external-parameter-entities\", false);\n"
+                "```"
+            ),
+            "cmdi": (
+                "### Recommended Fix\n"
+                "1. **Avoid shell commands** - Use language APIs instead\n"
+                "2. **Use allowlists** for permitted inputs\n"
+                "3. **Escape shell metacharacters** if commands are necessary\n"
+                "4. **Run with minimal privileges** and use sandboxing\n\n"
+                "```python\n"
+                "# Instead of:\n"
+                "os.system(f'ping {user_input}')\n\n"
+                "# Use:\n"
+                "import subprocess\n"
+                "subprocess.run(['ping', '-c', '4', user_input], check=True)\n"
+                "```"
+            ),
+            "ssti": (
+                "### Recommended Fix\n"
+                "1. **Never pass user input directly to templates**\n"
+                "2. **Use logic-less templates** (Mustache, Handlebars)\n"
+                "3. **Sandbox template execution** if dynamic templates are needed\n"
+                "4. **Validate and escape all input** before rendering\n"
+            ),
+            "lfi": (
+                "### Recommended Fix\n"
+                "1. **Use an allowlist of permitted files**\n"
+                "2. **Avoid user input in file paths** entirely\n"
+                "3. **Canonicalize paths** and verify they're within allowed directories\n"
+                "4. **Use chroot/jail** to restrict file access\n\n"
+                "```python\n"
+                "import os\n"
+                "base_dir = '/app/uploads'\n"
+                "requested = os.path.realpath(os.path.join(base_dir, user_input))\n"
+                "if not requested.startswith(base_dir):\n"
+                "    raise SecurityError('Path traversal attempt')\n"
+                "```"
+            ),
+            "auth_bypass": (
+                "### Recommended Fix\n"
+                "1. **Implement proper session management**\n"
+                "2. **Use secure authentication libraries** (don't roll your own)\n"
+                "3. **Enforce authentication on all sensitive endpoints**\n"
+                "4. **Implement multi-factor authentication** for critical functions\n"
+            ),
+            "jwt_vuln": (
+                "### Recommended Fix\n"
+                "1. **Always verify the signature** before trusting JWT claims\n"
+                "2. **Reject tokens with 'alg: none'** - Hardcode expected algorithm\n"
+                "3. **Use strong secret keys** (256+ bits of entropy)\n"
+                "4. **Set appropriate expiration times** and validate `exp` claim\n\n"
+                "```python\n"
+                "import jwt\n"
+                "# Explicitly specify the algorithm - never trust header\n"
+                "payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])\n"
+                "```"
+            ),
+            "session_abuse": (
+                "### Recommended Fix\n"
+                "1. **Invalidate sessions on logout** - Server-side revocation\n"
+                "2. **Set appropriate session timeouts** (idle and absolute)\n"
+                "3. **Regenerate session IDs** after authentication\n"
+                "4. **Use secure cookie attributes** (HttpOnly, Secure, SameSite)\n"
+            ),
+            "business_logic": (
+                "### Recommended Fix\n"
+                "1. **Validate business rules server-side** - Never trust client\n"
+                "2. **Implement proper state machine validation**\n"
+                "3. **Add transaction integrity checks** for financial operations\n"
+                "4. **Log and monitor for anomalous behavior patterns**\n"
+            ),
+            "race_condition": (
+                "### Recommended Fix\n"
+                "1. **Use database transactions** with appropriate isolation level\n"
+                "2. **Implement mutex/locking** for critical sections\n"
+                "3. **Use atomic operations** where possible\n"
+                "4. **Add idempotency keys** for non-idempotent operations\n"
+            ),
+            "csrf": (
+                "### Recommended Fix\n"
+                "1. **Implement CSRF tokens** on all state-changing requests\n"
+                "2. **Use SameSite cookie attribute** (Strict or Lax)\n"
+                "3. **Verify Origin/Referer headers** as additional defense\n"
+                "4. **Require re-authentication** for sensitive operations\n"
+            ),
+            "clickjacking": (
+                "### Recommended Fix\n"
+                "1. **Set X-Frame-Options header** to DENY or SAMEORIGIN\n"
+                "2. **Implement CSP frame-ancestors directive**\n"
+                "3. **Add framebusting JavaScript** as fallback\n\n"
+                "```\n"
+                "X-Frame-Options: DENY\n"
+                "Content-Security-Policy: frame-ancestors 'none'\n"
+                "```"
+            ),
+            "header_security": (
+                "### Recommended Fix\n"
+                "Add the following security headers:\n\n"
+                "```\n"
+                "Strict-Transport-Security: max-age=31536000; includeSubDomains\n"
+                "X-Content-Type-Options: nosniff\n"
+                "X-Frame-Options: DENY\n"
+                "Content-Security-Policy: default-src 'self'\n"
+                "Referrer-Policy: strict-origin-when-cross-origin\n"
+                "Permissions-Policy: geolocation=(), camera=(), microphone=()\n"
+                "```"
+            ),
+            "nosql": (
+                "### Recommended Fix\n"
+                "1. **Sanitize and validate all input** before database queries\n"
+                "2. **Use parameterized queries** or ODM libraries\n"
+                "3. **Disable JavaScript execution** in MongoDB if not needed\n"
+                "4. **Apply strict type checking** on query parameters\n\n"
+                "```javascript\n"
+                "// Instead of:\n"
+                "db.users.find({ password: req.body.password })\n\n"
+                "// Use:\n"
+                "db.users.find({ password: { $eq: String(req.body.password) } })\n"
+                "```"
+            ),
         }
 
         return remediations.get(vuln_type, (
             "### Recommended Fix\n"
             f"Address the {classification.get('cwe_name', 'vulnerability')} by:\n"
-            "1. Implementing proper input validation\n"
-            "2. Following secure coding practices\n"
-            "3. Conducting security code review\n"
-            "4. Adding appropriate security controls\n"
+            "1. Implementing proper input validation and output encoding\n"
+            "2. Following secure coding practices for your framework\n"
+            "3. Conducting security code review on the affected component\n"
+            "4. Adding appropriate security controls and monitoring\n"
+            f"5. Refer to CWE-{classification.get('cwe', 'XXX').split('-')[-1]} for detailed mitigation guidance\n"
         ))
 
     def _collect_references(
@@ -1681,8 +2470,9 @@ class HackerOneReportGenerator:
             assumptions.append("Assumes internal services are accessible from the vulnerable server")
 
         # Add finding-specific limitations
-        if finding.get("limitations"):
-            limitations.extend(finding["limitations"])
+        finding_limitations = finding.get("limitations")
+        if finding_limitations:
+            limitations.extend(finding_limitations)
 
         return limitations, assumptions
 
@@ -1731,8 +2521,47 @@ class HackerOneReportGenerator:
             saved_files["html_poc"] = str(poc_path)
             report.attachments.append(str(poc_path))
 
+        # Save PDF
+        if "pdf" in formats:
+            pdf_path = self._generate_pdf(report, report_dir)
+            if pdf_path:
+                saved_files["pdf"] = pdf_path
+
         logger.info(f"Report saved to {report_dir}")
         return saved_files
+
+    def _generate_pdf(self, report: HackerOneReport, report_dir: Path) -> Optional[str]:
+        """Generate PDF from HackerOne report."""
+        try:
+            import markdown
+            from weasyprint import HTML, CSS
+        except ImportError as e:
+            logger.debug(f"PDF generation requires 'weasyprint' and 'markdown': {e}")
+            return None
+
+        try:
+            md_content = report.to_markdown()
+            md_converter = markdown.Markdown(extensions=["tables", "fenced_code", "codehilite"])
+            html_body = md_converter.convert(md_content)
+
+            html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Security Report - {report.asset.domain}</title>
+</head>
+<body>
+{html_body}
+</body>
+</html>
+"""
+            pdf_path = report_dir / "hackerone_report.pdf"
+            HTML(string=html_content).write_pdf(str(pdf_path), stylesheets=[CSS(string=H1_PDF_CSS)])
+            logger.info(f"PDF report generated: {pdf_path}")
+            return str(pdf_path)
+        except Exception as e:
+            logger.warning(f"PDF generation failed: {e}")
+            return None
 
     def _generate_poc_html(self, report: HackerOneReport) -> str:
         """Generate HTML PoC file for the vulnerability."""
@@ -1766,6 +2595,14 @@ class HackerOneReportGenerator:
         """
         domain = report.asset.domain
         url = report.asset.url
+
+        # Escape for HTML and JavaScript contexts to prevent injection
+        domain_html = html_escape(domain) if domain else ""
+        url_html = html_escape(url) if url else ""
+        # For JavaScript string literals, use JSON encoding (handles quotes, backslashes, newlines)
+        import json
+        domain_js = json.dumps(domain)[1:-1] if domain else ""  # Strip outer quotes
+        url_js = json.dumps(url)[1:-1] if url else ""
 
         # --- Build comparison table from exploit_evidence ---
         comp_rows = ""
@@ -1871,14 +2708,14 @@ class HackerOneReportGenerator:
     </style>
 </head>
 <body>
-    <h1>Origin Validation Error PoC — {domain}</h1>
+    <h1>Origin Validation Error PoC — {domain_html}</h1>
 
     <div class="meta">
         <table>
-            <tr><td>Target Asset</td><td><strong>{domain}</strong></td></tr>
-            <tr><td>Target URL</td><td><code>{url}</code></td></tr>
-            <tr><td>Vulnerability</td><td>{report.cwe} — {report.cwe_name}</td></tr>
-            <tr><td>Severity</td><td><strong>{report.severity.upper()}</strong> (CVSS {report.cvss_score})</td></tr>
+            <tr><td>Target Asset</td><td><strong>{domain_html}</strong></td></tr>
+            <tr><td>Target URL</td><td><code>{url_html}</code></td></tr>
+            <tr><td>Vulnerability</td><td>{html_escape(report.cwe or "")} — {html_escape(report.cwe_name or "")}</td></tr>
+            <tr><td>Severity</td><td><strong>{html_escape((report.severity or "MEDIUM").upper())}</strong> (CVSS {report.cvss_score})</td></tr>
         </table>
     </div>
 
@@ -1900,12 +2737,12 @@ class HackerOneReportGenerator:
 
     <!-- ============ CAPTURED EVIDENCE ============ -->
     <h2>Captured HTTP Evidence (from scan)</h2>
-    <p>Real HTTP exchanges captured by the automated scanner against <strong>{domain}</strong>:</p>
+    <p>Real HTTP exchanges captured by the automated scanner against <strong>{domain_html}</strong>:</p>
     {evidence_blocks}
 
     <!-- ============ LIVE TESTS ============ -->
     <h2>Interactive Live Tests</h2>
-    <p>These tests make real requests to <strong>{domain}</strong> from this page's origin.
+    <p>These tests make real requests to <strong>{domain_html}</strong> from this page's origin.
        If the CORS misconfiguration exists, the browser will allow reading the response.</p>
 
     <div class="test">
@@ -1962,8 +2799,8 @@ class HackerOneReportGenerator:
         // Test 1: Arbitrary Origin
         function testArbitrary() {{
             var el = document.getElementById('result-arbitrary');
-            el.textContent = 'Sending credentialed request to {domain}...';
-            fetch('{url}', {{method:'GET', credentials:'include', mode:'cors'}})
+            el.textContent = 'Sending credentialed request to {domain_js}...';
+            fetch('{url_js}', {{method:'GET', credentials:'include', mode:'cors'}})
                 .then(function(r) {{ return r.text().then(function(b){{ return {{resp:r, body:b}}; }}); }})
                 .then(function(data) {{
                     var text = formatResponse(data.resp, data.body);
@@ -1990,7 +2827,7 @@ class HackerOneReportGenerator:
 
             // The iframe has Origin: null due to sandbox + srcdoc
             var iframeCode = '<scr'+'ipt>'
-                + 'fetch("' + '{url}' + '",{{method:"GET",credentials:"include",mode:"cors"}})'
+                + 'fetch("' + '{url_js}' + '",{{method:"GET",credentials:"include",mode:"cors"}})'
                 + '.then(function(r){{return r.text().then(function(b){{return{{resp:r,body:b}};}})}})'
                 + '.then(function(d){{'
                 + '  var out="Origin: null\\nStatus: "+d.resp.status+"\\n";'
@@ -2015,10 +2852,10 @@ class HackerOneReportGenerator:
         // Test 3: Preflight (OPTIONS)
         function testPreflight() {{
             var el = document.getElementById('result-preflight');
-            el.textContent = 'Sending preflight-triggering request to {domain}...';
+            el.textContent = 'Sending preflight-triggering request to {domain_js}...';
 
             // Use a non-simple request to force browser preflight
-            fetch('{url}', {{
+            fetch('{url_js}', {{
                 method: 'DELETE',
                 credentials: 'include',
                 mode: 'cors',
@@ -2057,6 +2894,213 @@ class HackerOneReportGenerator:
     </div>
 </body>
 </html>'''
+
+    def generate_coverage_summary(
+        self,
+        scan_state: Dict[str, Any],
+        domain: str,
+    ) -> str:
+        """
+        Generate a scan coverage summary for bug bounty submissions.
+
+        This explains to the program what was tested, what was skipped, and why.
+        Useful when submitting few findings to show thoroughness of testing.
+
+        Args:
+            scan_state: The full scan state dictionary with coverage data
+            domain: Target domain
+
+        Returns:
+            Path to the generated SCAN_COVERAGE_SUMMARY.md file
+        """
+        md = []
+        md.append(f"# Scan Coverage Summary — {domain}")
+        md.append("")
+        md.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        md.append("")
+
+        # Get coverage tracker data from scan metadata
+        meta = scan_state.get("metadata", {})
+        coverage_data = meta.get("coverage_tracker", {})
+
+        # Overall stats
+        coverage_pct = coverage_data.get("coverage_percentage", 0)
+        surfaces_tested = coverage_data.get("surfaces_tested", 0)
+        surfaces_skipped = coverage_data.get("surfaces_skipped", 0)
+        total_surfaces = surfaces_tested + surfaces_skipped
+
+        md.append("## Testing Thoroughness")
+        md.append("")
+
+        # Visual progress bar
+        filled = int(coverage_pct / 5)
+        empty = 20 - filled
+        bar = "█" * filled + "░" * empty
+        md.append(f"**Overall Coverage:** `[{bar}]` {coverage_pct:.0f}%")
+        md.append("")
+        md.append(f"- Surfaces tested: {surfaces_tested}")
+        md.append(f"- Surfaces skipped: {surfaces_skipped}")
+        md.append(f"- Total attack surface: {total_surfaces}")
+        md.append("")
+
+        # Module execution stats
+        modules_run = scan_state.get("modules_run", [])
+        modules_skipped = scan_state.get("modules_skipped", {})
+
+        md.append("## Modules Executed")
+        md.append("")
+        md.append(f"**Ran {len(modules_run)} security modules** including:")
+        md.append("")
+
+        # Group modules by category
+        module_categories = {
+            "Injection": ["sqli", "nosql", "cmdi", "ssti", "xxe", "ldap", "lfi", "ssrf"],
+            "Authentication": ["jwt", "auth_bypass", "oauth", "saml", "mfa_bypass", "session"],
+            "Authorization": ["idor", "bola", "privesc", "mass_assignment"],
+            "Client-Side": ["xss", "dom_xss", "cors", "csrf", "prototype_pollution"],
+            "Business Logic": ["business_logic", "race_condition", "workflow"],
+        }
+
+        for category, module_names in module_categories.items():
+            executed = [m for m in modules_run if any(mn in m.lower() for mn in module_names)]
+            if executed:
+                md.append(f"- **{category}:** {len(executed)} modules")
+
+        md.append("")
+
+        # Skip reasons - CRITICAL for explaining low findings
+        skip_summary = coverage_data.get("skip_summary", {})
+        if skip_summary:
+            md.append("## Why Some Areas Were Skipped")
+            md.append("")
+            md.append("| Reason | Count | Impact |")
+            md.append("|--------|-------|--------|")
+
+            reason_impacts = {
+                "RATE_LIMITED": "Testing blocked by rate limiting — potential vulns may exist",
+                "AUTH_REQUIRED": "Endpoint requires authentication not available during scan",
+                "BLOCKED_BY_WAF": "WAF blocked testing — endpoint not fully assessed",
+                "BUDGET_EXHAUSTED": "Scan budget reached before completing tests",
+                "TIMEOUT": "Module timed out — partial testing only",
+                "SPA_CATCHALL": "SPA returns same response for all paths — path analysis limited",
+                "ERROR": "Module encountered errors — retesting recommended",
+            }
+
+            for reason, count in skip_summary.items():
+                impact = reason_impacts.get(reason, "—")
+                md.append(f"| {reason.replace('_', ' ')} | {count} | {impact} |")
+
+            md.append("")
+            md.append("> **Note:** Skipped areas may still contain vulnerabilities. ")
+            md.append("> Low findings count does not mean secure — it may mean constrained testing.")
+            md.append("")
+
+        # High-value gaps
+        high_value_gaps = coverage_data.get("high_value_gaps", [])
+        if high_value_gaps:
+            md.append("## High-Value Areas Not Fully Tested")
+            md.append("")
+            md.append("These endpoints are typically sensitive but couldn't be fully assessed:")
+            md.append("")
+            md.append("| Endpoint | Reason | Recommendation |")
+            md.append("|----------|--------|----------------|")
+
+            for gap in high_value_gaps[:10]:  # Limit to top 10
+                endpoint = gap.get("surface", "Unknown")
+                reason = gap.get("skip_reason", "Unknown")
+                recommendation = {
+                    "AUTH_REQUIRED": "Test with authenticated session",
+                    "RATE_LIMITED": "Re-test with rate limit bypass",
+                    "BLOCKED_BY_WAF": "Manual testing recommended",
+                }.get(reason, "Manual review recommended")
+                md.append(f"| `{endpoint}` | {reason} | {recommendation} |")
+
+            md.append("")
+
+        # Authentication status
+        auth_context = scan_state.get("auth_context", {})
+        if auth_context:
+            md.append("## Authentication Coverage")
+            md.append("")
+            has_auth = auth_context.get("has_auth", False)
+            auth_type = auth_context.get("auth_type", "none")
+
+            if has_auth:
+                md.append(f"- **Auth Type:** {auth_type}")
+                md.append(f"- **Authenticated Testing:** Yes")
+                md.append("- **Auth-protected endpoints:** Tested with valid credentials")
+            else:
+                md.append("- **Authenticated Testing:** No")
+                md.append("- **Impact:** Auth-protected endpoints not fully tested")
+                md.append("- **Recommendation:** Provide valid credentials for deeper testing")
+
+            md.append("")
+
+        # Stateful flow coverage
+        flow_coverage = coverage_data.get("flow_coverage", {})
+        if flow_coverage:
+            md.append("## Stateful Flow Testing")
+            md.append("")
+            flows_tested = flow_coverage.get("tested", 0)
+            flows_total = flow_coverage.get("total", 0)
+            flows_blocked = flow_coverage.get("blocked", 0)
+
+            md.append(f"- **Flows Tested:** {flows_tested}/{flows_total}")
+            if flows_blocked:
+                md.append(f"- **Flows Blocked:** {flows_blocked} (rate limit or auth)")
+            md.append("")
+
+            tested_flows = flow_coverage.get("tested_flows", [])
+            if tested_flows:
+                md.append("**Successfully tested:**")
+                for flow in tested_flows[:5]:
+                    md.append(f"- {flow}")
+                md.append("")
+
+        # Confidence assessment
+        absence_confidence = coverage_data.get("absence_confidence", {})
+        if absence_confidence:
+            md.append("## Confidence of Absence")
+            md.append("")
+            md.append("For vulnerability types not found, how confident are we they don't exist?")
+            md.append("")
+            md.append("| Vulnerability Type | Confidence | Reason |")
+            md.append("|-------------------|------------|--------|")
+
+            for vuln_type, conf_data in absence_confidence.items():
+                if isinstance(conf_data, dict):
+                    confidence = conf_data.get("confidence", "LOW")
+                    reason = conf_data.get("reason", "Unknown")
+                else:
+                    confidence = str(conf_data)
+                    reason = "—"
+
+                emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(confidence, "⚪")
+                md.append(f"| {vuln_type} | {emoji} {confidence} | {reason} |")
+
+            md.append("")
+
+        # Final note
+        md.append("---")
+        md.append("")
+        md.append("## Interpretation")
+        md.append("")
+        md.append("**Low finding count does not mean secure.** It may indicate:")
+        md.append("")
+        md.append("1. ✅ Target is genuinely well-secured")
+        md.append("2. ⚠️ Testing was constrained (rate limits, auth, WAF)")
+        md.append("3. ⚠️ Attack surface not fully discovered (SPA, dynamic content)")
+        md.append("4. ⚠️ Vulnerabilities require manual testing to find")
+        md.append("")
+        md.append("This coverage report helps distinguish between these scenarios.")
+        md.append("")
+
+        # Save the file
+        summary_path = self.output_dir / "SCAN_COVERAGE_SUMMARY.md"
+        summary_path.write_text("\n".join(md))
+
+        logger.info(f"Coverage summary saved to {summary_path}")
+        return str(summary_path)
 
 
 # =============================================================================

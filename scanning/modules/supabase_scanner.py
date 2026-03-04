@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -29,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 from scanning.modules.backend_detector import SupabaseConfig, BackendDetector
 
 if TYPE_CHECKING:
@@ -181,6 +181,14 @@ class SupabaseScanner:
                 "Prefer": "return=representation",
             }
 
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception as e:
+                logger.debug(f"[SupabaseScanner] Rate limiter error: {e}")
+
     async def scan(
         self,
         target: str | None = None,
@@ -188,11 +196,12 @@ class SupabaseScanner:
         rate_limiter: Any = None,
     ) -> SupabaseScanResult | dict:
         """Run all Supabase security tests."""
+        self._rate_limiter = rate_limiter  # Store for use in test methods
         # Standard module interface: detect Supabase from target if not configured
         if self.config is None and target:
             logger.info(f"[SupabaseScanner] Detecting Supabase from target: {target}")
             if self._detector:
-                detection = await self._detector.detect_backend(target)
+                detection = await self._detector.detect(target)
                 if detection.supabase:
                     self.config = detection.supabase
                     self._init_headers()
@@ -237,12 +246,12 @@ class SupabaseScanner:
                 evidence=f"Key prefix: {self.config.service_role_key[:50]}...",
                 remediation="Never expose service_role key in client code. Use it only in "
                            "server-side code with proper authentication.",
-                cwe="CWE-798"
+                cwe_id="CWE-798"
             ))
         
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            verify=False,
+        async with get_scan_client(
+            timeout=self.timeout.connect,
+            verify_ssl=False,
         ) as client:
             # Run all tests in parallel where possible
             await asyncio.gather(
@@ -287,6 +296,7 @@ class SupabaseScanner:
         for table in self.COMMON_TABLES:
             try:
                 # Test 1: Unauthenticated read
+                await self._acquire_rate_limit()
                 response = await client.get(
                     f"{rest_url}/{table}",
                     headers=self.headers,
@@ -304,7 +314,7 @@ class SupabaseScanner:
                         
                         if isinstance(data, list) and data:
                             for field in sensitive_fields:
-                                if field in data[0]:
+                                if isinstance(data, list) and data and field in data[0]:
                                     exposed_fields.append(field)
                         
                         severity = Severity.HIGH if exposed_fields else Severity.MEDIUM
@@ -315,10 +325,10 @@ class SupabaseScanner:
                             severity=severity,
                             description=f"The table '{table}' returns data with anon key. "
                                        f"{'Sensitive fields exposed: ' + ', '.join(exposed_fields) if exposed_fields else 'Review if this data should be public.'}",
-                            evidence=f"Returned {len(data)} rows. Sample keys: {list(data[0].keys())[:5] if data else 'N/A'}",
+                            evidence=f"Returned {len(data)} rows. Sample keys: {list(data[0].keys())[:5] if (isinstance(data, list) and data) else 'N/A'}",
                             table_or_bucket=table,
                             remediation="Implement RLS policies: CREATE POLICY ... ON table FOR SELECT USING (auth.uid() = user_id)",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                 
                 # Test 2: Write attempt (POST) - ONLY in write-allowed modes
@@ -326,6 +336,7 @@ class SupabaseScanner:
                     logger.debug(f"⚠️ SAFE MODE: Skipping write test for table '{table}'")
                 else:
                     test_data = {"test_field": "rls_bypass_test", "id": str(uuid.uuid4())}
+                    await self._acquire_rate_limit()
                     response = await client.post(
                         f"{rest_url}/{table}",
                         headers=self.headers,
@@ -342,7 +353,7 @@ class SupabaseScanner:
                             evidence=f"POST request succeeded with status {response.status_code}",
                             table_or_bucket=table,
                             remediation="Add RLS policy: CREATE POLICY ... ON table FOR INSERT WITH CHECK (auth.uid() IS NOT NULL)",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                 
                 # Test 3: Delete attempt - ONLY in write-allowed modes
@@ -350,6 +361,7 @@ class SupabaseScanner:
                 if not ALLOW_WRITES:
                     logger.debug(f"⚠️ SAFE MODE: Skipping delete test for table '{table}'")
                 else:
+                    await self._acquire_rate_limit()
                     response = await client.delete(
                         f"{rest_url}/{table}",
                         headers={**self.headers, "Prefer": "return=minimal"},
@@ -366,7 +378,7 @@ class SupabaseScanner:
                             evidence=f"DELETE request returned {response.status_code}",
                             table_or_bucket=table,
                             remediation="Add RLS policy for DELETE operations",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
                     
             except Exception as e:
@@ -390,6 +402,7 @@ class SupabaseScanner:
         for bucket in self.COMMON_BUCKETS:
             try:
                 # Test 1: List bucket contents
+                await self._acquire_rate_limit()
                 response = await client.get(
                     f"{storage_url}/object/list/{bucket}",
                     headers=self.headers,
@@ -409,10 +422,11 @@ class SupabaseScanner:
                             evidence=f"Found {len(files)} files/folders",
                             table_or_bucket=bucket,
                             remediation="Set bucket policies to prevent listing or make bucket private",
-                            cwe="CWE-548"
+                            cwe_id="CWE-548"
                         ))
                 
                 # Test 2: Public URL access
+                await self._acquire_rate_limit()
                 response = await client.get(
                     f"{storage_url}/object/public/{bucket}/test.txt"
                 )
@@ -427,7 +441,7 @@ class SupabaseScanner:
                         evidence="Public URL returned 200",
                         table_or_bucket=bucket,
                         remediation="Review if public access is intended. Use signed URLs for private files.",
-                        cwe="CWE-284"
+                        cwe_id="CWE-284"
                     ))
                 
                 # Test 3: Unauthorized upload - ONLY in write-allowed modes
@@ -435,6 +449,7 @@ class SupabaseScanner:
                     logger.debug(f"⚠️ SAFE MODE: Skipping upload test for bucket '{bucket}'")
                 else:
                     test_content = b"security_test_upload"
+                    await self._acquire_rate_limit()
                     response = await client.post(
                         f"{storage_url}/object/{bucket}/security_test.txt",
                         headers={**self.headers, "Content-Type": "text/plain"},
@@ -451,7 +466,7 @@ class SupabaseScanner:
                             evidence=f"Upload succeeded with status {response.status_code}",
                             table_or_bucket=bucket,
                             remediation="Add storage policies to restrict uploads to authenticated users",
-                            cwe="CWE-434"
+                            cwe_id="CWE-434"
                         ))
                         
                         # Try to delete the test file (cleanup)
@@ -468,6 +483,7 @@ class SupabaseScanner:
                 ]
                 
                 for path in traversal_paths:
+                    await self._acquire_rate_limit()
                     response = await client.get(
                         f"{storage_url}/object/{bucket}/{path}",
                         headers=self.headers
@@ -482,7 +498,7 @@ class SupabaseScanner:
                             evidence=f"Payload: {path}",
                             table_or_bucket=bucket,
                             remediation="Report to Supabase security team",
-                            cwe="CWE-22"
+                            cwe_id="CWE-22"
                         ))
                         break
                         
@@ -512,6 +528,7 @@ class SupabaseScanner:
         for func in common_functions:
             try:
                 # Test 1: GET request
+                await self._acquire_rate_limit()
                 response = await client.get(
                     f"{functions_url}/{func}",
                     headers={"Authorization": f"Bearer {self.config.anon_key}"}
@@ -530,17 +547,18 @@ class SupabaseScanner:
                             evidence=f"GET returned {response.status_code}",
                             table_or_bucket=func,
                             remediation="Ensure function validates auth token and user permissions",
-                            cwe="CWE-287"
+                            cwe_id="CWE-287"
                         ))
                 
-                # Test 2: POST with malicious payloads
+                # Test 2: POST with malicious payloads (non-destructive)
                 test_payloads = [
                     {"command": "ls -la"},
-                    {"query": "'; DROP TABLE users; --"},
+                    {"query": "' OR '1'='1; --"},  # Non-destructive SQL injection test
                     {"path": "../../../../etc/passwd"},
                 ]
                 
                 for payload in test_payloads:
+                    await self._acquire_rate_limit()
                     response = await client.post(
                         f"{functions_url}/{func}",
                         headers={
@@ -561,7 +579,7 @@ class SupabaseScanner:
                                 evidence=f"Payload: {json.dumps(payload)[:100]}",
                                 table_or_bucket=func,
                                 remediation="Validate and sanitize all input parameters",
-                                cwe="CWE-94"
+                                cwe_id="CWE-94"
                             ))
                             break
                             
@@ -586,6 +604,7 @@ class SupabaseScanner:
         
         try:
             # Test WebSocket endpoint availability
+            await self._acquire_rate_limit()
             response = await client.get(
                 realtime_url,
                 headers={"apikey": self.config.anon_key}
@@ -600,7 +619,7 @@ class SupabaseScanner:
                                "Verify channel-level authorization is configured.",
                     evidence=f"Response: {response.status_code}",
                     remediation="Implement RLS policies for realtime subscriptions",
-                    cwe="CWE-284"
+                    cwe_id="CWE-284"
                 ))
         except Exception as e:
             logger.debug(f"Realtime test error: {e}")
@@ -622,6 +641,7 @@ class SupabaseScanner:
         try:
             # Test 1: Email enumeration via signup
             test_email = f"test_{uuid.uuid4().hex[:8]}@test.com"
+            await self._acquire_rate_limit()
             response = await client.post(
                 f"{auth_url}/signup",
                 headers={"apikey": self.config.anon_key},
@@ -644,12 +664,13 @@ class SupabaseScanner:
                                "allows attackers to enumerate valid email addresses.",
                     evidence=f"New email: {response.status_code}, Existing: {response2.status_code}",
                     remediation="Configure identical responses for all signup attempts",
-                    cwe="CWE-203"
+                    cwe_id="CWE-203"
                 ))
             
             # Test 2: Weak password acceptance
             weak_passwords = ["123456", "password", "qwerty"]
             for pwd in weak_passwords:
+                await self._acquire_rate_limit()
                 response = await client.post(
                     f"{auth_url}/signup",
                     headers={"apikey": self.config.anon_key},
@@ -665,11 +686,12 @@ class SupabaseScanner:
                                    "Weak passwords make brute-force attacks easier.",
                         evidence=f"Signup with '{pwd}' returned {response.status_code}",
                         remediation="Configure minimum password length and complexity in Supabase dashboard",
-                        cwe="CWE-521"
+                        cwe_id="CWE-521"
                     ))
                     break
             
             # Test 3: Auth settings endpoint
+            await self._acquire_rate_limit()
             response = await client.get(
                 f"{auth_url}/settings",
                 headers={"apikey": self.config.anon_key}
@@ -691,7 +713,7 @@ class SupabaseScanner:
                                        "This skips email verification.",
                             evidence=json.dumps(settings)[:200],
                             remediation="Disable auto-confirm for production",
-                            cwe="CWE-287"
+                            cwe_id="CWE-287"
                         ))
                         
         except Exception as e:
@@ -715,6 +737,7 @@ class SupabaseScanner:
         
         for url in dashboard_urls:
             try:
+                await self._acquire_rate_limit()
                 response = await client.get(url, follow_redirects=True)
                 
                 # If we get the login page, dashboard is not exposed
@@ -729,13 +752,14 @@ class SupabaseScanner:
                                        "Verify access controls are properly configured.",
                             evidence=f"URL: {url}",
                             remediation="Ensure dashboard access requires authenticated team members",
-                            cwe="CWE-284"
+                            cwe_id="CWE-284"
                         ))
             except Exception as e:
                 logger.debug(f"Dashboard test error: {e}")
         
         # Test API documentation exposure
         try:
+            await self._acquire_rate_limit()
             response = await client.get(
                 f"{self.config.project_url}/rest/v1/",
                 headers={"apikey": self.config.anon_key}
@@ -750,7 +774,7 @@ class SupabaseScanner:
                                "This may reveal table structure.",
                     evidence=response.text[:200],
                     remediation="This is expected behavior. Ensure RLS is properly configured.",
-                    cwe="CWE-200"
+                    cwe_id="CWE-200"
                 ))
         except Exception:
             pass

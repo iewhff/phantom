@@ -5,16 +5,16 @@ Tests for gRPC specific vulnerabilities and misconfigurations.
 
 from __future__ import annotations
 
-import json
-import struct
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -51,9 +51,15 @@ class GRPCScanner(ScanModule):
         "application/grpc-web-text+proto",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -62,11 +68,16 @@ class GRPCScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for gRPC vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         clean_host = host.replace("https://", "").replace("http://", "").split("/")[0]
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Detect gRPC endpoints
             grpc_info = await self._detect_grpc(client, clean_host, rate_limiter)
             
@@ -106,8 +117,8 @@ class GRPCScanner(ScanModule):
                 client, clean_host, rate_limiter
             )
             findings.extend(insecure_findings)
-        
-        return findings
+
+        return {"findings": [f.to_dict() for f in findings], "info": []}
     
     async def _detect_grpc(
         self,
@@ -225,14 +236,14 @@ class GRPCScanner(ScanModule):
                     findings.append(Finding(
                         name="gRPC-Web Method Accessible",
                         severity=severity,
-                        confidence="HIGH",
+                        confidence_score=85.0,
                         description=f"gRPC-Web method accessible: {method}",
-                        matched_at=test_url,
+                        endpoint=test_url,
                         evidence=[
                             f"gRPC Status: {grpc_status}",
                             f"Message: {grpc_message}",
                         ],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         cvss_score=6.5 if "admin" in method.lower() else 4.3,
                         remediation="Implement proper authorization for gRPC methods. "
                                    "Use interceptors for authentication.",
@@ -284,15 +295,15 @@ class GRPCScanner(ScanModule):
                 if grpc_status in ["0", "2", "3"]:  # OK, UNKNOWN, or INVALID_ARGUMENT
                     findings.append(Finding(
                         name="gRPC Reflection Enabled",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="gRPC server reflection is enabled, exposing service definitions",
-                        matched_at=test_url,
+                        endpoint=test_url,
                         evidence=[
                             "Reflection endpoint responds",
                             f"gRPC Status: {grpc_status}",
                         ],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         cvss_score=5.3,
                         remediation="Disable gRPC reflection in production. "
                                    "Use: grpc.reflection.enabled=false",
@@ -339,12 +350,12 @@ class GRPCScanner(ScanModule):
                     if grpc_status in ["0", "2"]:
                         findings.append(Finding(
                             name="gRPC Health Endpoint Exposed",
-                            severity="LOW",
-                            confidence="HIGH",
+                            severity=Severity.LOW,
+                            confidence_score=85.0,
                             description="gRPC health check endpoint is publicly accessible",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["Health endpoint responds"],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=3.1,
                             remediation="Consider restricting health endpoint to internal access.",
                         ))
@@ -403,14 +414,14 @@ class GRPCScanner(ScanModule):
                     findings.append(Finding(
                         name=f"gRPC {service_name} Detected",
                         severity=severity,
-                        confidence="MEDIUM",
+                        confidence_score=65.0,
                         description=f"gRPC service detected: {service_name}",
-                        matched_at=test_url,
+                        endpoint=test_url,
                         evidence=[
                             f"Service path: {service_path}",
                             f"gRPC Status: {grpc_status}",
                         ],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         cvss_score=6.5 if severity == "HIGH" else 4.3,
                         remediation="Ensure proper authorization for sensitive services.",
                     ))
@@ -461,12 +472,12 @@ class GRPCScanner(ScanModule):
                 if header in response.headers:
                     findings.append(Finding(
                         name="gRPC Metadata Reflection",
-                        severity="MEDIUM",
-                        confidence="MEDIUM",
+                        severity=Severity.MEDIUM,
+                        confidence_score=65.0,
                         description="gRPC server reflects metadata headers",
-                        matched_at=test_url,
+                        endpoint=test_url,
                         evidence=[f"Header {header} reflected in response"],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         cvss_score=4.3,
                         remediation="Don't reflect arbitrary metadata. Validate metadata inputs.",
                     ))
@@ -509,15 +520,15 @@ class GRPCScanner(ScanModule):
                 if grpc_status is not None:
                     findings.append(Finding(
                         name="Insecure gRPC (No TLS)",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"gRPC service accessible without TLS on port {port}",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"Port: {port}",
                             "gRPC responds over HTTP (no encryption)",
                         ],
-                        cwe="CWE-319",
+                        cwe_id="CWE-319",
                         cvss_score=7.5,
                         remediation="Enable TLS for all gRPC communications. "
                                    "Use grpc.ssl_channel_credentials().",

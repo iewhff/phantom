@@ -39,18 +39,22 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 
+if TYPE_CHECKING:
+    from scanning.scan_safety_config import ScanSafetyConfig
+
 import click
+
+# Professional Ethics & Legal Compliance
+from utils.legal_disclaimer import check_authorization
+from utils.audit_logger import init_audit_logger, get_audit_logger
 from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     Progress,
@@ -59,14 +63,8 @@ from rich.progress import (
     BarColumn,
     TaskProgressColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.table import Table
-from rich.tree import Tree
-from rich import print as rprint
-from rich.style import Style
-from rich.text import Text
-from rich.markdown import Markdown
 
 # Import PHANTOM AI modules
 try:
@@ -149,6 +147,7 @@ except ImportError:
     HACKERONE_REPORTER_AVAILABLE = False
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def safe_asyncio_run(coro):
@@ -204,8 +203,8 @@ def safe_asyncio_run(coro):
             if hasattr(loop, 'shutdown_default_executor'):
                 loop.run_until_complete(loop.shutdown_default_executor())
 
-        except Exception:
-            pass  # Ignore cleanup errors
+        except Exception as e:
+            logger.debug(f"Event loop cleanup error (expected): {e}")
         finally:
             # Force garbage collection BEFORE closing loop
             # This cleans up subprocess transports while loop is still open
@@ -379,9 +378,35 @@ def load_scan_state(scan_id: str) -> Optional[Dict[str, Any]]:
 
 
 def normalize_target(target: str) -> str:
-    """Normalize target URL."""
+    """Normalize target URL.
+
+    FIX CLI-04: Add validation for target format.
+    """
+    import re
+
+    # Strip whitespace
+    target = target.strip()
+
+    # Validate non-empty
+    if not target:
+        raise click.BadParameter("Target cannot be empty")
+
+    # Add scheme if missing
     if not target.startswith(("http://", "https://")):
+        # Validate it looks like a domain/IP before adding https://
+        if not re.match(r'^[\w\.-]+(:\d+)?(/.*)?$', target):
+            raise click.BadParameter(f"Invalid target format: {target}")
         target = f"https://{target}"
+
+    # Validate URL structure
+    parsed = urlparse(target)
+    if not parsed.netloc:
+        raise click.BadParameter(f"Invalid URL (no host): {target}")
+
+    # Check for suspicious patterns (path traversal attempts)
+    if ".." in target or target.count("//") > 1:
+        console.print(f"[yellow]⚠️ Warning: Suspicious pattern in target: {target}[/yellow]")
+
     return target.rstrip("/")
 
 
@@ -498,7 +523,7 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, no_banner: bool):
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
 @click.option("--format", "-f", "output_format",
               type=click.Choice(["pdf", "html", "json", "md", "sarif"]),
-              default="html", help="Report format")
+              default="json", help="Report format (default: JSON)")
 @click.option("--modules", "-m", help="Modules to run (comma-separated or category)")
 @click.option("--safe-mode", "-s",
               type=click.Choice(["passive", "safe", "cautious", "standard", "aggressive"]),
@@ -506,6 +531,7 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, no_banner: bool):
 @click.option("--rate", "-r", type=float, default=2.0, help="Requests per second")
 @click.option("--concurrent", "-c", type=int, default=3, help="Concurrent modules")
 @click.option("--scope", multiple=True, help="Additional in-scope domains")
+@click.option("--subdomains", is_flag=True, default=False, help="Also scan subdomains (default: OFF for safety)")
 @click.option("--exclude", multiple=True, help="Exclude specific modules")
 @click.option("--preset", help="Load bug bounty preset")
 @click.option("--no-recon", is_flag=True, help="Skip reconnaissance phase")
@@ -513,16 +539,22 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, no_banner: bool):
 @click.option("--no-chain", is_flag=True, help="Skip vulnerability chaining")
 @click.option("--no-ai", is_flag=True, help="Skip AI validation")
 @click.option("--no-auth", is_flag=True, help="Skip authorization check")
+@click.option("--dry-run", is_flag=True, default=False, help="Simulate scan without sending actual requests (OPSEC test)")
 @click.option("--timeout", type=int, help="Overall scan timeout in seconds")
 @click.option("--compliance", multiple=True,
               type=click.Choice(["pci-dss", "hipaa", "gdpr", "nist", "owasp", "all"]),
               help="Compliance frameworks to map (can be used multiple times)")
+@click.option("--totp-secret", type=str, default=None,
+              help="TOTP secret (base32) for automatic 2FA handling")
+@click.option("--allow-manual-auth", is_flag=True, default=False,
+              help="Allow manual browser intervention for CAPTCHA/2FA challenges")
 @click.pass_context
 def scan(ctx: click.Context, target: str, output: Optional[str], output_format: str,
          modules: Optional[str], safe_mode: str, rate: float, concurrent: int,
-         scope: tuple, exclude: tuple, preset: Optional[str],
+         scope: tuple, subdomains: bool, exclude: tuple, preset: Optional[str],
          no_recon: bool, no_tools: bool, no_chain: bool, no_ai: bool, no_auth: bool,
-         timeout: Optional[int], compliance: tuple):
+         dry_run: bool, timeout: Optional[int], compliance: tuple,
+         totp_secret: Optional[str], allow_manual_auth: bool):
     """
     Execute PHANTOM AI security scan on TARGET.
 
@@ -548,6 +580,16 @@ def scan(ctx: click.Context, target: str, output: Optional[str], output_format: 
 
     compliance_list = list(compliance) if compliance else []
 
+    # GAP-5: Advanced auth options (TOTP, manual auth)
+    import os
+    if totp_secret:
+        os.environ["PHANTOM_TOTP_SECRET"] = totp_secret
+        console.print("[cyan]🔐 TOTP secret configured — automatic 2FA handling enabled[/cyan]")
+
+    if allow_manual_auth:
+        os.environ["PHANTOM_ALLOW_MANUAL_AUTH"] = "1"
+        console.print("[cyan]🖥️ Manual auth enabled — browser will open for CAPTCHA/2FA challenges[/cyan]")
+
     safe_asyncio_run(_run_phantom_scan(
         target=target,
         output_dir=output,
@@ -568,6 +610,8 @@ def scan(ctx: click.Context, target: str, output: Optional[str], output_format: 
         scan_mode=ScanMode.STANDARD if PHANTOM_AVAILABLE else "standard",
         verbose=ctx.obj.get("verbose", False),
         compliance=compliance_list,
+        include_subdomains=subdomains,
+        dry_run=dry_run,
     ))
 
 
@@ -592,6 +636,11 @@ async def _run_phantom_scan(
     verbose: bool,
     compliance: List[str] = None,
     custom_headers: Optional[Dict[str, str]] = None,
+    include_subdomains: bool = False,
+    dry_run: bool = False,
+    client_name: Optional[str] = None,  # FIX CLI-02: For client engagements
+    engagement_id: Optional[str] = None,  # FIX CLI-02: For client engagements
+    safety_config: Optional["ScanSafetyConfig"] = None,  # P0 FIX: Professional safety config
 ) -> None:
     """Execute PHANTOM AI scan."""
 
@@ -679,6 +728,28 @@ async def _run_phantom_scan(
             if verbose:
                 console.print(f"[yellow]⚠️ Auth check skipped: {e}[/yellow]")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AUDIT LOGGING: Initialize comprehensive audit trail for scan command
+    # ═══════════════════════════════════════════════════════════════════════════
+    audit = init_audit_logger(
+        engagement_id=scan_id,
+        operator=os.environ.get("USER", "phantom-ai"),
+    )
+    audit.log_authorization(
+        target=target,
+        accepted=True,
+        scope=scope,
+        mode=safe_mode,
+        rate_limit=rate,
+    )
+    if scope:
+        audit.log_scope_confirmed(
+            targets=[target],
+            scope=scope,
+            program_name=f"Scan: {domain}",
+        )
+    console.print(f"[dim]📝 Audit log: {audit.log_file}[/dim]")
+
     # Initialize scan state
     scan_state = {
         "scan_id": scan_id,
@@ -702,6 +773,8 @@ async def _run_phantom_scan(
             "no_recon": no_recon,
             "no_chain": no_chain,
             "no_ai": no_ai,
+            "client_name": client_name,  # FIX CLI-02: Store for client reports
+            "engagement_id": engagement_id,  # FIX CLI-02: Store for client reports
         }
     }
 
@@ -897,7 +970,13 @@ async def _run_phantom_scan(
                 settings = get_settings()
                 settings.rate_limit.requests_per_second = rate
 
-                scanner = FullScanner(settings, safe_mode=safe_mode)
+                scanner = FullScanner(
+                    settings,
+                    safe_mode=safe_mode,
+                    include_subdomains=include_subdomains,
+                    scope=scope,  # ETHICS-08: Real-time scope blocking
+                    safety_config=safety_config,  # P0 FIX: Professional safety configuration
+                )
 
                 # Determine category - CLIENT mode uses dedicated client category
                 category = "standard"
@@ -946,6 +1025,7 @@ async def _run_phantom_scan(
                     pentest_log.log_error(f"Module error: {error}")
 
                 scan_duration = (datetime.now() - scan_start_time).total_seconds()
+                scan_state["duration_seconds"] = scan_duration
                 pentest_log.log_phase_end("vulnerability_scanning", scan_duration, {
                     "modules_run": len(result.modules_run),
                     "raw_findings": len(all_findings),
@@ -1003,7 +1083,7 @@ async def _run_phantom_scan(
                             evidence = finding.get("description", "")
 
                         # Normalize confidence to 0-1 scale (some modules use 0-100 or strings)
-                        raw_confidence = finding.get("confidence", 0.5)
+                        raw_confidence = finding.get("confidence_score", finding.get("confidence", 0.5))
                         try:
                             if isinstance(raw_confidence, str):
                                 # Handle string labels like "HIGH", "MEDIUM", "LOW"
@@ -1106,8 +1186,8 @@ async def _run_phantom_scan(
                     # Cleanup pipeline resources
                     try:
                         await pipeline.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Pipeline cleanup error: {e}")
 
                 except Exception as e:
                     if verbose:
@@ -1119,8 +1199,8 @@ async def _run_phantom_scan(
                     # Try to close pipeline even on error
                     try:
                         await pipeline.close()
-                    except Exception:
-                        pass
+                    except Exception as cleanup_err:
+                        logger.debug(f"Pipeline cleanup error: {cleanup_err}")
             else:
                 validated_findings = all_findings
                 info_findings_skipped = 0
@@ -1347,9 +1427,73 @@ async def _run_phantom_scan(
 
     console.print(table)
 
-    # Display findings
+    # Semantic grouping by category
     if validated_findings:
-        console.print("\n[bold]🔍 Security Findings:[/bold]")
+        _CATEGORY_MAP = {
+            "Injection": {"sqli", "sql_injection", "nosql", "nosqli", "cmdi", "command_injection", "ldap", "ssti", "template_injection", "crlf"},
+            "XSS / Client-Side": {"xss", "dom_xss", "reflected_xss", "stored_xss", "cross_site_scripting", "template_injection_xss", "clickjacking"},
+            "Auth / Session": {"authentication", "auth_bypass", "jwt", "session_abuse", "session", "token_not_invalidated", "mfa", "oauth", "saml"},
+            "Access Control": {"idor", "authorization", "authz", "broken_access_control"},
+            "Business Logic": {"business_logic", "business", "price_manipulation", "workflow_bypass", "race"},
+            "API Security": {"api", "api_security", "graphql", "grpc", "mass_assign", "rate_limit", "ratelimit"},
+            "Creative / Logic": {"creative_logic", "creative_exploiter", "context_confusion", "trust_boundary", "chaos_composer"},
+            "Infrastructure": {"cors", "headers", "ssl", "smuggling", "cache", "cache_deception", "dns_rebind", "host_header", "prototype"},
+            "Information Disclosure": {"info_disclosure", "information_disclosure", "directory", "sensitive_file", "vcs_exposure", "cms", "dir"},
+        }
+
+        # Classify each finding
+        categories: dict[str, list] = {}
+        for f in validated_findings:
+            # Unwrap ValidatedFinding → raw_finding if needed
+            raw = f.raw_finding if hasattr(f, "raw_finding") else f
+            if hasattr(raw, "vulnerability_type"):
+                vt = raw.vulnerability_type
+                ftype = (vt.value if hasattr(vt, "value") else str(vt)).lower().replace(" ", "_").replace("-", "_")
+            elif isinstance(raw, dict):
+                ftype = (raw.get("type") or raw.get("vulnerability_type") or
+                         (raw.get("finding", {}) if isinstance(raw.get("finding"), dict) else {}).get("vulnerability_type", "other")
+                         ).lower().replace(" ", "_").replace("-", "_")
+            else:
+                ftype = "other"
+            if hasattr(raw, "module_name"):
+                module = (raw.module_name or "").lower()
+            elif isinstance(raw, dict):
+                module = (raw.get("module_name") or raw.get("module") or
+                          (raw.get("finding", {}) if isinstance(raw.get("finding"), dict) else {}).get("module_name", "")).lower()
+            else:
+                module = ""
+            category = "Other"
+            for cat_name, cat_types in _CATEGORY_MAP.items():
+                if ftype in cat_types or module in cat_types:
+                    category = cat_name
+                    break
+            categories.setdefault(category, []).append(f)
+
+        console.print("\n[bold]📋 Findings by Category:[/bold]")
+        for cat_name, cat_findings in sorted(categories.items(), key=lambda x: -max(
+            {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(_get_severity(f), 0)
+            for f in x[1]
+        )):
+            sev_counts = {}
+            for f in cat_findings:
+                s = _get_severity(f)
+                sev_counts[s] = sev_counts.get(s, 0) + 1
+            sev_str = " ".join(f"{format_severity(s)}×{c}" for s, c in
+                              sorted(sev_counts.items(), key=lambda x: -{"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(x[0], 0)))
+            console.print(f"  [bold]{cat_name}[/bold] ({len(cat_findings)}) — {sev_str}")
+            # Show top 2 findings per category
+            for f in sorted(cat_findings, key=lambda f: -{"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(_get_severity(f), 0))[:2]:
+                name = _get_type(f)
+                url = _get_url(f)
+                console.print(f"    {format_severity(_get_severity(f))} {name}")
+                if url:
+                    console.print(f"       {url[:60]}{'...' if len(url) > 60 else ''}")
+            if len(cat_findings) > 2:
+                console.print(f"    [dim]... +{len(cat_findings) - 2} more[/dim]")
+
+    # Display all findings (flat list)
+    if validated_findings:
+        console.print("\n[bold]🔍 All Findings:[/bold]")
 
         for i, finding in enumerate(validated_findings[:10], 1):
             severity = _get_severity(finding)
@@ -1446,35 +1590,75 @@ async def _run_phantom_scan(
         "errors": scan_state.get("errors", []),
     }
 
-    if output_format == "json":
-        report_file = output_path / f"phantom_{safe_domain}_{timestamp}.json"
-        report_file.write_text(json.dumps(report_data, indent=2, default=str))
+    # FIX CLI-08: Add error handling for report generation
+    report_file = None
+    try:
+        if output_format == "json":
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}.json"
+            report_file.write_text(json.dumps(report_data, indent=2, default=str))
 
-    elif output_format == "sarif" and PHANTOM_AVAILABLE:
-        report_file = output_path / f"phantom_{safe_domain}_{timestamp}.sarif"
-        sarif_output = findings_to_sarif(validated_findings, target, scan_id)
-        report_file.write_text(json.dumps(sarif_output, indent=2))
+        elif output_format == "sarif" and PHANTOM_AVAILABLE:
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}.sarif"
+            sarif_output = findings_to_sarif(validated_findings, target, scan_id)
+            report_file.write_text(json.dumps(sarif_output, indent=2))
 
-    elif output_format == "html":
-        report_file = output_path / f"phantom_{safe_domain}_{timestamp}.html"
-        _generate_phantom_html_report(report_data, report_file)
+        elif output_format == "html":
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}.html"
+            _generate_phantom_html_report(report_data, report_file)
 
-    elif output_format == "md":
-        report_file = output_path / f"phantom_{safe_domain}_{timestamp}.md"
-        _generate_phantom_md_report(report_data, report_file)
+        elif output_format == "md":
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}.md"
+            _generate_phantom_md_report(report_data, report_file)
 
-    else:
-        # Default to JSON
-        report_file = output_path / f"phantom_{safe_domain}_{timestamp}.json"
-        report_file.write_text(json.dumps(report_data, indent=2, default=str))
+        else:
+            # Default to JSON
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}.json"
+            report_file.write_text(json.dumps(report_data, indent=2, default=str))
 
-    console.print(f"\n[green]✅ Report saved: {report_file}[/green]")
+        console.print(f"\n[green]✅ Report saved: {report_file}[/green]")
+
+    except (OSError, PermissionError, IOError) as e:
+        console.print(f"\n[red]❌ Failed to save report: {e}[/red]")
+        # Try fallback to temp directory
+        try:
+            import tempfile
+            fallback_dir = Path(tempfile.gettempdir())
+            report_file = fallback_dir / f"phantom_{safe_domain}_{timestamp}.json"
+            report_file.write_text(json.dumps(report_data, indent=2, default=str))
+            console.print(f"[yellow]⚠️ Report saved to fallback location: {report_file}[/yellow]")
+        except Exception as fallback_e:
+            console.print(f"[red]❌ Fallback also failed: {fallback_e}[/red]")
+            console.print("[yellow]Report data available in scan state file.[/yellow]")
+    except (TypeError, ValueError) as e:
+        console.print(f"\n[red]❌ Failed to serialize report: {e}[/red]")
+        # Try simplified JSON
+        try:
+            report_file = output_path / f"phantom_{safe_domain}_{timestamp}_simple.json"
+            simple_data = {"findings": [str(f) for f in validated_findings], "error": str(e)}
+            report_file.write_text(json.dumps(simple_data, indent=2))
+            console.print(f"[yellow]⚠️ Simplified report saved: {report_file}[/yellow]")
+        except Exception:
+            console.print("[yellow]Report data available in scan state file.[/yellow]")
 
     # Update final state
     scan_state["status"] = "completed"
     scan_state["end_time"] = datetime.now().isoformat()
     scan_state["report_file"] = str(report_file)
     save_scan_state(scan_id, scan_state)
+
+    # Log scan completion to audit trail
+    try:
+        audit = get_audit_logger()
+        if audit:
+            duration = (datetime.now() - start_time).total_seconds()
+            audit.log_scan_completed(
+                target=target,
+                findings_count=len(validated_findings),
+                duration_seconds=duration,
+                scope_violations=0,
+            )
+    except Exception:
+        pass  # Audit logging is optional
 
     # Final summary panel
     risk_level = "LOW"
@@ -1536,11 +1720,22 @@ async def _run_phantom_scan(
             module=module,
         )
 
-    # Log chains to pentest log
+    # Log chains to pentest log (with consecutive-name dedup)
     for i, chain in enumerate(chains):
         chain_vulns = chain.get("vulnerabilities", [])
         if chain_vulns:
             vuln_names = [_get_vuln_display_name(v) for v in chain_vulns]
+            # Collapse consecutive duplicates: CSTI→CSTI→CSTI → CSTI (×3)
+            deduped_log = []
+            for n in vuln_names:
+                if deduped_log and deduped_log[-1][0] == n:
+                    deduped_log[-1] = (n, deduped_log[-1][1] + 1)
+                else:
+                    deduped_log.append((n, 1))
+            vuln_names = [
+                f"{name} (×{count})" if count > 1 else name
+                for name, count in deduped_log
+            ]
         else:
             vuln_names = [chain.get("name", "Unknown Chain")]
         pentest_log.log_chain(
@@ -1612,6 +1807,9 @@ def _flatten_validated_finding(validated_finding) -> dict:
             "is_valid": validated_finding.is_valid,
             "validation_confidence": validated_finding.final_confidence,
         }
+        # Preserve metadata (cluster, proof_gate, etc.) from postprocessing
+        if hasattr(raw, "metadata") and raw.metadata:
+            result["metadata"] = raw.metadata if isinstance(raw.metadata, dict) else {}
         return result
     elif hasattr(validated_finding, "to_dict"):
         # Has to_dict but not raw_finding - might be dict-like
@@ -1619,7 +1817,7 @@ def _flatten_validated_finding(validated_finding) -> dict:
         # Check if it's nested format from ValidatedFinding
         if "finding" in d and isinstance(d["finding"], dict):
             inner = d["finding"]
-            return {
+            flat = {
                 "type": inner.get("vulnerability_type", inner.get("type", "unknown")),
                 "name": inner.get("title", inner.get("name", "Unknown")),
                 "title": inner.get("title", inner.get("name", "Unknown")),
@@ -1634,6 +1832,10 @@ def _flatten_validated_finding(validated_finding) -> dict:
                 "confidence": d.get("final_confidence", 0.5),
                 "is_valid": d.get("is_valid", True),
             }
+            # Preserve metadata (cluster, proof_gate, etc.) from postprocessing
+            if inner.get("metadata"):
+                flat["metadata"] = inner["metadata"]
+            return flat
         return d
     else:
         # Already a dict
@@ -1641,17 +1843,20 @@ def _flatten_validated_finding(validated_finding) -> dict:
 
 
 def _get_severity(finding) -> str:
-    """Get severity from finding."""
+    """Get severity from finding. Always returns uppercase (CRITICAL, HIGH, MEDIUM, LOW, INFO)."""
     # ValidatedFinding wraps the raw finding
     if hasattr(finding, "raw_finding"):
         finding = finding.raw_finding
     if hasattr(finding, "severity"):
-        return finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity)
+        sev = finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity)
+        return sev.upper() if isinstance(sev, str) else "INFO"
     elif isinstance(finding, dict):
         # Serialized ValidatedFinding: {"finding": {...}, "is_valid": true, ...}
         if "finding" in finding and isinstance(finding["finding"], dict):
-            return finding["finding"].get("severity", "INFO")
-        return finding.get("severity", "INFO")
+            sev = finding["finding"].get("severity", "INFO")
+        else:
+            sev = finding.get("severity", "INFO")
+        return sev.upper() if isinstance(sev, str) else "INFO"
     return "INFO"
 
 
@@ -1702,6 +1907,10 @@ def _get_type(finding) -> str:
 
     # For dict-based findings
     if isinstance(raw, dict):
+        # Serialized ValidatedFinding: {"finding": {...}, "is_valid": true, ...}
+        if "finding" in raw and isinstance(raw["finding"], dict):
+            raw = raw["finding"]
+
         # Try title first
         title = raw.get("title")
         if title and title.lower() not in ("unknown", "other"):
@@ -1752,7 +1961,7 @@ def _get_confidence(finding) -> float:
     elif hasattr(finding, "confidence"):
         return finding.confidence
     elif isinstance(finding, dict):
-        return finding.get("final_confidence", finding.get("confidence", 0.0))
+        return finding.get("final_confidence", finding.get("confidence_score", finding.get("confidence", 0.0)))
     return 0.0
 
 
@@ -1993,6 +2202,15 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
         .severity-tag.medium {{ background: var(--medium); color: #333; }}
         .severity-tag.low {{ background: var(--low); }}
 
+        .proof-badge {{ padding: 2px 8px; border-radius: 3px; font-size: 0.7em; margin-left: 8px; font-weight: 600; }}
+        .proof-badge.proven {{ background: #27ae60; color: white; }}
+        .proof-badge.verified {{ background: #3498db; color: white; }}
+        .proof-badge.detected {{ background: #95a5a6; color: white; }}
+
+        .cluster-badge {{ padding: 2px 8px; border-radius: 3px; font-size: 0.7em; margin-left: 8px; font-weight: 600; background: #8e44ad; color: white; }}
+        .sub-finding {{ margin: 8px 0 8px 20px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-left: 3px solid #555; font-size: 0.9em; }}
+        .sub-finding strong {{ color: #ccc; }}
+
         .finding-detail {{
             margin-top: 0.5rem;
             padding: 0.5rem 1rem;
@@ -2089,16 +2307,36 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
         <div class="card">
             <h2>🔍 Security Findings</h2>
 """
-        for i, finding in enumerate(findings, 1):
+        # Reorder findings by cluster (representatives first)
+        try:
+            from scanning.result_processor.cluster import get_clustered_findings
+            _ordered_findings = get_clustered_findings(findings)
+        except Exception:
+            _ordered_findings = findings
+
+        _rendered_cluster_ids: set = set()
+        _finding_num = 0
+
+        for finding in _ordered_findings:
+            _cl = ((finding.get("metadata") or {}).get("cluster") or {})
+            _cid = _cl.get("cluster_id", "")
+            _csize = _cl.get("cluster_size", 1)
+            _is_rep = _cl.get("is_representative", True)
+
+            # Skip sub-findings — they are rendered inside the representative's <details>
+            if _csize > 1 and not _is_rep:
+                continue
+
+            _finding_num += 1
             severity = finding.get("severity", "INFO").lower()
-            vuln_type = finding.get("type", finding.get("name", "Unknown"))
+            vuln_type = finding.get("vuln_type", finding.get("type", finding.get("name", "Unknown")))
             title = finding.get("title", finding.get("name", vuln_type))
-            url = finding.get("url", finding.get("matched_at", "N/A"))
+            url = finding.get("endpoint", finding.get("url", finding.get("matched_at", "N/A")))
             description = finding.get("description", "No description available.")
             parameter = finding.get("parameter", "")
             payload = finding.get("payload", "")
             evidence = finding.get("evidence", "")
-            confidence = finding.get("confidence", finding.get("validation_confidence", 0))
+            confidence = finding.get("confidence_score", finding.get("confidence", finding.get("validation_confidence", 0)))
             module = finding.get("module", "")
 
             # Build evidence section
@@ -2108,12 +2346,10 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
                 evidence_html += f'<div class="finding-detail">🎯 <strong>Parameter:</strong> <code>{parameter}</code></div>'
 
             if payload:
-                # Escape HTML in payload
                 safe_payload = str(payload).replace("<", "&lt;").replace(">", "&gt;")
                 evidence_html += f'<div class="finding-detail">💉 <strong>Payload:</strong> <code>{safe_payload[:200]}</code></div>'
 
             if evidence:
-                # Handle evidence as string or list
                 if isinstance(evidence, list):
                     evidence_str = "; ".join(str(e)[:100] for e in evidence[:3])
                 else:
@@ -2122,21 +2358,69 @@ def _generate_phantom_html_report(data: Dict[str, Any], path: Path) -> None:
                 evidence_html += f'<div class="finding-detail">🔍 <strong>Evidence:</strong> {safe_evidence}</div>'
 
             if confidence:
-                conf_percent = confidence if isinstance(confidence, (int, float)) and confidence <= 1 else confidence / 100
+                if isinstance(confidence, str):
+                    _word_conf = {"very high": 0.95, "high": 0.85, "medium": 0.65, "moderate": 0.65, "low": 0.45, "very low": 0.25}
+                    conf_percent = _word_conf.get(confidence.lower(), 0.5)
+                elif isinstance(confidence, (int, float)):
+                    conf_percent = confidence if confidence <= 1 else confidence / 100
+                else:
+                    conf_percent = 0.5
                 conf_color = "#27ae60" if conf_percent >= 0.75 else "#f1c40f" if conf_percent >= 0.5 else "#e74c3c"
                 evidence_html += f'<div class="finding-detail">📊 <strong>Confidence:</strong> <span style="color: {conf_color}">{conf_percent:.0%}</span></div>'
 
             if module:
                 evidence_html += f'<div class="finding-detail">🔧 <strong>Module:</strong> {module}</div>'
 
+            # Proof gate badge
+            _pg = finding.get("metadata", {}).get("proof_gate", {}) if isinstance(finding.get("metadata"), dict) else {}
+            _pg_level = _pg.get("level", "") if _pg else ""
+            gate_badge = ""
+            if _pg_level == "exploited":
+                gate_badge = '<span class="proof-badge proven">PROVEN</span>'
+            elif _pg_level == "verified":
+                gate_badge = '<span class="proof-badge verified">VERIFIED</span>'
+            elif _pg_level == "detected":
+                gate_badge = '<span class="proof-badge detected">DETECTED</span>'
+
+            # Cluster badge
+            cluster_badge = ""
+            if _csize > 1:
+                cluster_badge = f'<span class="cluster-badge">{_csize} findings</span>'
+
+            # Build sub-findings HTML for multi-member clusters
+            sub_html = ""
+            if _csize > 1 and _cid not in _rendered_cluster_ids:
+                _rendered_cluster_ids.add(_cid)
+                sub_findings = [
+                    sf for sf in _ordered_findings
+                    if ((sf.get("metadata") or {}).get("cluster") or {}).get("cluster_id") == _cid
+                    and not ((sf.get("metadata") or {}).get("cluster") or {}).get("is_representative")
+                ]
+                if sub_findings:
+                    sub_items = ""
+                    for sf in sub_findings:
+                        sf_title = sf.get("title", sf.get("name", sf.get("type", "Unknown")))
+                        sf_sev = sf.get("severity", "INFO").upper()
+                        sf_ep = sf.get("endpoint", sf.get("matched_at", ""))
+                        sf_desc = sf.get("description", "")[:150]
+                        safe_sf_desc = str(sf_desc).replace("<", "&lt;").replace(">", "&gt;")
+                        sub_items += f'<div class="sub-finding"><strong>{sf_title}</strong> ({sf_sev})'
+                        if sf_ep:
+                            sub_items += f' — <code>{sf_ep}</code>'
+                        if safe_sf_desc:
+                            sub_items += f'<br>{safe_sf_desc}'
+                        sub_items += '</div>'
+                    sub_html = f'<details><summary>Related findings ({len(sub_findings)} more)</summary>{sub_items}</details>'
+
             html += f"""
             <div class="finding {severity}">
                 <div class="finding-header">
-                    <h3>{i}. {title}</h3>
-                    <span class="severity-tag {severity}">{severity.upper()}</span>
+                    <h3>{_finding_num}. {title}</h3>
+                    <span class="severity-tag {severity}">{severity.upper()}</span>{gate_badge}{cluster_badge}
                 </div>
                 <p>{description}</p>
                 {evidence_html}
+                {sub_html}
             </div>
 """
         html += "        </div>\n"
@@ -2261,13 +2545,13 @@ def _generate_phantom_md_report(data: Dict[str, Any], path: Path) -> None:
         severity = finding.get("severity", "INFO")
         vuln_type = finding.get("type", finding.get("name", "Unknown"))
         title = finding.get("title", finding.get("name", vuln_type))
-        url = finding.get("url", finding.get("matched_at", "N/A"))
+        url = finding.get("endpoint", finding.get("url", finding.get("matched_at", "N/A")))
         description = finding.get("description", "No description available.")
-        cwe = finding.get("cwe", "N/A")
+        cwe = finding.get("cwe_id", finding.get("cwe", "N/A"))
         parameter = finding.get("parameter", "")
         payload = finding.get("payload", "")
         evidence = finding.get("evidence", "")
-        confidence = finding.get("confidence", finding.get("validation_confidence", 0))
+        confidence = finding.get("confidence_score", finding.get("confidence", finding.get("validation_confidence", 0)))
         module = finding.get("module", "")
 
         md += f"""### {i}. [{severity}] {title}
@@ -2371,7 +2655,7 @@ def _generate_phantom_md_report(data: Dict[str, Any], path: Path) -> None:
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
 @click.option("--format", "-f", "output_format",
               type=click.Choice(["html", "json", "md"]),
-              default="html", help="Report format")
+              default="json", help="Report format (default: JSON)")
 @click.pass_context
 def quick(ctx: click.Context, target: str, output: Optional[str], output_format: str):
     """
@@ -2429,24 +2713,32 @@ def quick(ctx: click.Context, target: str, output: Optional[str], output_format:
 @cli.command()
 @click.argument("target")
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
-@click.option("--format", "-f", "output_format",
-              type=click.Choice(["pdf", "html", "json", "md", "sarif"]),
-              default="html", help="Report format")
 @click.option("--safe-mode", "-s",
               type=click.Choice(["passive", "safe", "cautious", "standard", "aggressive"]),
               default="safe", help="Safety level")
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Enable deterministic mode for reproducible scans (THEME-8)")
+@click.option("--totp-secret", type=str, default=None,
+              help="TOTP secret (base32) for automatic 2FA handling")
+@click.option("--allow-manual-auth", is_flag=True, default=False,
+              help="Allow manual browser intervention for CAPTCHA/2FA challenges")
 @click.pass_context
-def full(ctx: click.Context, target: str, output: Optional[str], output_format: str, safe_mode: str):
+def full(ctx: click.Context, target: str, output: Optional[str], safe_mode: str, deterministic: bool,
+         totp_secret: Optional[str], allow_manual_auth: bool):
     """
     Comprehensive PHANTOM AI scan (all 75+ modules).
 
     Full security assessment with all available modules, 6-stage validation,
     vulnerability chaining, and enterprise reporting.
 
+    Automatically generates: JSON state + Markdown reports + PDF reports
+
     \b
     Examples:
         phantom full https://example.com
-        phantom full https://api.target.com -s cautious -f sarif
+        phantom full https://api.target.com -s cautious
+        phantom full https://2fa-app.com --totp-secret BASE32SECRET
+        phantom full https://captcha-site.com --allow-manual-auth
     """
     if not ctx.obj.get("no_banner"):
         print_banner()
@@ -2460,15 +2752,48 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
         "  • 6-stage validation pipeline\n"
         "  • Vulnerability chaining\n"
         "  • AI-powered verification\n"
-        "  • Compliance mapping",
+        "  • Compliance mapping\n\n"
+        "[cyan]Auto-generates: JSON + MD + PDF reports[/cyan]",
         title="Full Scan",
         border_style="green",
     ))
 
-    safe_asyncio_run(_run_phantom_scan(
+    # THEME-8: Enable deterministic mode if requested
+    if deterministic:
+        from scanning.determinism import enable_deterministic_mode
+        enable_deterministic_mode()
+
+    # GAP-5: Advanced auth options (TOTP, manual auth)
+    import os
+    if totp_secret:
+        os.environ["PHANTOM_TOTP_SECRET"] = totp_secret
+        console.print("[cyan]🔐 TOTP secret configured — automatic 2FA handling enabled[/cyan]")
+
+    if allow_manual_auth:
+        os.environ["PHANTOM_ALLOW_MANUAL_AUTH"] = "1"
+        console.print("[cyan]🖥️ Manual auth enabled — browser will open for CAPTCHA/2FA challenges[/cyan]")
+        console.print("[cyan]🎯 Deterministic mode enabled — scans will be reproducible[/cyan]")
+
+    safe_asyncio_run(_run_full_scan(
         target=target,
         output_dir=output,
-        output_format=output_format,
+        safe_mode=safe_mode,
+        verbose=ctx.obj.get("verbose", False),
+    ))
+
+
+async def _run_full_scan(
+    target: str,
+    output_dir: Optional[str],
+    safe_mode: str,
+    verbose: bool,
+) -> None:
+    """Execute full scan with automatic report generation."""
+    # Run the main scan
+    await _run_phantom_scan(
+        target=target,
+        output_dir=output_dir,
+        output_format="json",
         modules=None,
         safe_mode=safe_mode,
         rate=2.0,
@@ -2483,8 +2808,12 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
         no_auth=False,
         timeout=None,
         scan_mode=ScanMode.FULL if PHANTOM_AVAILABLE else "full",
-        verbose=ctx.obj.get("verbose", False),
-    ))
+        verbose=verbose,
+    )
+
+    # Auto-generate HackerOne reports (MD + JSON + PDF)
+    if HACKERONE_REPORTER_AVAILABLE:
+        await _generate_hackerone_reports(target, output_dir)
 
 
 # =============================================================================
@@ -2494,9 +2823,6 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
 @cli.command()
 @click.argument("target")
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
-@click.option("--format", "-f", "output_format",
-              type=click.Choice(["html", "json", "md"]),
-              default="html", help="Report format")
 @click.option("--platform",
               type=click.Choice(["hackerone", "bugcrowd", "intigriti", "other"]),
               default="other", help="Bug bounty platform")
@@ -2511,11 +2837,29 @@ def full(ctx: click.Context, target: str, output: Optional[str], output_format: 
 @click.option("--modules", "-m", help="Modules to run (comma-separated, e.g., 'cors' or 'cors,headers')")
 @click.option("--hackerone-report/--no-hackerone-report", default=True,
               help="Generate HackerOne-quality reports for findings")
+@click.option("--scope", multiple=True, required=True,
+              help="In-scope domains (REQUIRED for bounty mode, e.g., --scope '*.example.com' --scope 'api.example.com')")
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Enable deterministic mode for reproducible scans (THEME-8)")
+@click.option("--totp-secret", type=str, default=None,
+              help="TOTP secret (base32) for automatic 2FA handling")
+@click.option("--allow-manual-auth", is_flag=True, default=False,
+              help="Allow manual browser intervention for CAPTCHA/2FA challenges")
+@click.option("--output-format", "-f",
+              type=click.Choice(["hackerone", "sarif", "all"]),
+              default="hackerone",
+              help="Output report format: hackerone (default), sarif (DevSecOps), or all")
+@click.option("--accept-terms", is_flag=True, default=False,
+              help="Accept legal disclaimer non-interactively (for CI/CD and testing)")
+@click.option("--no-auth", is_flag=True, default=False,
+              help="Skip target authorization check")
 @click.pass_context
-def bounty(ctx: click.Context, target: str, output: Optional[str], output_format: str,
+def bounty(ctx: click.Context, target: str, output: Optional[str],
            platform: str, program_tier: str, rate: float, estimate: bool,
            header: tuple, username: Optional[str], program: Optional[str],
-           modules: Optional[str], hackerone_report: bool):
+           modules: Optional[str], hackerone_report: bool, scope: tuple,
+           deterministic: bool, totp_secret: Optional[str], allow_manual_auth: bool,
+           output_format: str, accept_terms: bool, no_auth: bool):
     """
     Bug bounty optimized PHANTOM AI scan.
 
@@ -2540,6 +2884,87 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
     """
     if not ctx.obj.get("no_banner"):
         print_banner()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PROFESSIONAL ETHICS: Legal disclaimer and authorization check
+    # "Pentesting profissional NÃO é atacar à vontade"
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ETHICS-09: Username is REQUIRED for professional bug bounty hunting
+    if not username and not accept_terms:
+        console.print(Panel(
+            "[bold red]⛔ USERNAME REQUIRED FOR BOUNTY MODE[/bold red]\n\n"
+            "Professional bug bounty hunting requires identification.\n"
+            "Bug bounty programs need to identify researchers.\n\n"
+            "[yellow]Add your username with: --username YOUR_USERNAME[/yellow]\n"
+            "[dim]Example: phantom bounty https://target.com -u your_hackerone_username[/dim]\n"
+            "[dim]For local testing: --accept-terms (skips this check)[/dim]",
+            title="Missing Identification",
+            border_style="red",
+        ))
+        return
+
+    if not username:
+        username = "local-tester"
+
+    # ETHICS-01/02: Legal disclaimer and authorization check
+    program_name = program or platform or "Bug Bounty Program"
+    if not check_authorization(
+        program_name=f"{program_name} ({platform.upper()})",
+        targets=[target],
+        mode="safe",
+        rate_limit=rate,
+        skip_disclaimer=accept_terms,
+    ):
+        console.print("[red]❌ Authorization not confirmed. Scan aborted.[/red]")
+        console.print("[dim]This is required for professional and legal bug bounty hunting.[/dim]")
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ETHICS-05/07: Scope validation - MANDATORY for bug bounty
+    # "Professional pentesting stays within defined scope"
+    # ═══════════════════════════════════════════════════════════════════════════
+    scope_list = list(scope)
+    from utils.legal_disclaimer import verify_scope_programmatically
+
+    # Validate target is within declared scope
+    in_scope, reason = verify_scope_programmatically(scope_list, target)
+    if not in_scope:
+        console.print(Panel(
+            f"[bold red]⛔ TARGET NOT IN DECLARED SCOPE[/bold red]\n\n"
+            f"Target: {target}\n"
+            f"Declared Scope: {', '.join(scope_list)}\n"
+            f"Reason: {reason}\n\n"
+            "[yellow]Bug bounty programs require testing ONLY within defined scope.[/yellow]\n"
+            "[yellow]Out-of-scope testing can result in legal action.[/yellow]\n\n"
+            "[dim]If this target IS in scope, add it: --scope 'target.com' or --scope '*.target.com'[/dim]",
+            title="Scope Violation",
+            border_style="red",
+        ))
+        return
+
+    console.print(f"[green]✓ Target verified in scope: {reason}[/green]")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ETHICS-10: Initialize Audit Logger for comprehensive audit trail
+    # ═══════════════════════════════════════════════════════════════════════════
+    audit = init_audit_logger(
+        engagement_id=f"BOUNTY-{datetime.now().strftime('%Y%m%d')}-{platform.upper()}",
+        operator=username or "unknown",
+    )
+    audit.log_authorization(
+        target=target,
+        accepted=True,
+        scope=scope_list,
+        mode="safe",
+        rate_limit=rate,
+    )
+    audit.log_scope_confirmed(
+        targets=[target],
+        scope=scope_list,
+        program_name=program or platform or "Bug Bounty Program",
+    )
+    console.print(f"[dim]📝 Audit log: {audit.log_file}[/dim]")
 
     console.print(Panel(
         "[bold yellow]💰 BOUNTY HUNTING MODE[/bold yellow]\n\n"
@@ -2601,10 +3026,25 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
         border_style="green",
     ))
 
+    # THEME-8: Enable deterministic mode if requested
+    if deterministic:
+        from scanning.determinism import enable_deterministic_mode
+        enable_deterministic_mode()
+        console.print("[cyan]🎯 Deterministic mode enabled — scans will be reproducible[/cyan]")
+
+    # GAP-5: Advanced auth options (TOTP, manual auth)
+    import os
+    if totp_secret:
+        os.environ["PHANTOM_TOTP_SECRET"] = totp_secret
+        console.print("[cyan]🔐 TOTP secret configured — automatic 2FA handling enabled[/cyan]")
+
+    if allow_manual_auth:
+        os.environ["PHANTOM_ALLOW_MANUAL_AUTH"] = "1"
+        console.print("[cyan]🖥️ Manual auth enabled — browser will open for CAPTCHA/2FA challenges[/cyan]")
+
     safe_asyncio_run(_run_bounty_scan(
         target=target,
         output_dir=output,
-        output_format=output_format,
         platform=platform,
         program_tier=program_tier,
         rate=rate,
@@ -2614,13 +3054,15 @@ def bounty(ctx: click.Context, target: str, output: Optional[str], output_format
         modules_override=modules,
         hackerone_report=hackerone_report,
         program=program,
+        scope=scope_list,
+        output_format=output_format,
+        no_auth=no_auth,
     ))
 
 
 async def _run_bounty_scan(
     target: str,
     output_dir: Optional[str],
-    output_format: str,
     platform: str,
     program_tier: str,
     rate: float,
@@ -2630,56 +3072,215 @@ async def _run_bounty_scan(
     modules_override: Optional[str] = None,
     hackerone_report: bool = True,
     program: Optional[str] = None,
+    scope: Optional[List[str]] = None,
+    output_format: str = "hackerone",
+    no_auth: bool = False,
 ) -> None:
     """Execute bounty-optimized scan."""
 
     # Use override modules if provided, otherwise default bounty set
     scan_modules = modules_override or "sqli,xss,dom_xss,idor,auth,api,ssrf,xxe,csrf,cors"
 
-    # Run the main scan with bounty-specific settings
+    # Track scan timing for SARIF report
+    scan_start_time = datetime.now()
+
+    # Run the main scan with bounty-specific settings (JSON always generated)
+    # Bounty mode uses "cautious" — sends detection payloads but never modifies data.
+    # "safe" would block all injection scanners (sqli, xss, ssrf, etc.)
     await _run_phantom_scan(
         target=target,
         output_dir=output_dir,
-        output_format=output_format,
+        output_format="json",
         modules=scan_modules,
-        safe_mode="safe",
+        safe_mode="cautious",
         rate=rate,
         concurrent=2,
-        scope=[],
+        scope=scope or [],
         exclude=[],
         preset=None,
         no_recon=False,
         no_tools=True,
         no_chain=False,
         no_ai=False,
-        no_auth=False,
+        no_auth=no_auth,
         custom_headers=custom_headers,
         timeout=None,
         scan_mode=ScanMode.BOUNTY if PHANTOM_AVAILABLE else "bounty",
         verbose=verbose,
     )
 
+    scan_end_time = datetime.now()
+
     # Show bounty estimates if enabled
     if estimate and PHANTOM_AVAILABLE:
-        console.print("\n[bold yellow]💰 Bounty Estimation:[/bold yellow]")
-
-        # create_program_config expects strings, not enums
-        # It converts internally: BountyPlatform(platform.lower()), ProgramTier[tier.upper()]
-        config = create_program_config(
-            name=get_domain(target),
-            platform=platform,  # string: "hackerone", "bugcrowd", etc.
-            tier=program_tier,  # string: "standard", "premium", etc.
+        await _display_bounty_estimates(
+            target=target,
+            platform=platform,
+            program_tier=program_tier,
         )
 
-        estimator = BountyEstimator(config)
+    # Generate reports based on output_format option
+    # HackerOne reports (default for bounty mode)
+    if output_format in ("hackerone", "all"):
+        if hackerone_report and HACKERONE_REPORTER_AVAILABLE:
+            await _generate_hackerone_reports(target, output_dir, custom_headers=custom_headers, program=program)
 
-        console.print(f"   Platform: {platform.upper()}")
-        console.print(f"   Program Tier: {program_tier}")
-        console.print(f"   Typical Ranges: See full report for estimates")
+    # SARIF report for DevSecOps integration
+    if output_format in ("sarif", "all"):
+        await _generate_sarif_report(
+            target=target,
+            output_dir=output_dir,
+            scan_start_time=scan_start_time,
+            scan_end_time=scan_end_time,
+        )
 
-    # Generate HackerOne-quality reports for findings
-    if hackerone_report and HACKERONE_REPORTER_AVAILABLE:
-        await _generate_hackerone_reports(target, output_dir, custom_headers=custom_headers, program=program)
+
+async def _display_bounty_estimates(
+    target: str,
+    platform: str,
+    program_tier: str,
+) -> None:
+    """
+    Display bounty estimates for scan findings using BountyEstimator.
+
+    Reads findings from the most recent scan state file and calculates
+    estimated bounty ranges based on platform, tier, and vulnerability type.
+    """
+    from rich.table import Table
+
+    console.print("\n[bold yellow]===============================================================================[/bold yellow]")
+    console.print("[bold yellow]                        BOUNTY ESTIMATION REPORT[/bold yellow]")
+    console.print("[bold yellow]===============================================================================[/bold yellow]\n")
+
+    # Get the most recent scan for this target
+    scans_dir = get_scans_dir()
+    domain = get_domain(target)
+
+    # Find relevant scan state
+    scan_files = sorted(scans_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    scan_state = None
+
+    for scan_file in scan_files:
+        try:
+            with open(scan_file) as f:
+                state = json.load(f)
+                if state.get("domain") == domain or domain in str(state.get("target", "")):
+                    scan_state = state
+                    break
+        except Exception as e:
+            logger.debug(f"Error reading scan file {scan_file}: {e}")
+            continue
+
+    if not scan_state:
+        console.print("[yellow]No scan state found for target. Run scan first.[/yellow]")
+        return
+
+    findings = scan_state.get("validated_findings", scan_state.get("findings", []))
+
+    if not findings:
+        console.print("[yellow]No findings to estimate bounties for.[/yellow]")
+        return
+
+    # Create program config and estimator
+    config = create_program_config(
+        name=domain,
+        platform=platform,
+        tier=program_tier,
+    )
+    estimator = BountyEstimator(config)
+
+    # Display program info
+    console.print(f"[cyan]Platform:[/cyan]     {platform.upper()}")
+    console.print(f"[cyan]Program Tier:[/cyan] {program_tier.upper()}")
+    console.print(f"[cyan]Target:[/cyan]       {domain}")
+    console.print(f"[cyan]Findings:[/cyan]     {len(findings)}\n")
+
+    # Create table for estimates
+    table = Table(title="Bounty Estimates by Finding", show_header=True, header_style="bold cyan")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Severity", width=10)
+    table.add_column("Vulnerability Type", width=30)
+    table.add_column("Est. Range (USD)", justify="right", width=18)
+    table.add_column("Expected", justify="right", width=12)
+    table.add_column("Confidence", justify="right", width=10)
+
+    # Process each finding
+    estimates = []
+    for i, finding in enumerate(findings, 1):
+        vuln_type = _get_type(finding)
+        severity = _get_severity(finding)
+
+        # Get finding ID (handle various formats)
+        finding_id = ""
+        if isinstance(finding, dict):
+            if "finding" in finding and isinstance(finding["finding"], dict):
+                finding_id = finding["finding"].get("id", f"finding-{i}")
+            else:
+                finding_id = finding.get("id", f"finding-{i}")
+        elif hasattr(finding, "id"):
+            finding_id = finding.id
+        else:
+            finding_id = f"finding-{i}"
+
+        # Estimate bounty
+        estimate = estimator.estimate(
+            vulnerability_id=finding_id,
+            vulnerability_type=vuln_type.lower().replace(" ", "_"),
+            severity=severity.lower(),
+        )
+        estimates.append(estimate)
+
+        # Color code severity
+        severity_colors = {
+            "CRITICAL": "bold red",
+            "HIGH": "red",
+            "MEDIUM": "yellow",
+            "LOW": "green",
+            "INFO": "dim",
+        }
+        sev_style = severity_colors.get(severity.upper(), "white")
+
+        # Add row to table
+        table.add_row(
+            str(i),
+            f"[{sev_style}]{severity.upper()}[/{sev_style}]",
+            vuln_type[:30] if len(vuln_type) > 30 else vuln_type,
+            estimate.formatted_range,
+            estimate.formatted_expected,
+            f"{estimate.confidence:.0%}",
+        )
+
+    console.print(table)
+
+    # Get and display totals
+    totals = estimator.get_total_estimate()
+
+    console.print("\n[bold yellow]-------------------------------------------------------------------------------[/bold yellow]")
+    console.print("[bold yellow]                              TOTAL ESTIMATES[/bold yellow]")
+    console.print("[bold yellow]-------------------------------------------------------------------------------[/bold yellow]\n")
+
+    # Create summary table
+    summary_table = Table(show_header=False, box=None)
+    summary_table.add_column("Label", style="cyan", width=25)
+    summary_table.add_column("Value", style="bold white", width=30)
+
+    summary_table.add_row("Total Findings:", str(totals["finding_count"]))
+    summary_table.add_row("Estimated Range:", totals["formatted_range"])
+    summary_table.add_row("Expected Value:", totals["formatted_expected"])
+
+    console.print(summary_table)
+
+    # Severity distribution
+    if totals.get("severity_distribution"):
+        console.print("\n[cyan]Severity Distribution:[/cyan]")
+        for sev, count in totals["severity_distribution"].items():
+            console.print(f"   {sev.upper()}: {count} finding(s)")
+
+    # Display modifiers info
+    console.print("\n[dim]Note: Estimates are based on historical platform data and may vary.[/dim]")
+    console.print("[dim]Actual payouts depend on program specifics, report quality, and impact.[/dim]")
+
+    console.print("\n[bold yellow]===============================================================================[/bold yellow]\n")
 
 
 async def _generate_hackerone_reports(
@@ -2708,7 +3309,8 @@ async def _generate_hackerone_reports(
                 if state.get("domain") == domain or domain in str(state.get("target", "")):
                     scan_state = state
                     break
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error reading scan file {scan_file}: {e}")
             continue
 
     if not scan_state:
@@ -2721,14 +3323,18 @@ async def _generate_hackerone_reports(
         console.print("[yellow]⚠️ No findings to report[/yellow]")
         return
 
-    # Filter for reportable findings (MEDIUM severity and above)
+    # Filter for reportable findings (MEDIUM severity and above + confidence threshold)
+    # FIX 2026-03-02: Also check confidence meets severity-specific threshold.
+    # Without this, CSRF conf=60 with severity=HIGH bypasses the 70% threshold.
+    _SEVERITY_CONF_THRESHOLDS = {"CRITICAL": 0.80, "HIGH": 0.70, "MEDIUM": 0.65, "LOW": 0.60, "INFO": 0.50}
     reportable = [
         f for f in findings
-        if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+        if _get_severity(f) in ("CRITICAL", "HIGH", "MEDIUM")
+        and _get_confidence(f) >= _SEVERITY_CONF_THRESHOLDS.get(_get_severity(f), 0.70)
     ]
 
     if not reportable:
-        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity)[/yellow]")
+        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity with sufficient confidence)[/yellow]")
         return
 
     console.print(f"   Found {len(reportable)} reportable findings")
@@ -2752,8 +3358,8 @@ async def _generate_hackerone_reports(
             # Generate the report
             report = generator.generate_report(raw_finding)
 
-            # Save in multiple formats
-            saved_files = generator.save_report(report, formats=["md", "json", "html"])
+            # Save in all formats (md, json, html, pdf)
+            saved_files = generator.save_report(report, formats=["md", "json", "html", "pdf"])
 
             generated_reports.append({
                 "title": report.title,
@@ -2770,17 +3376,30 @@ async def _generate_hackerone_reports(
     # Summary
     if generated_reports:
         output_path = generator.output_dir
+
+        # Generate coverage summary (explains testing thoroughness)
+        try:
+            coverage_path = generator.generate_coverage_summary(scan_state, domain)
+            console.print(f"   [cyan]📊 Coverage summary:[/cyan] {coverage_path}")
+        except Exception as e:
+            logger.debug(f"Coverage summary generation failed: {e}")
+
         console.print(Panel(
             f"[bold green]✅ Generated {len(generated_reports)} HackerOne Reports[/bold green]\n\n"
             f"Output Directory: {output_path}\n\n"
             "[cyan]Each report includes:[/cyan]\n"
             "  • Markdown report (hackerone_report.md)\n"
+            "  • PDF report (hackerone_report.pdf)\n"
             "  • JSON data (report_data.json)\n"
             "  • HTML PoC (if applicable)\n"
             "  • Reproducible curl commands\n"
             "  • CWE/CVSS classification\n"
             "  • Impact assessment\n"
-            "  • Remediation guidance",
+            "  • Remediation guidance\n\n"
+            "[yellow]📊 SCAN_COVERAGE_SUMMARY.md[/yellow] explains:\n"
+            "  • What was tested vs skipped\n"
+            "  • Why areas were skipped (rate limit, auth, WAF)\n"
+            "  • Confidence of absence for vuln types",
             title="📋 HackerOne Reports Generated",
             border_style="green",
         ))
@@ -2807,7 +3426,7 @@ async def _generate_hackerone_reports(
                 scan_metadata={
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "safety_mode": scan_state.get("safety_mode", "safe"),
-                    "modules_run": len(scan_state.get("modules_executed", [])),
+                    "modules_run": len(scan_state.get("modules_run", [])),
                     "duration_seconds": scan_state.get("duration_seconds", 0),
                     "operator": (custom_headers or {}).get("X-Bug-Bounty", "phantom-ai"),
                 },
@@ -2817,6 +3436,164 @@ async def _generate_hackerone_reports(
             console.print(f"\n   [cyan]📋 Handoff session:[/cyan] {saved_handoff.get('md', '')}")
         except Exception as e:
             console.print(f"\n   [yellow]⚠️ Handoff generation skipped: {e}[/yellow]")
+
+
+async def _generate_sarif_report(
+    target: str,
+    output_dir: Optional[str] = None,
+    scan_start_time: Optional[datetime] = None,
+    scan_end_time: Optional[datetime] = None,
+) -> Optional[str]:
+    """
+    Generate SARIF 2.1.0 report for DevSecOps integration.
+
+    SARIF (Static Analysis Results Interchange Format) is the standard format
+    for GitHub Code Scanning, Azure DevOps, and other CI/CD security tools.
+
+    Args:
+        target: Target URL that was scanned
+        output_dir: Optional output directory
+        scan_start_time: When the scan started
+        scan_end_time: When the scan ended
+
+    Returns:
+        Path to generated SARIF file, or None if generation failed
+    """
+    from pathlib import Path
+
+    console.print("\n[bold cyan]📄 Generating SARIF Report (DevSecOps Integration)...[/bold cyan]")
+
+    # Check if SARIF generator is available
+    if not PHANTOM_AVAILABLE:
+        console.print("[yellow]⚠️ SARIF Generator not available (PHANTOM not loaded)[/yellow]")
+        return None
+
+    # Load scan state (same pattern as other report generators)
+    scans_dir = get_scans_dir()
+    domain = get_domain(target)
+
+    scan_files = sorted(scans_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    scan_state = None
+
+    for scan_file in scan_files:
+        try:
+            with open(scan_file) as f:
+                state = json.load(f)
+                if state.get("domain") == domain or domain in str(state.get("target", "")):
+                    scan_state = state
+                    break
+        except Exception as e:
+            logger.debug(f"Error reading scan file {scan_file}: {e}")
+            continue
+
+    if not scan_state:
+        console.print("[yellow]⚠️ No scan state found for target[/yellow]")
+        return None
+
+    findings = scan_state.get("validated_findings", scan_state.get("findings", []))
+
+    if not findings:
+        console.print("[yellow]⚠️ No findings to include in SARIF report[/yellow]")
+        return None
+
+    console.print(f"   Found {len(findings)} findings to export")
+
+    # Create SARIF generator
+    try:
+        sarif_gen = SARIFGenerator()
+
+        # Set invocation metadata
+        sarif_gen.set_invocation(
+            start_time=scan_start_time or datetime.now(),
+            end_time=scan_end_time or datetime.now(),
+            working_directory=str(Path.cwd()),
+            command_line=f"phantom scan {target}",
+            execution_successful=True,
+            target_url=target,
+            scan_id=scan_state.get("scan_id", "unknown"),
+        )
+
+        # Add each finding to SARIF
+        for finding in findings:
+            # Unwrap serialized ValidatedFinding if needed
+            raw_finding = finding
+            if isinstance(finding, dict) and "finding" in finding and isinstance(finding["finding"], dict):
+                raw_finding = finding["finding"]
+
+            # Extract finding details
+            vuln_type = raw_finding.get("type", raw_finding.get("vulnerability_type", "unknown"))
+            url = raw_finding.get("url", raw_finding.get("matched_at", target))
+            message = raw_finding.get("description", raw_finding.get("message", f"{vuln_type} vulnerability detected"))
+            severity = _get_severity(raw_finding).lower()
+            parameter = raw_finding.get("parameter", raw_finding.get("param"))
+            evidence = raw_finding.get("evidence", raw_finding.get("proof"))
+            request = raw_finding.get("request")
+            response = raw_finding.get("response")
+            confidence = raw_finding.get("confidence")
+            vuln_id = raw_finding.get("id", raw_finding.get("finding_id"))
+
+            # Convert confidence to float if it's a percentage
+            if isinstance(confidence, (int, float)) and confidence > 1:
+                confidence = confidence / 100.0
+
+            sarif_gen.add_finding(
+                vulnerability_type=vuln_type,
+                url=url,
+                message=message,
+                severity=severity,
+                parameter=parameter,
+                evidence=evidence,
+                request=request,
+                response=response,
+                vulnerability_id=vuln_id,
+                confidence=confidence,
+                method=raw_finding.get("method", "GET"),
+            )
+
+        # Determine output path
+        if output_dir:
+            out_path = Path(output_dir)
+        else:
+            out_path = Path("evidence") / domain.replace(".", "_")
+
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sarif_file = out_path / f"{domain.replace('.', '_')}_{timestamp}_sarif.json"
+
+        # Save SARIF report
+        sarif_gen.save(sarif_file, pretty=True)
+
+        # Get statistics for display
+        stats = sarif_gen.get_statistics()
+
+        console.print(Panel(
+            f"[bold green]✅ SARIF Report Generated[/bold green]\n\n"
+            f"Output: {sarif_file}\n\n"
+            "[cyan]SARIF Statistics:[/cyan]\n"
+            f"  • Total findings: {stats['total_results']}\n"
+            f"  • Unique rules: {stats['total_rules']}\n"
+            f"  • Artifacts: {stats['total_artifacts']}\n\n"
+            "[cyan]Severity Distribution:[/cyan]\n"
+            f"  • Error (CRITICAL/HIGH): {stats['severity_distribution']['error']}\n"
+            f"  • Warning (MEDIUM): {stats['severity_distribution']['warning']}\n"
+            f"  • Note (LOW/INFO): {stats['severity_distribution']['note']}\n\n"
+            "[cyan]DevSecOps Integration:[/cyan]\n"
+            "  • GitHub Code Scanning: Upload via Security tab\n"
+            "  • Azure DevOps: Use SARIF upload task\n"
+            "  • GitLab: Use SAST report format\n"
+            "  • CI/CD: Integrate with security gates",
+            title="📊 SARIF 2.1.0 Report",
+            border_style="green",
+        ))
+
+        return str(sarif_file)
+
+    except Exception as e:
+        console.print(f"[red]✗ SARIF report generation failed: {e}[/red]")
+        logger.exception("SARIF generation error")
+        return None
 
 
 # =============================================================================
@@ -2873,7 +3650,7 @@ def hackerone_report_cmd(ctx: click.Context, scan_id: str, output: Optional[str]
         # Filter for MEDIUM+ severity
         findings = [
             f for f in findings
-            if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+            if _get_severity(f) in ("CRITICAL", "HIGH", "MEDIUM")
         ]
 
     if not findings:
@@ -2968,7 +3745,8 @@ def handoff(ctx, scan_id, output, operator):
                 if state.get("scan_id") == scan_id or scan_id in str(scan_file):
                     scan_state = state
                     break
-        except Exception:
+        except (json.JSONDecodeError, OSError) as e:
+            logging.debug(f"Failed to load scan state from {scan_file}: {e}")
             continue
 
     if not scan_state:
@@ -3007,7 +3785,7 @@ def handoff(ctx, scan_id, output, operator):
         scan_metadata={
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "safety_mode": scan_state.get("safety_mode", "safe"),
-            "modules_run": len(scan_state.get("modules_executed", [])),
+            "modules_run": len(scan_state.get("modules_run", [])),
             "duration_seconds": scan_state.get("duration_seconds", 0),
             "operator": operator or "phantom-ai",
         },
@@ -3036,24 +3814,61 @@ def handoff(ctx, scan_id, output, operator):
 @cli.command()
 @click.argument("target")
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
-@click.option("--format", "-f", "output_format",
-              type=click.Choice(["pdf", "html", "json", "md"]),
-              default="html", help="Report format")
 @click.option("--client-name", help="Client organization name")
 @click.option("--engagement-id", help="Engagement identifier")
 @click.option("--safe-mode", "-s",
               type=click.Choice(["safe", "cautious", "standard", "aggressive"]),
-              default="standard", help="Safety level")
+              default="cautious", help="Safety level (default: cautious for client safety)")
 @click.option("--rate", "-r", type=float, default=10.0, help="Requests per second")
 @click.option("--concurrent", "-c", type=int, default=5, help="Concurrent modules")
-@click.option("--subdomains/--no-subdomains", default=True, help="Subdomain enumeration")
+@click.option("--subdomains/--no-subdomains", default=False, help="Subdomain enumeration (default: OFF, requires explicit --subdomains)")
 @click.option("--compliance", multiple=True,
               type=click.Choice(["pci-dss", "hipaa", "gdpr", "nist", "owasp", "all"]),
               help="Compliance frameworks to map")
+@click.option("--scope", multiple=True,
+              help="In-scope domains (e.g., --scope '*.example.com' --scope 'api.example.com')")
+@click.option("--scope-file", type=click.Path(exists=True),
+              help="JSON file with scope definition (engagement letter format)")
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Enable deterministic mode for reproducible scans (THEME-8)")
+# P0 Professional Safety Options
+@click.option("--roe-file", type=click.Path(exists=True),
+              help="[P0.1] Rules of Engagement JSON file (required for aggressive mode)")
+@click.option("--proof-policy",
+              type=click.Choice(["read_only", "schema_only", "sample_redacted", "full_extraction"]),
+              default="sample_redacted",
+              help="[P0.2] Evidence extraction policy (default: sample_redacted)")
+@click.option("--redaction-level",
+              type=click.Choice(["none", "minimal", "standard", "strict", "paranoid"]),
+              default="strict",
+              help="[P0.7] Report redaction level (default: strict for clients)")
+@click.option("--environment",
+              type=click.Choice(["staging", "production", "local"]),
+              default=None,
+              help="[P0] Target environment (auto-detected if not specified)")
+@click.option("--backup-verified", is_flag=True, default=False,
+              help="[P0.8] Confirm client has verified backup exists")
+@click.option("--maintenance-window", is_flag=True, default=False,
+              help="[P0.8] Confirm scan is during maintenance window")
+@click.option("--emergency-contact",
+              help="[P0.8] Emergency contact for this engagement")
+@click.option("--output-format", "-f",
+              type=click.Choice(["client", "sarif", "all"]),
+              default="client",
+              help="Output report format: client (default), sarif (DevSecOps), or all")
+@click.option("--accept-terms", is_flag=True, default=False,
+              help="Accept legal disclaimer non-interactively (for CI/CD and testing)")
+@click.option("--no-auth", is_flag=True, default=False,
+              help="Skip target authorization check")
 @click.pass_context
-def client(ctx: click.Context, target: str, output: Optional[str], output_format: str,
+def client(ctx: click.Context, target: str, output: Optional[str],
            client_name: Optional[str], engagement_id: Optional[str], safe_mode: str,
-           rate: float, concurrent: int, subdomains: bool, compliance: tuple):
+           rate: float, concurrent: int, subdomains: bool, compliance: tuple,
+           scope: tuple, scope_file: Optional[str], deterministic: bool,
+           roe_file: Optional[str], proof_policy: str, redaction_level: str,
+           environment: Optional[str], backup_verified: bool, maintenance_window: bool,
+           emergency_contact: Optional[str], output_format: str,
+           accept_terms: bool, no_auth: bool):
     """
     Professional client engagement with PHANTOM AI.
 
@@ -3068,12 +3883,146 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
     if not ctx.obj.get("no_banner"):
         print_banner()
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PROFESSIONAL ETHICS: Client authorization and engagement verification
+    # "Pentesting profissional requer autorização escrita"
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ETHICS-03: Client name required for professional engagements
+    if not client_name:
+        console.print(Panel(
+            "[bold yellow]⚠️ CLIENT NAME RECOMMENDED[/bold yellow]\n\n"
+            "Professional pentesting should identify the client.\n"
+            "This is important for:\n"
+            "  • Legal audit trail\n"
+            "  • Report documentation\n"
+            "  • Engagement tracking\n\n"
+            "[dim]Add client name with: --client-name \"Client Organization\"[/dim]",
+            title="Client Identification",
+            border_style="yellow",
+        ))
+        client_name = "Unnamed Client"  # Default for audit purposes
+
+    # Auto-generate engagement ID if not provided
+    if not engagement_id:
+        engagement_id = f"PHANTOM-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+        console.print(f"[dim]Auto-generated engagement ID: {engagement_id}[/dim]")
+
+    # ETHICS-03: Legal disclaimer and authorization check for client work
+    if not check_authorization(
+        program_name=f"Client Engagement: {client_name}",
+        targets=[target],
+        mode=safe_mode,
+        rate_limit=rate,
+        skip_disclaimer=accept_terms,
+    ):
+        console.print("[red]❌ Authorization not confirmed. Engagement aborted.[/red]")
+        console.print("[dim]Professional pentesting requires explicit client authorization.[/dim]")
+        console.print("[dim]Use --accept-terms to skip interactive prompts.[/dim]")
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ETHICS-06/07: Scope validation for client engagements
+    # "Professional pentesting requires scope defined in engagement letter"
+    # ═══════════════════════════════════════════════════════════════════════════
+    scope_list: List[str] = list(scope) if scope else []
+
+    # Load scope from file if provided
+    if scope_file:
+        try:
+            import json
+            with open(scope_file, "r") as f:
+                scope_data = json.load(f)
+
+            # Support multiple scope file formats
+            if isinstance(scope_data, list):
+                # Simple list of domains
+                scope_list.extend(scope_data)
+            elif isinstance(scope_data, dict):
+                # Engagement letter format: {"allowed_domains": [...], "excluded_domains": [...]}
+                if "allowed_domains" in scope_data:
+                    scope_list.extend(scope_data["allowed_domains"])
+                if "scope" in scope_data:
+                    scope_list.extend(scope_data["scope"])
+                if "targets" in scope_data:
+                    scope_list.extend(scope_data["targets"])
+
+            console.print(f"[green]✓ Loaded scope from: {scope_file}[/green]")
+            console.print(f"[dim]  Allowed domains: {', '.join(scope_list)}[/dim]")
+        except Exception as e:
+            console.print(Panel(
+                f"[bold red]⛔ SCOPE FILE ERROR[/bold red]\n\n"
+                f"Failed to load scope file: {scope_file}\n"
+                f"Error: {e}\n\n"
+                "[yellow]Scope file should be JSON format:[/yellow]\n"
+                "[dim]Simple: [\"*.example.com\", \"api.example.com\"][/dim]\n"
+                "[dim]Or engagement letter: {\"allowed_domains\": [...]}[/dim]",
+                title="Scope File Error",
+                border_style="red",
+            ))
+            return
+
+    # Validate target against scope if scope is defined
+    if scope_list:
+        from utils.legal_disclaimer import verify_scope_programmatically
+
+        in_scope, reason = verify_scope_programmatically(scope_list, target)
+        if not in_scope:
+            console.print(Panel(
+                f"[bold red]⛔ TARGET NOT IN ENGAGEMENT SCOPE[/bold red]\n\n"
+                f"Target: {target}\n"
+                f"Engagement Scope: {', '.join(scope_list)}\n"
+                f"Reason: {reason}\n\n"
+                "[yellow]Client engagements MUST stay within defined scope.[/yellow]\n"
+                "[yellow]Out-of-scope testing violates your engagement agreement.[/yellow]\n\n"
+                "[dim]Update your scope file or add: --scope 'domain.com'[/dim]",
+                title="Scope Violation",
+                border_style="red",
+            ))
+            return
+
+        console.print(f"[green]✓ Target verified in engagement scope: {reason}[/green]")
+    else:
+        # No scope defined - warn but allow (client may have verbal authorization)
+        console.print(Panel(
+            "[bold yellow]⚠️ NO SCOPE DEFINED[/bold yellow]\n\n"
+            "Professional client engagements should define scope.\n"
+            "Consider adding:\n"
+            "  • --scope '*.client.com' (command line)\n"
+            "  • --scope-file engagement_scope.json (file)\n\n"
+            "[dim]Proceeding without scope validation...[/dim]",
+            title="Scope Warning",
+            border_style="yellow",
+        ))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ETHICS-10: Initialize Audit Logger for professional engagement audit trail
+    # ═══════════════════════════════════════════════════════════════════════════
+    audit = init_audit_logger(
+        engagement_id=engagement_id,
+        operator=client_name or "unknown-client",
+    )
+    audit.log_authorization(
+        target=target,
+        accepted=True,
+        scope=scope_list,
+        mode=safe_mode,
+        rate_limit=rate,
+    )
+    if scope_list:
+        audit.log_scope_confirmed(
+            targets=[target],
+            scope=scope_list,
+            program_name=f"Client Engagement: {client_name}",
+        )
+    console.print(f"[dim]📝 Audit log: {audit.log_file}[/dim]")
+
     compliance_list = list(compliance) if compliance else []
 
     console.print(Panel(
         f"[bold green]🔒 PROFESSIONAL CLIENT ENGAGEMENT[/bold green]\n\n"
-        f"Client: {client_name or 'Not specified'}\n"
-        f"Engagement ID: {engagement_id or 'Not specified'}\n"
+        f"Client: {client_name}\n"
+        f"Engagement ID: {engagement_id}\n"
         f"Target: {target}\n"
         f"Mode: {safe_mode.upper()}\n"
         f"Rate: {rate} req/sec\n"
@@ -3083,22 +4032,130 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
         border_style="green",
     ))
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CLIENT MODE SAFETY: Block aggressive unless explicitly authorized
+    # Professional pentest = prove impact without causing damage
+    # ═══════════════════════════════════════════════════════════════════════════
     if safe_mode == "aggressive":
+        if os.environ.get("PHANTOM_ALLOW_AGGRESSIVE", "").lower() not in ("1", "true", "yes", "authorized"):
+            console.print(Panel(
+                "[bold red]⛔ AGGRESSIVE MODE BLOCKED (CLIENT ENGAGEMENT)[/bold red]\n\n"
+                "Client engagements require extra care:\n"
+                "  • Professional pentesting = prove impact WITHOUT causing damage\n"
+                "  • 'Se consegues provar que PODES fazer algo, não precisas fazê-lo'\n\n"
+                "Aggressive mode requires explicit authorization:\n"
+                "[yellow]export PHANTOM_ALLOW_AGGRESSIVE=authorized[/yellow]\n\n"
+                "[green]Falling back to 'standard' mode (recommended for client work).[/green]",
+                title="Client Safety Protection",
+                border_style="red",
+            ))
+            safe_mode = "standard"
+            os.environ["PHANTOM_SAFE_MODE"] = safe_mode
+        else:
+            # Authorized aggressive mode - show extra warning
+            console.print(Panel(
+                "[bold red]⚠️ AGGRESSIVE MODE WARNING[/bold red]\n\n"
+                "This mode will attempt exploitation techniques that may:\n"
+                "  • Modify data in the application\n"
+                "  • Trigger alerts and WAF blocks\n"
+                "  • Cause service disruption\n\n"
+                "[yellow]Ensure you have written authorization from the client![/yellow]\n"
+                "[yellow]All actions will be logged for audit purposes.[/yellow]",
+                title="Warning",
+                border_style="red",
+            ))
+
+    # THEME-8: Enable deterministic mode if requested
+    if deterministic:
+        from scanning.determinism import enable_deterministic_mode
+        enable_deterministic_mode()
+        console.print("[cyan]🎯 Deterministic mode enabled — scans will be reproducible[/cyan]")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # P0 FIX: Build professional safety configuration
+    # ═══════════════════════════════════════════════════════════════════════════
+    safety_config = None
+    try:
+        from scanning.scan_safety_config import (
+            ScanSafetyConfig, Environment, RoEInfo, detect_environment
+        )
+
+        # Determine environment
+        if environment:
+            env = Environment(environment)
+        else:
+            env = detect_environment(target)
+            if env == Environment.UNKNOWN:
+                # For client engagements, assume production unless stated otherwise
+                console.print(
+                    "[yellow]⚠️ Environment not specified. Assuming PRODUCTION for safety.[/yellow]"
+                )
+                env = Environment.PRODUCTION
+
+        # Load RoE if provided
+        roe = RoEInfo()
+        if roe_file:
+            roe = RoEInfo.from_file(roe_file)
+            if roe.is_valid():
+                console.print(f"[green]✓ RoE loaded and valid: {roe_file}[/green]")
+            else:
+                console.print(f"[red]⚠️ RoE invalid or expired: {roe.status.value}[/red]")
+
+        # Build safety config
+        emergency_contacts = [emergency_contact] if emergency_contact else []
+        safety_config = ScanSafetyConfig(
+            environment=env,
+            safety_level=safe_mode,
+            roe=roe,
+            proof_policy=proof_policy,
+            redact_evidence=True,
+            redaction_level=redaction_level,
+            backup_verified=backup_verified,
+            maintenance_window=maintenance_window,
+            emergency_contacts=emergency_contacts,
+            enable_audit_log=True,
+        )
+
+        # Validate configuration
+        is_valid, errors = safety_config.validate_for_scan()
+        if not is_valid:
+            for err in errors:
+                console.print(f"[red]❌ Safety validation error: {err}[/red]")
+
+            # For production + aggressive, require valid RoE
+            if env == Environment.PRODUCTION and safe_mode == "aggressive":
+                console.print(Panel(
+                    "[bold red]⛔ AGGRESSIVE MODE BLOCKED[/bold red]\n\n"
+                    "Aggressive testing in production requires:\n"
+                    "  • Valid RoE file (--roe-file path/to/roe.json)\n"
+                    "  • Backup verification (--backup-verified)\n"
+                    "  • Emergency contacts (--emergency-contact)\n\n"
+                    "[dim]Create RoE template: phantom roe-template --output roe.json[/dim]",
+                    title="Safety Block",
+                    border_style="red",
+                ))
+                return
+
         console.print(Panel(
-            "[bold red]⚠️ AGGRESSIVE MODE WARNING[/bold red]\n\n"
-            "This mode will attempt exploitation techniques that may:\n"
-            "  • Modify data in the application\n"
-            "  • Trigger alerts and WAF blocks\n"
-            "  • Cause service disruption\n\n"
-            "[yellow]Ensure you have written authorization from the client![/yellow]",
-            title="Warning",
-            border_style="red",
+            f"[bold green]✓ P0 Safety Configuration[/bold green]\n\n"
+            f"  Environment: {env.value.upper()}\n"
+            f"  Safety Level: {safe_mode}\n"
+            f"  Proof Policy: {proof_policy}\n"
+            f"  Redaction: {redaction_level}\n"
+            f"  RoE Status: {roe.status.value}\n"
+            f"  Audit Logging: ENABLED",
+            title="Professional Safety",
+            border_style="green",
         ))
+
+    except ImportError as e:
+        console.print(f"[yellow]⚠️ P0 safety modules not available: {e}[/yellow]")
+        console.print("[dim]Continuing with basic safety controls...[/dim]")
+    # ═══════════════════════════════════════════════════════════════════════════
 
     safe_asyncio_run(_run_client_scan(
         target=target,
         output_dir=output,
-        output_format=output_format,
         safe_mode=safe_mode,
         rate=rate,
         concurrent=concurrent,
@@ -3107,13 +4164,16 @@ def client(ctx: click.Context, target: str, output: Optional[str], output_format
         client_name=client_name,
         engagement_id=engagement_id,
         compliance_frameworks=compliance_list,
+        scope=scope_list,
+        safety_config=safety_config,
+        output_format=output_format,
+        no_auth=no_auth,
     ))
 
 
 async def _run_client_scan(
     target: str,
     output_dir: Optional[str],
-    output_format: str,
     safe_mode: str,
     rate: float,
     concurrent: int,
@@ -3122,39 +4182,72 @@ async def _run_client_scan(
     client_name: Optional[str] = None,
     engagement_id: Optional[str] = None,
     compliance_frameworks: Optional[List[str]] = None,
+    scope: Optional[List[str]] = None,
+    safety_config: Optional["ScanSafetyConfig"] = None,
+    output_format: str = "client",
+    no_auth: bool = False,
 ) -> None:
     """Execute client engagement scan with professional report generation."""
 
+    # Track scan timing for SARIF report
+    scan_start_time = datetime.now()
+
     # Run the main scan
+    # NOTE: include_subdomains controls actual subdomain enumeration
+    # no_recon controls reconnaissance phase (crawling, etc.)
     await _run_phantom_scan(
         target=target,
         output_dir=output_dir,
-        output_format=output_format,
+        output_format="json",  # JSON always generated
         modules=None,
         safe_mode=safe_mode,
         rate=rate,
         concurrent=concurrent,
-        scope=[],
+        scope=scope or [],
         exclude=[],
         preset=None,
-        no_recon=not subdomains,
+        no_recon=False,  # Always do reconnaissance for client engagements
         no_tools=False,
         no_chain=False,
         no_ai=False,
-        no_auth=False,
+        no_auth=no_auth,
         timeout=None,
         scan_mode=ScanMode.CLIENT if PHANTOM_AVAILABLE else "client",
         verbose=verbose,
+        include_subdomains=subdomains,  # CRITICAL: Pass the flag to actually enumerate subdomains
+        compliance=compliance_frameworks,  # FIX CLI-03: Pass compliance frameworks
+        client_name=client_name,  # FIX CLI-02: Store in scan state
+        engagement_id=engagement_id,  # FIX CLI-02: Store in scan state
+        safety_config=safety_config,  # P0 FIX: Pass professional safety configuration
     )
 
-    # Generate professional client reports
-    await _generate_client_reports(
-        target=target,
-        output_dir=output_dir,
-        client_name=client_name,
-        engagement_id=engagement_id,
-        compliance_frameworks=compliance_frameworks or [],
-    )
+    scan_end_time = datetime.now()
+
+    # Generate reports based on output_format option
+    # Client reports (default for client mode)
+    if output_format in ("client", "all"):
+        # Generate professional client reports (always MD + JSON + PDF)
+        # P0 FIX: Pass redaction level from safety config
+        redaction_level = "standard"
+        if safety_config:
+            redaction_level = safety_config.redaction_level
+        await _generate_client_reports(
+            target=target,
+            output_dir=output_dir,
+            client_name=client_name,
+            engagement_id=engagement_id,
+            compliance_frameworks=compliance_frameworks or [],
+            redaction_level=redaction_level,
+        )
+
+    # SARIF report for DevSecOps integration
+    if output_format in ("sarif", "all"):
+        await _generate_sarif_report(
+            target=target,
+            output_dir=output_dir,
+            scan_start_time=scan_start_time,
+            scan_end_time=scan_end_time,
+        )
 
 
 async def _generate_client_reports(
@@ -3163,6 +4256,7 @@ async def _generate_client_reports(
     client_name: Optional[str] = None,
     engagement_id: Optional[str] = None,
     compliance_frameworks: Optional[List[str]] = None,
+    redaction_level: str = "standard",
 ) -> None:
     """Generate professional client assessment reports for scan findings."""
     from pathlib import Path
@@ -3183,7 +4277,8 @@ async def _generate_client_reports(
                 if state.get("domain") == domain or domain in str(state.get("target", "")):
                     scan_state = state
                     break
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error reading scan file {scan_file}: {e}")
             continue
 
     if not scan_state:
@@ -3196,14 +4291,17 @@ async def _generate_client_reports(
         console.print("[yellow]⚠️ No findings to report[/yellow]")
         return
 
-    # Filter for reportable findings (MEDIUM+ severity)
+    # Filter for reportable findings (MEDIUM+ severity + confidence threshold)
+    # FIX 2026-03-02: Also check confidence meets severity-specific threshold.
+    _SEVERITY_CONF_THRESHOLDS_CLIENT = {"CRITICAL": 0.80, "HIGH": 0.70, "MEDIUM": 0.65, "LOW": 0.60, "INFO": 0.50}
     reportable = [
         f for f in findings
-        if _get_severity(f).upper() in ("CRITICAL", "HIGH", "MEDIUM")
+        if _get_severity(f) in ("CRITICAL", "HIGH", "MEDIUM")
+        and _get_confidence(f) >= _SEVERITY_CONF_THRESHOLDS_CLIENT.get(_get_severity(f), 0.70)
     ]
 
     if not reportable:
-        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity)[/yellow]")
+        console.print("[yellow]⚠️ No reportable findings (MEDIUM+ severity with sufficient confidence)[/yellow]")
         return
 
     console.print(f"   Found {len(reportable)} reportable findings")
@@ -3219,6 +4317,7 @@ async def _generate_client_reports(
             client_name=client_name or "Client",
             engagement_id=engagement_id or "",
             compliance_frameworks=compliance_frameworks or [],
+            redaction_level=redaction_level,  # P0 FIX: Apply PII redaction
         )
 
         report = generator.generate(
@@ -3227,13 +4326,15 @@ async def _generate_client_reports(
                 "target": target,
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "safety_mode": scan_state.get("safety_mode", "standard"),
-                "modules_run": len(scan_state.get("modules_executed", [])),
+                "modules_run": len(scan_state.get("modules_run", [])),
                 "duration_seconds": scan_state.get("duration_seconds", 0),
                 "scan_id": scan_state.get("scan_id", "unknown"),
             },
         )
 
-        saved = generator.save(report)
+        # Always generate all formats: MD + JSON + PDF
+        formats = ["md", "json", "pdf"]
+        saved = generator.save(report, formats=formats)
 
         # Per-finding report summary
         for fr in report.finding_reports:
@@ -3241,17 +4342,23 @@ async def _generate_client_reports(
             title = fr.get("title", "Unknown")
             console.print(f"   [green]✓[/green] [{sev}] {title}")
 
+        # Build deliverables list
+        deliverables = [
+            f"  • CLIENT_REPORT.md — {saved.get('md', '')}",
+            f"  • CLIENT_REPORT.pdf — {saved.get('pdf', 'N/A')}",
+            f"  • client_report_data.json — {saved.get('json', '')}",
+            f"  • executive_summary.md — {saved.get('executive_summary', '')}",
+            f"  • compliance_annex.md — {saved.get('compliance_annex', 'N/A')}",
+            "  • Per-finding reports with PoC files",
+        ]
+
         console.print(Panel(
             f"[bold green]✅ Client Assessment Report Generated[/bold green]\n\n"
             f"Client: {report.client_name}\n"
             f"Engagement: {report.engagement_id}\n"
             f"Findings: {len(report.finding_reports)}\n"
             f"Output: {out_path}\n\n"
-            "[cyan]Deliverables:[/cyan]\n"
-            f"  • CLIENT_REPORT.md — {saved.get('md', '')}\n"
-            f"  • executive_summary.md — {saved.get('executive_summary', '')}\n"
-            f"  • compliance_annex.md — {saved.get('compliance_annex', 'N/A')}\n"
-            "  • Per-finding reports with PoC files\n",
+            "[cyan]Deliverables:[/cyan]\n" + "\n".join(deliverables),
             title="📋 Client Report Ready",
             border_style="green",
         ))
@@ -3286,7 +4393,7 @@ async def _generate_client_reports(
             scan_metadata={
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "safety_mode": scan_state.get("safety_mode", "standard"),
-                "modules_run": len(scan_state.get("modules_executed", [])),
+                "modules_run": len(scan_state.get("modules_run", [])),
                 "duration_seconds": scan_state.get("duration_seconds", 0),
                 "operator": client_name or "phantom-ai",
             },
@@ -3657,7 +4764,8 @@ def status(ctx: click.Context, scan_id: Optional[str]):
                     f"[{status_color}]{state.get('status', '?')}[/{status_color}]",
                     str(len(state.get("findings", []))),
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error reading scan file {scan_file}: {e}")
                 continue
 
         console.print(table)
@@ -3710,7 +4818,8 @@ def list_scans(ctx: click.Context, limit: int):
                 str(len(state.get("findings", []))),
                 state.get("start_time", "?")[:10],
             )
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error reading scan file {scan_file}: {e}")
             continue
 
     console.print(table)
@@ -3755,7 +4864,7 @@ def resume(ctx: click.Context, scan_id: str):
     safe_asyncio_run(_run_phantom_scan(
         target=state.get("target"),
         output_dir=None,
-        output_format="html",
+        output_format="json",
         modules=config.get("modules"),
         safe_mode=config.get("safe_mode", "safe"),
         rate=config.get("rate", 2.0),
@@ -4096,7 +5205,7 @@ async def _analyze_chains(
 @click.option("--output", "-o", type=click.Path(), help="Output file path")
 @click.option("--format", "-f", "output_format",
               type=click.Choice(["pdf", "html", "json", "md", "sarif"]),
-              default="html", help="Report format")
+              default="json", help="Report format (default: JSON)")
 @click.option("--compliance", multiple=True,
               type=click.Choice(["pci-dss", "hipaa", "gdpr", "nist", "owasp", "all"]),
               help="Include compliance mapping")
@@ -4555,7 +5664,8 @@ def presets(ctx: click.Context, list_presets: bool, show: Optional[str], create:
                     f"{preset.get('rate_limit', 1.0)} req/s",
                     str(len(preset.get("modules", []))),
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error reading preset file {preset_file}: {e}")
                 continue
 
         console.print(table)
@@ -5110,6 +6220,270 @@ def gdpr_report(ctx: click.Context, output: Optional[str]):
 
     except ImportError:
         console.print("[red]❌ GDPR module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+# =============================================================================
+# LEARNING COMMANDS - Incident-Based Learning
+# =============================================================================
+
+@cli.group()
+@click.pass_context
+def learn(ctx: click.Context):
+    """
+    Incident-based learning commands.
+
+    Record real-world outcomes to improve detection accuracy.
+    The system learns from:
+    - Bug bounty report outcomes (paid/rejected)
+    - Real security incidents
+    - Attack chain success rates
+
+    \b
+    Commands:
+        bounty    Record a bug bounty report outcome
+        incident  Record a real-world security incident
+        stats     Show learning statistics
+        seed      Seed known attack patterns
+
+    \b
+    Examples:
+        phantom learn bounty --program hackerone-meta --type xss --outcome paid --payout 500
+        phantom learn stats
+    """
+    pass
+
+
+@learn.command("bounty")
+@click.option("--program", "-p", required=True, help="Bug bounty program name")
+@click.option("--type", "-t", "vuln_type", required=True, help="Vulnerability type (e.g., xss, sqli)")
+@click.option("--severity", "-s", type=click.Choice(["critical", "high", "medium", "low"]),
+              default="medium", help="Vulnerability severity")
+@click.option("--outcome", "-o", type=click.Choice(["paid", "duplicate", "informative", "rejected", "pending"]),
+              required=True, help="Report outcome")
+@click.option("--payout", type=float, default=0.0, help="Payout amount in USD")
+@click.option("--chain", help="Attack chain type if applicable")
+@click.option("--module", help="PHANTOM module that found this")
+@click.option("--reason", help="Rejection reason if rejected")
+@click.pass_context
+def learn_bounty(ctx: click.Context, program: str, vuln_type: str, severity: str,
+                 outcome: str, payout: float, chain: str, module: str, reason: str):
+    """
+    Record a bug bounty report outcome.
+
+    Helps PHANTOM learn which findings produce real value.
+
+    \b
+    Examples:
+        phantom learn bounty -p hackerone-meta -t xss -s high -o paid --payout 1000
+        phantom learn bounty -p bugcrowd-uber -t idor -o rejected --reason "out of scope"
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    try:
+        from scanning.incident_learning import record_bounty, BountyOutcome
+
+        outcome_map = {
+            "paid": BountyOutcome.PAID,
+            "duplicate": BountyOutcome.DUPLICATE,
+            "informative": BountyOutcome.INFORMATIVE,
+            "rejected": BountyOutcome.REJECTED,
+            "pending": BountyOutcome.PENDING,
+        }
+
+        report_id = record_bounty(
+            program=program,
+            vuln_type=vuln_type,
+            severity=severity,
+            outcome=outcome_map[outcome],
+            payout=payout,
+            attack_chain=chain or "",
+            module_name=module or "",
+            rejection_reason=reason or "",
+        )
+
+        if outcome == "paid":
+            console.print(f"\n[green]💰 Recorded bounty: ${payout:.0f} for {vuln_type}[/green]")
+        elif outcome == "rejected":
+            console.print(f"\n[red]❌ Recorded rejection: {vuln_type} ({reason or 'no reason'})[/red]")
+        else:
+            console.print(f"\n[yellow]📝 Recorded outcome: {outcome} for {vuln_type}[/yellow]")
+
+        console.print(f"   Report ID: {report_id}")
+        console.print(f"   Program: {program}")
+
+        console.print("\n[dim]This outcome will be used to improve chain probability scoring.[/dim]")
+
+    except ImportError:
+        console.print("[red]❌ Incident learning module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@learn.command("incident")
+@click.option("--type", "-t", "vuln_types", multiple=True, required=True,
+              help="Vulnerability type(s) involved")
+@click.option("--chain", "-c", required=True, help="Attack chain type (e.g., sqli_to_data, xss_to_ato)")
+@click.option("--impact", "-i", required=True, help="Impact type (data_theft, ato, rce, etc.)")
+@click.option("--description", "-d", required=True, help="Brief incident description")
+@click.option("--records", type=int, default=0, help="Number of records affected")
+@click.option("--financial", type=float, default=0.0, help="Financial impact in USD")
+@click.option("--industry", help="Target industry")
+@click.option("--cve", multiple=True, help="Related CVE IDs")
+@click.pass_context
+def learn_incident(ctx: click.Context, vuln_types: tuple, chain: str, impact: str,
+                   description: str, records: int, financial: float, industry: str, cve: tuple):
+    """
+    Record a real-world security incident.
+
+    Helps PHANTOM learn which attack chains actually happen.
+
+    \b
+    Examples:
+        phantom learn incident -t sqli -c sqli_to_data -i data_theft \\
+            -d "Customer database breach" --records 1000000
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    try:
+        from scanning.incident_learning import record_real_incident, IncidentSource
+
+        incident_id = record_real_incident(
+            vuln_types=list(vuln_types),
+            chain=chain,
+            impact=impact,
+            description=description,
+            source=IncidentSource.MANUAL,
+            records_affected=records,
+            financial_impact=financial,
+            target_industry=industry or "",
+            cve_ids=list(cve),
+        )
+
+        console.print(f"\n[red]🚨 Recorded incident: {chain}[/red]")
+        console.print(f"   Incident ID: {incident_id}")
+        console.print(f"   Vuln types: {', '.join(vuln_types)}")
+        console.print(f"   Impact: {impact}")
+
+        if records:
+            console.print(f"   Records affected: {records:,}")
+        if financial:
+            console.print(f"   Financial impact: ${financial:,.0f}")
+
+        console.print("\n[dim]This incident will be used to improve attack chain analysis.[/dim]")
+
+    except ImportError:
+        console.print("[red]❌ Incident learning module not available[/red]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@learn.command("stats")
+@click.pass_context
+def learn_stats(ctx: click.Context):
+    """
+    Show learning statistics.
+
+    Displays collected incidents, bounties, and learned patterns.
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    console.print("\n[bold cyan]📊 Incident Learning Statistics[/bold cyan]\n")
+
+    try:
+        from scanning.incident_learning import get_incident_engine
+
+        engine = get_incident_engine()
+        summary = engine.get_summary()
+
+        # Overview
+        console.print("[bold]Overview:[/bold]")
+        console.print(f"   Total incidents recorded: {summary['total_incidents']}")
+        console.print(f"   Total bounty reports: {summary['total_bounties']}")
+        console.print(f"   Last recompute: {summary['last_recompute']}")
+
+        # Bounty stats
+        if summary.get("bounty_stats", {}).get("total_reports", 0) > 0:
+            bs = summary["bounty_stats"]
+            console.print(f"\n[bold]Bounty Statistics:[/bold]")
+            console.print(f"   Total payout: ${bs.get('total_payout', 0):,.0f}")
+            console.print(f"   Avg payout: ${bs.get('avg_payout', 0):,.0f}")
+            console.print(f"   Paid: {bs.get('paid', 0)} | Rejected: {bs.get('rejected', 0)}")
+
+        # Top chains
+        if summary.get("top_chains"):
+            console.print(f"\n[bold]Top Attack Chains by Probability:[/bold]")
+
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("Chain", style="cyan")
+            table.add_column("Probability", justify="right")
+            table.add_column("Confidence", justify="right")
+
+            for chain in summary["top_chains"]:
+                prob = chain["probability"]
+                conf = chain["confidence"]
+
+                prob_style = "green" if prob > 0.7 else ("yellow" if prob > 0.4 else "red")
+                conf_style = "green" if conf > 0.6 else "dim"
+
+                table.add_row(
+                    chain["chain"],
+                    f"[{prob_style}]{prob:.0%}[/{prob_style}]",
+                    f"[{conf_style}]{conf:.0%}[/{conf_style}]"
+                )
+
+            console.print(table)
+
+        console.print("\n[dim]Use 'phantom learn bounty' and 'phantom learn incident' to record more data.[/dim]")
+
+    except ImportError:
+        console.print("[red]❌ Incident learning module not available[/red]")
+        console.print("[dim]Create scanning/incident_learning.py to enable this feature.[/dim]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+
+
+@learn.command("seed")
+@click.option("--confirm", is_flag=True, help="Confirm seeding known patterns")
+@click.pass_context
+def learn_seed(ctx: click.Context, confirm: bool):
+    """
+    Seed known attack patterns from real-world incidents.
+
+    Bootstraps the learning engine with known attack chains
+    from major breaches (Equifax, Capital One, etc.).
+    """
+    if not ctx.obj.get("no_banner"):
+        print_banner()
+
+    if not confirm:
+        console.print("\n[yellow]This will seed the learning engine with known attack patterns.[/yellow]")
+        console.print("Use --confirm to proceed.\n")
+
+        console.print("[bold]Known patterns to seed:[/bold]")
+        console.print("   • SQLi → Data Theft (Equifax, Sony, Ashley Madison)")
+        console.print("   • XSS → ATO (Twitter, eBay, Steam)")
+        console.print("   • SSRF → Internal Access (Capital One, Shopify)")
+        console.print("   • IDOR → Data Breach (Facebook, Parler, Bumble)")
+        console.print("   • Business Logic → Fraud (Uber, gift card abuse)")
+        return
+
+    try:
+        from scanning.incident_learning import seed_known_patterns
+
+        console.print("\n[cyan]🌱 Seeding known attack patterns...[/cyan]")
+
+        seed_known_patterns()
+
+        console.print("\n[green]✅ Successfully seeded known patterns[/green]")
+        console.print("[dim]Chain probabilities will now reflect real-world incident data.[/dim]")
+
+    except ImportError:
+        console.print("[red]❌ Incident learning module not available[/red]")
     except Exception as e:
         console.print(f"[red]❌ Error: {e}[/red]")
 

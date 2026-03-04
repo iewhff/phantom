@@ -99,6 +99,25 @@ from .scope_guard import (
     create_scope_from_url,
     is_safe_target,
 )
+from .confidence import (
+    normalize_confidence,
+    confidence_to_string,
+    is_high_confidence,
+    is_reportable_confidence,
+    compare_confidence,
+    max_confidence,
+    min_confidence,
+    average_confidence,
+    CONFIDENCE_SCALE,
+)
+from .scan_client import (
+    get_scan_client,
+    create_scan_client,
+    get_scan_client_kwargs,
+    reset_scan_session,
+    get_circuit_breaker,
+    ScanClient,
+)
 
 __all__ = [
     "get_logger",
@@ -194,4 +213,21 @@ __all__ = [
     "ScopeViolationError",
     "create_scope_from_url",
     "is_safe_target",
+    # Confidence Normalization
+    "normalize_confidence",
+    "confidence_to_string",
+    "is_high_confidence",
+    "is_reportable_confidence",
+    "compare_confidence",
+    "max_confidence",
+    "min_confidence",
+    "average_confidence",
+    "CONFIDENCE_SCALE",
+    # Unified HTTP Client (ScanClient)
+    "get_scan_client",
+    "create_scan_client",
+    "get_scan_client_kwargs",
+    "reset_scan_session",
+    "get_circuit_breaker",
+    "ScanClient",
 ]

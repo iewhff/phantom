@@ -20,15 +20,12 @@ Version: 2.0.0
 from __future__ import annotations
 
 import os
-import sys
 import random
 import asyncio
-import hashlib
 import time
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any, Callable, List
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from enum import Enum
 
@@ -37,12 +34,8 @@ import httpx
 from utils.logger import get_logger
 from utils.network_protection import (
     NetworkProtection,
-    ProxyConfig,
     ProxyType,
     TorController,
-    USER_AGENTS,
-    ACCEPT_HEADERS,
-    ACCEPT_LANGUAGE,
 )
 
 logger = get_logger(__name__)

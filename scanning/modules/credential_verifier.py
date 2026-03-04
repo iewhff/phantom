@@ -13,12 +13,10 @@ Reference: HackerOne Platform Standards §9 - Leaked Credentials (Exemplary Stan
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -311,7 +309,7 @@ class CredentialVerifier:
                         status=CredentialStatus.VALID,
                         verification_method="stripe_balance_api",
                         access_level="service" if is_live else "test",
-                        severity="critical" if is_live else "medium",
+                        severity="CRITICAL" if is_live else "MEDIUM",
                         notes=[
                             "Authentication successful via Stripe Balance API",
                             "NO transactions or actions performed",
@@ -383,8 +381,11 @@ class CredentialVerifier:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    access_level = "admin" if data.get("site_admin") else "user"
+                    if isinstance(asset_data, dict):
+                        access_level = "admin" if data.get("site_admin") else "user"
                     
+                    owner_note = f"Token owner: {data.get('login', 'unknown')}" if isinstance(data, dict) else "Token owner: unknown"
+
                     return CredentialVerificationResult(
                         credential_type="github_token",
                         credential_masked=self._mask_credential(credential),
@@ -393,13 +394,14 @@ class CredentialVerifier:
                         status=CredentialStatus.VALID,
                         verification_method="github_user_api",
                         access_level=access_level,
-                        severity="critical" if access_level == "admin" else "high",
+                        severity="CRITICAL" if access_level == "admin" else "HIGH",
                         notes=[
                             "Authentication successful via GitHub User API",
                             "NO repositories or data accessed",
-                            f"Token owner: {data.get('login', 'unknown')}",
+                            owner_note,
                         ],
                     )
+
                 elif response.status_code == 401:
                     return CredentialVerificationResult(
                         credential_type="github_token",
@@ -458,8 +460,16 @@ class CredentialVerifier:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    access_level = "admin" if data.get("is_admin") else "user"
+                    if isinstance(asset_data, dict):
+                        access_level = "admin" if data.get("is_admin") else "user"
                     
+                    notes = [
+                        "Authentication successful via GitLab User API"
+                    ]
+
+                    if isinstance(asset_data, dict):
+                        notes.append(f"Token owner: {data.get('username', 'unknown')}")
+
                     return CredentialVerificationResult(
                         credential_type="gitlab_token",
                         credential_masked=self._mask_credential(credential),
@@ -468,12 +478,10 @@ class CredentialVerifier:
                         status=CredentialStatus.VALID,
                         verification_method="gitlab_user_api",
                         access_level=access_level,
-                        severity="critical" if access_level == "admin" else "high",
-                        notes=[
-                            "Authentication successful via GitLab User API",
-                            f"Token owner: {data.get('username', 'unknown')}",
-                        ],
+                        severity="CRITICAL" if access_level == "admin" else "HIGH",
+                        notes=notes,
                     )
+
                 elif response.status_code == 401:
                     return CredentialVerificationResult(
                         credential_type="gitlab_token",
@@ -521,7 +529,11 @@ class CredentialVerifier:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    if data.get("ok"):
+
+                    if isinstance(data, dict) and data.get("ok"):
+                        notes = ["Authentication successful via Slack Auth Test"]
+                        notes.append(f"Workspace: {data.get('team', 'unknown')}")
+
                         return CredentialVerificationResult(
                             credential_type="slack_token",
                             credential_masked=self._mask_credential(credential),
@@ -530,13 +542,12 @@ class CredentialVerifier:
                             status=CredentialStatus.VALID,
                             verification_method="slack_auth_test",
                             access_level="service",
-                            severity="high",
-                            notes=[
-                                "Authentication successful via Slack Auth Test",
-                                f"Workspace: {data.get('team', 'unknown')}",
-                            ],
+                            severity="HIGH",
+                            notes=notes,
                         )
-                    else:
+                    
+                    elif isinstance(asset_data, dict):
+                        notes = [f"Auth failed: {data.get('error', 'unknown')}"]
                         return CredentialVerificationResult(
                             credential_type="slack_token",
                             credential_masked=self._mask_credential(credential),
@@ -544,7 +555,17 @@ class CredentialVerifier:
                             source_url=source_url,
                             status=CredentialStatus.INVALID,
                             verification_method="slack_auth_test",
-                            notes=[f"Auth failed: {data.get('error', 'unknown')}"],
+                            notes=notes,
+                        )
+                    else:
+                        return CredentialVerificationResult(
+                            credential_type="slack_token",
+                            credential_masked=self._mask_credential(credential),
+                            source=source,
+                            source_url=source_url,
+                            status=CredentialStatus.ERROR,
+                            verification_method="slack_auth_test",
+                            notes=[f"Unexpected response format"],
                         )
                 else:
                     return CredentialVerificationResult(
@@ -556,6 +577,7 @@ class CredentialVerifier:
                         verification_method="slack_auth_test",
                         notes=[f"HTTP error: {response.status_code}"],
                     )
+
         except Exception as e:
             return CredentialVerificationResult(
                 credential_type="slack_token",
@@ -605,7 +627,8 @@ class CredentialVerifier:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    scopes = data.get("scopes", [])
+                    if isinstance(asset_data, dict):
+                        scopes = data.get("scopes", [])
                     
                     # Determine access level from scopes
                     if "mail.send" in scopes:
@@ -683,7 +706,7 @@ class CredentialVerifier:
                         status=CredentialStatus.VALID,
                         verification_method="openai_models_api",
                         access_level="service",
-                        severity="high",
+                        severity="HIGH",
                         notes=["Authentication successful via OpenAI Models API"],
                     )
                 elif response.status_code == 401:
@@ -779,7 +802,7 @@ class CredentialVerifier:
                         status=CredentialStatus.VALID,  # service_role keys are always valid if they exist
                         verification_method="jwt_decode",
                         access_level="admin",
-                        severity="critical",
+                        severity="CRITICAL",
                         notes=[
                             "CRITICAL: service_role key exposed",
                             "This key bypasses Row Level Security",
@@ -853,10 +876,12 @@ class CredentialVerifier:
             header_data = json.loads(base64.urlsafe_b64decode(header))
             payload_data = json.loads(base64.urlsafe_b64decode(payload))
             
-            notes = [f"Algorithm: {header_data.get('alg', 'unknown')}"]
+            if isinstance(asset_data, dict):
+                notes = [f"Algorithm: {header_data.get('alg', 'unknown')}"]
             
             # Check expiration
-            exp = payload_data.get("exp")
+            if isinstance(asset_data, dict):
+                exp = payload_data.get("exp")
             if exp:
                 exp_time = datetime.fromtimestamp(exp)
                 if exp_time < datetime.now():
@@ -865,25 +890,28 @@ class CredentialVerifier:
                     notes.append(f"Valid until {exp_time.isoformat()}")
             
             # Check issuer
-            iss = payload_data.get("iss")
+            if isinstance(asset_data, dict):
+                iss = payload_data.get("iss")
             if iss:
                 notes.append(f"Issuer: {iss}")
             
             # Determine access level from claims
-            roles = payload_data.get("roles", payload_data.get("role", []))
+            if isinstance(asset_data, dict):
+                roles = payload_data.get("roles", payload_data.get("role", []))
             if isinstance(roles, str):
                 roles = [roles]
             
-            if "admin" in roles or payload_data.get("admin"):
-                access_level = "admin"
-                severity = "critical"
-            elif "service" in roles:
-                access_level = "service"
-                severity = "critical"
-            else:
-                access_level = "user"
-                severity = "high"
-            
+            if isinstance(asset_data, dict):
+                if "admin" in roles or payload_data.get("admin"):
+                    access_level = "admin"
+                    severity = "critical"
+                elif "service" in roles:
+                    access_level = "service"
+                    severity = "critical"
+                else:
+                    access_level = "user"
+                    severity = "high"
+                
             return CredentialVerificationResult(
                 credential_type="jwt_token",
                 credential_masked=self._mask_credential(credential),

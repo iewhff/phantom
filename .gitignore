@@ -250,3 +250,62 @@ tools/*.bin
 *.old
 temp/
 tmp/
+*.py.backup_*
+
+# ============================================================================
+# AUDIT LOGS (Contain target data, scan details, hashes)
+# ============================================================================
+logs/audit/
+logs/legal_audit.jsonl
+
+# ============================================================================
+# INTERNAL AUDIT/TODO DOCUMENTS (Development-only)
+# ============================================================================
+*_AUDIT.md
+*_AUDIT_*.md
+*_TODO.md
+*_TODO_*.md
+*_GAPS.md
+*_GAPS_*.md
+LOGIC_AUDIT*.md
+HONEST_GAPS_TODO.md
+TESTS_REQUIRED.md
+OVERFILTERING_ANALYSIS.md
+
+# ============================================================================
+# INTERNAL DOCS & PRESENTATIONS (Not for public repo)
+# ============================================================================
+auditdocs/
+PHANTOM_AUDIT_PRESENTATION.html
+PHANTOM_PENTEST_CAPABILITIES.html
+
+# ============================================================================
+# TRAINING APPS / EXTERNAL REPOS (Submodules or local clones)
+# ============================================================================
+NodeGoat/
+
+# ============================================================================
+# SCRATCH / UTILITY SCRIPTS (One-off dev tools)
+# ============================================================================
+corretor.py
+sanitazer.py
+encontrar_erros_scanner.py
+phantom_audit.py
+prompt.md
+blueprint.md
+labs.md
+local.md
+a_LABS_TEST_PLAN.md
+
+# ============================================================================
+# LEGAL TEMPLATES (Sensitive — not for public repo)
+# ============================================================================
+legal/
+
+# ============================================================================
+# OFFICE DOCUMENTS (Binary files, case studies)
+# ============================================================================
+*.docx
+*.pdf
+*.pptx
+*.xlsx

@@ -41,25 +41,27 @@ Version: 2.0.0-enterprise
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlencode, quote, parse_qs, urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 
 
 # Safe mode environment variable - set by full_scanner.py
 SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
 ALLOW_WRITES = SAFE_MODE in ("standard", "aggressive")
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -347,10 +349,37 @@ class PrototypePollutionScanner(ScanModule):
     URL_PP_PAYLOADS = URL_PP_PAYLOADS
     DOM_SINKS = DOM_POLLUTION_SINKS
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
+    # Server-side prototype pollution only applies to JavaScript backends.
+    # These tech fingerprints indicate a JS backend is present.
+    _JS_BACKEND_INDICATORS = frozenset({
+        "node.js", "nodejs", "express", "express.js", "next.js", "nextjs",
+        "nuxt", "nuxt.js", "koa", "fastify", "hapi", "nest.js", "nestjs",
+        "deno", "bun", "meteor", "sails", "sails.js", "adonis", "adonisjs",
+        "remix", "gatsby", "svelte", "sveltekit",
+    })
+
+    def _has_js_backend(self, asset_data: dict[str, Any]) -> bool:
+        """Check if the target's tech stack includes a JavaScript backend."""
+        if isinstance(asset_data, dict):
+            techs = asset_data.get("technologies", [])
+        if not techs:
+            return False
+        for t in techs:
+            name = (t.get("name", "") if isinstance(t, dict) else str(t)).lower()
+            if any(js in name for js in self._JS_BACKEND_INDICATORS):
+                return True
+        return False
+
     async def scan(
         self,
         host: str,
@@ -359,55 +388,84 @@ class PrototypePollutionScanner(ScanModule):
     ) -> dict[str, Any]:
         """
         Enterprise: Comprehensive prototype pollution scan.
+
+        Server-side tests (JSON body, URL params, RCE gadgets, DoS, API merge)
+        are SKIPPED when no JavaScript backend is detected — __proto__ is
+        meaningless on Java, Python, Ruby, Go, PHP, etc.
+
+        Client-side tests (DOM sinks, library fingerprinting) always run because
+        they check front-end JavaScript regardless of backend.
         """
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[dict[str, Any]] = []
-        
+
         base_url = f"https://{host}" if not host.startswith("http") else host
-        endpoints = asset_data.get("endpoints", [])
-        
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
-            # Phase 1: Test JSON body prototype pollution
-            json_findings = await self._test_json_pollution_enterprise(
-                client, base_url, endpoints, rate_limiter
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
+
+        js_backend = self._has_js_backend(asset_data)
+        if not js_backend:
+            logger.info(
+                "[PrototypePollution] No JS backend detected — "
+                "skipping server-side tests (JSON, URL, RCE, DoS, API). "
+                "Running client-side checks only (DOM sinks, library fingerprinting)."
             )
-            findings.extend(json_findings)
-            
-            # Phase 2: Test URL parameter pollution
-            url_findings = await self._test_url_pollution_enterprise(
-                client, base_url, endpoints, rate_limiter
-            )
-            findings.extend(url_findings)
-            
-            # Phase 3: Test RCE gadget chains
-            rce_findings = await self._test_rce_gadgets(
-                client, base_url, endpoints, rate_limiter
-            )
-            findings.extend(rce_findings)
-            
-            # Phase 4: Check for DOM-based pollution
+
+        # FIX: Pass auth headers for authenticated endpoint testing
+        async with get_scan_client(
+            verify_ssl=False,
+            timeout=self.timeout,
+            custom_headers=self._auth_headers,
+        ) as client:
+            # === Server-side tests — only when JS backend detected ===
+            if js_backend:
+                # Phase 1: Test JSON body prototype pollution
+                json_findings = await self._test_json_pollution_enterprise(
+                    client, base_url, endpoints, rate_limiter
+                )
+                findings.extend(json_findings)
+
+                # Phase 2: Test URL parameter pollution
+                url_findings = await self._test_url_pollution_enterprise(
+                    client, base_url, endpoints, rate_limiter
+                )
+                findings.extend(url_findings)
+
+                # Phase 3: Test RCE gadget chains
+                rce_findings = await self._test_rce_gadgets(
+                    client, base_url, endpoints, rate_limiter
+                )
+                findings.extend(rce_findings)
+
+                # Phase 6: DoS testing
+                dos_findings = await self._test_dos_pollution(
+                    client, base_url, rate_limiter
+                )
+                findings.extend(dos_findings)
+
+                # Phase 7: API endpoint testing
+                api_findings = await self._test_api_endpoints_enterprise(
+                    client, base_url, rate_limiter
+                )
+                findings.extend(api_findings)
+
+            # === Client-side tests — always run ===
+            # Phase 4: Check for DOM-based pollution (client-side JS)
             dom_findings = await self._test_dom_pollution_enterprise(
                 client, base_url, rate_limiter
             )
             findings.extend(dom_findings)
-            
-            # Phase 5: Library vulnerability fingerprinting
+
+            # Phase 5: Library vulnerability fingerprinting (client-side JS)
             lib_findings = await self._test_library_vulns(
                 client, base_url, rate_limiter
             )
             findings.extend(lib_findings)
-            
-            # Phase 6: DoS testing
-            dos_findings = await self._test_dos_pollution(
-                client, base_url, rate_limiter
-            )
-            findings.extend(dos_findings)
-            
-            # Phase 7: API endpoint testing
-            api_findings = await self._test_api_endpoints_enterprise(
-                client, base_url, rate_limiter
-            )
-            findings.extend(api_findings)
-        
+
         return {"findings": findings}
     
     async def _test_json_pollution_enterprise(
@@ -465,13 +523,13 @@ class PrototypePollutionScanner(ScanModule):
                     
                     if result.vulnerable:
                         findings.append(Finding(
-                            type="prototype_pollution",
+                            vuln_type=VulnType.PROTOTYPE_POLLUTION,
                             name="Server-Side Prototype Pollution",
-                            severity="CRITICAL" if result.rce_possible else "HIGH",
+                            severity=Severity.CRITICAL if result.rce_possible else "HIGH",
                             description=f"Prototype pollution via {result.vuln_type.name if result.vuln_type else 'JSON body'}. "
                                        f"Object prototype can be modified through user input.",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Method: POST",
                                 f"Payload: {json.dumps(payload)[:200]}",
@@ -479,8 +537,8 @@ class PrototypePollutionScanner(ScanModule):
                                 *result.evidence,
                             ],
                             cvss_score=9.0,
-                            cwe="CWE-1321",
-                            confidence=result.confidence * 100,
+                            cwe_id="CWE-1321",
+                            confidence_score=result.confidence * 100,
                             remediation="Use Object.create(null) for objects without prototype. "
                                        "Sanitize __proto__, constructor, and prototype keys from input. "
                                        "Use Map instead of plain objects for user data. "
@@ -504,19 +562,19 @@ class PrototypePollutionScanner(ScanModule):
                             
                             if result.vulnerable:
                                 findings.append(Finding(
-                                    type="prototype_pollution",
+                                    vuln_type=VulnType.PROTOTYPE_POLLUTION,
                                     name=f"Prototype Pollution via {method}",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description=f"Update endpoint vulnerable to prototype pollution",
                                     host=urlparse(url).netloc,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                     f"Method: {method}",
                                     f"Payload: {json.dumps(payload)[:200]}",
                                 ],
                                 cvss_score=9.0,
-                                cwe="CWE-1321",
-                                confidence=result.confidence * 100,
+                                cwe_id="CWE-1321",
+                                confidence_score=result.confidence * 100,
                                 remediation="Filter dangerous keys from update operations.",
                             ).to_dict())
                             break
@@ -594,49 +652,68 @@ class PrototypePollutionScanner(ScanModule):
             if parsed.path and parsed.path not in test_paths:
                 test_paths.append(parsed.path)
         
+        # Fetch baseline responses (without payload) to compare.
+        # If the indicator already exists in the baseline, it's not our payload.
+        baseline_cache: dict[str, str] = {}
         for path in test_paths[:10]:
+            try:
+                await rate_limiter.acquire()
+                burl = urljoin(base_url, path)
+                bresp = await client.get(burl)
+                baseline_cache[path] = bresp.text.lower()
+            except Exception:
+                baseline_cache[path] = ""
+
+        for path in test_paths[:10]:
+            baseline_lower = baseline_cache.get(path, "")
             for payload in URL_PP_PAYLOADS[:15]:
                 await rate_limiter.acquire()
-                
+
                 try:
                     url = urljoin(base_url, f"{path}?{payload}")
                     response = await client.get(url)
-                    
-                    # Check for pollution indicators
+
                     response_lower = response.text.lower()
-                    
+
                     vulnerable = False
                     evidence = []
-                    
+
                     for indicator in POLLUTION_INDICATORS:
-                        if indicator.lower() in response_lower:
-                            # Make sure it's not just reflected as string
-                            if f'"{indicator}"' not in response_lower:
-                                vulnerable = True
-                                evidence.append(f"Indicator: {indicator}")
-                    
+                        ind_lower = indicator.lower()
+                        if ind_lower in response_lower:
+                            # Skip if indicator was already in the baseline
+                            # (e.g., "__proto__" reflected from URL in HTML,
+                            #  or login page that always contains "authenticated")
+                            if ind_lower in baseline_lower:
+                                continue
+                            # Skip if it's just a JSON-quoted string reflection
+                            if f'"{indicator}"' in response_lower:
+                                continue
+                            vulnerable = True
+                            evidence.append(f"Indicator: {indicator}")
+
                     if vulnerable:
                         findings.append(Finding(
-                            type="prototype_pollution",
+                            vuln_type=VulnType.PROTOTYPE_POLLUTION,
                             name="URL Parameter Prototype Pollution",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description="Prototype pollution via URL query parameters. "
                                        "Nested object syntax is being parsed and processed.",
                             host=urlparse(base_url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {payload}",
                                 *evidence,
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-1321",
-                            confidence=90,
+                            cwe_id="CWE-1321",
+                            confidence_score=90,
                             remediation="Use strict query parameter parsing. "
                                        "Reject nested object syntax in query strings. "
                                        "Use a query string parser that doesn't support bracket notation.",
                         ).to_dict())
                         break
-                        
+
                 except Exception as e:
                     logger.debug(f"URL pollution test error: {e}")
         
@@ -677,34 +754,54 @@ class PrototypePollutionScanner(ScanModule):
                             json=payload,
                             headers={"Content-Type": "application/json"}
                         )
-                        
-                        # Check for RCE indicators
+
+                        # FIX 2026-02-18: Skip error responses - they contain false positive patterns
+                        # Rails/Node.js 500 error pages include "spawn", "child_process", "ENOENT", etc.
+                        if response.status_code >= 400:
+                            # Error responses are NOT evidence of successful exploitation
+                            logger.debug(f"Skipping RCE check for {url}: status {response.status_code}")
+                            continue
+
+                        # FIX: Detect error pages even with 200 status (some frameworks do this)
+                        response_lower = response.text.lower()
+                        error_page_indicators = [
+                            "exception", "error occurred", "stack trace", "traceback",
+                            "internal server error", "application error", "debug mode",
+                            "rails error", "actioncontroller::routingerror",
+                            "express error", "syntaxerror", "typeerror", "referenceerror",
+                        ]
+                        is_error_page = any(ind in response_lower for ind in error_page_indicators)
+                        if is_error_page:
+                            logger.debug(f"Skipping RCE check for {url}: error page detected")
+                            continue
+
+                        # Check for RCE indicators (only for successful responses)
                         rce_indicators = [
                             "uid=", "gid=", "groups=",  # id command output
                             "root:", "www-data:",       # passwd content
-                            "ENOENT", "spawn",          # Node.js process errors
-                            "child_process",            # Module name leaked
                         ]
-                        
+
+                        # FIX: "ENOENT", "spawn", "child_process" removed - too common in error pages
+
                         for indicator in rce_indicators:
                             if indicator in response.text:
                                 findings.append(Finding(
-                                    type="prototype_pollution",
+                                    vuln_type=VulnType.PROTOTYPE_POLLUTION,
                                     name=f"Prototype Pollution RCE ({gadget_type.name})",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description=f"Remote code execution via prototype pollution. "
                                                f"Gadget chain: {gadget_type.name}. "
                                                f"Command execution confirmed.",
                                     host=urlparse(url).netloc,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Gadget: {gadget_type.name}",
                                         f"Payload: {json.dumps(payload)[:150]}...",
                                         f"RCE indicator: {indicator}",
                                     ],
                                     cvss_score=10.0,
-                                    cwe="CWE-94",
-                                    confidence=95,
+                                    cwe_id="CWE-94",
+                                    confidence_score=95,
                                     remediation="CRITICAL: Immediate action required. "
                                                "This is a remote code execution vulnerability. "
                                                "Update template engines. Sanitize all input.",
@@ -716,20 +813,20 @@ class PrototypePollutionScanner(ScanModule):
                         for key in gadget_keys:
                             if key in response.text:
                                 findings.append(Finding(
-                                    type="prototype_pollution",
+                                    vuln_type=VulnType.PROTOTYPE_POLLUTION,
                                     name=f"Potential RCE Gadget Reflected ({gadget_type.name})",
-                                    severity="HIGH",
-                                    description=f"RCE gadget key '{key}' reflected. "
-                                               f"Manual verification required for exploitation.",
+                                    severity=Severity.HIGH,
+                                    description=f"RCE gadget key '{key}' reflected in response. "
+                                               f"Prototype pollution enables template engine exploitation.",
                                     host=urlparse(url).netloc,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Gadget type: {gadget_type.name}",
                                         f"Reflected key: {key}",
                                     ],
                                     cvss_score=8.5,
-                                    cwe="CWE-1321",
-                                    confidence=90,
+                                    cwe_id="CWE-1321",
+                                    confidence_score=90,
                                     remediation="Filter prototype pollution keys. Update template engines.",
                                 ).to_dict())
                                 break
@@ -769,20 +866,20 @@ class PrototypePollutionScanner(ScanModule):
                 severity = "HIGH" if any(s in found_sinks for s in high_risk_sinks) else "MEDIUM"
                 
                 findings.append(Finding(
-                    type="prototype_pollution",
+                    vuln_type=VulnType.PROTOTYPE_POLLUTION,
                     name="Potential DOM Prototype Pollution",
                     severity=severity,
                     description=f"Vulnerable merge functions detected in client-side code. "
                                f"DOM-based prototype pollution may be possible.",
                     host=urlparse(base_url).netloc,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[
                         f"Vulnerable sinks found: {', '.join(found_sinks[:5])}",
                         "Manual testing required for exploitation",
                     ],
                     cvss_score=6.1 if severity == "MEDIUM" else 7.5,
-                    cwe="CWE-1321",
-                    confidence=85,
+                    cwe_id="CWE-1321",
+                    confidence_score=85,
                     remediation="Update libraries to patched versions. "
                                "Use Object.freeze on Object.prototype. "
                                "Implement Object.create(null) for safe objects.",
@@ -800,19 +897,53 @@ class PrototypePollutionScanner(ScanModule):
                 match = re.search(pattern, html)
                 if match:
                     version = match.group(1)
-                    findings.append(Finding(
-                        type="prototype_pollution",
-                        name=f"Library Version Detected: {lib} v{version}",
-                        severity="INFO",
-                        description=f"{lib} version {version} detected. Check for known vulnerabilities.",
-                        host=urlparse(base_url).netloc,
-                        matched_at=base_url,
-                        evidence=[f"Library: {lib}", f"Version: {version}"],
-                        cvss_score=0.0,
-                        cwe="CWE-1321",
-                        confidence=100,
-                        remediation="Verify library version is not vulnerable to prototype pollution.",
-                    ).to_dict())
+                    # FIX 2026-03-02: Cross-reference detected version against known CVEs
+                    # instead of always reporting as generic "Library Version Detected".
+                    matched_cves = []
+                    for vuln in VULNERABLE_LIBRARIES:
+                        if vuln.library == lib:
+                            # Simple version comparison (works for semver)
+                            try:
+                                from packaging.version import Version
+                                if Version(vuln.min_version) <= Version(version) < Version(vuln.max_version):
+                                    matched_cves.append(vuln)
+                            except Exception:
+                                # Fallback: string comparison
+                                if version < vuln.max_version:
+                                    matched_cves.append(vuln)
+
+                    if matched_cves:
+                        cve_list = ", ".join(v.cve for v in matched_cves)
+                        descs = "; ".join(f"{v.cve}: {v.description} (fixed in {v.max_version})" for v in matched_cves)
+                        findings.append(Finding(
+                            vuln_type=VulnType.PROTOTYPE_POLLUTION,
+                            name=f"Vulnerable {lib} v{version} ({cve_list})",
+                            severity=Severity.MEDIUM,
+                            description=f"{lib} {version} is vulnerable to prototype pollution. {descs}",
+                            host=urlparse(base_url).netloc,
+                            endpoint=base_url,
+                            evidence=[f"Library: {lib}", f"Version: {version}",
+                                      *[f"{v.cve}: affects < {v.max_version}" for v in matched_cves]],
+                            cvss_score=6.1,
+                            cwe_id="CWE-1321",
+                            confidence_score=95,
+                            remediation=f"Upgrade {lib} to version {matched_cves[-1].max_version} or later.",
+                        ).to_dict())
+                    else:
+                        # No known CVE — report as INFO with correct type
+                        findings.append(Finding(
+                            vuln_type=VulnType.INFO_DISCLOSURE,
+                            name=f"Library Detected: {lib} v{version}",
+                            severity=Severity.INFO,
+                            description=f"{lib} version {version} detected. No known prototype pollution CVEs for this version.",
+                            host=urlparse(base_url).netloc,
+                            endpoint=base_url,
+                            evidence=[f"Library: {lib}", f"Version: {version}"],
+                            cvss_score=0.0,
+                            cwe_id="CWE-200",
+                            confidence_score=80,
+                            remediation=f"Keep {lib} updated to the latest version.",
+                        ).to_dict())
                     
         except Exception as e:
             logger.debug(f"DOM pollution check error: {e}")
@@ -839,21 +970,21 @@ class PrototypePollutionScanner(ScanModule):
             for vuln in VULNERABLE_LIBRARIES:
                 if vuln.library.lower() in html:
                     findings.append(Finding(
-                        type="prototype_pollution",
+                        vuln_type=VulnType.PROTOTYPE_POLLUTION,
                         name=f"Potentially Vulnerable Library: {vuln.library} ({vuln.cve})",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         description=f"{vuln.library} detected. Vulnerable versions: {vuln.min_version} - {vuln.max_version}. "
                                    f"{vuln.description}",
                         host=urlparse(base_url).netloc,
-                        matched_at=base_url,
+                        endpoint=base_url,
                         evidence=[
                             f"Library: {vuln.library}",
                             f"CVE: {vuln.cve}",
                             f"Description: {vuln.description}",
                         ],
                         cvss_score=6.5,
-                        cwe="CWE-1321",
-                        confidence=85,
+                        cwe_id="CWE-1321",
+                        confidence_score=85,
                         remediation=f"Update {vuln.library} to version > {vuln.max_version}.",
                     ).to_dict())
                     
@@ -897,20 +1028,20 @@ class PrototypePollutionScanner(ScanModule):
                     # Check for significant delay
                     if elapsed > 3.0:
                         findings.append(Finding(
-                            type="prototype_pollution",
+                            vuln_type=VulnType.PROTOTYPE_POLLUTION,
                             name="Prototype Pollution DoS",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description=f"Denial of service possible via prototype pollution. "
                                        f"Response delayed by {elapsed:.1f}s.",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Payload: {json.dumps(payload)[:100]}",
                                 f"Response time: {elapsed:.1f}s",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-400",
-                            confidence=75,
+                            cwe_id="CWE-400",
+                            confidence_score=75,
                             remediation="Implement input size limits. "
                                        "Sanitize recursive structures. "
                                        "Add request timeout limits.",
@@ -919,16 +1050,16 @@ class PrototypePollutionScanner(ScanModule):
                         
                 except asyncio.TimeoutError:
                     findings.append(Finding(
-                        type="prototype_pollution",
+                        vuln_type=VulnType.PROTOTYPE_POLLUTION,
                         name="Prototype Pollution DoS (Timeout)",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description="Request timeout indicates possible DoS via prototype pollution.",
                         host=urlparse(url).netloc,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=["Request timed out with DoS payload"],
                         cvss_score=7.5,
-                        cwe="CWE-400",
-                        confidence=90,
+                        cwe_id="CWE-400",
+                        confidence_score=90,
                         remediation="Implement circuit breakers and request timeouts.",
                     ).to_dict())
                     break
@@ -979,20 +1110,20 @@ class PrototypePollutionScanner(ScanModule):
                     
                     if "polluted" in response_lower or "isadmin" in response_lower:
                         findings.append(Finding(
-                            type="prototype_pollution",
+                            vuln_type=VulnType.PROTOTYPE_POLLUTION,
                             name="Prototype Pollution in Merge API",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description="JSON merge endpoint vulnerable to prototype pollution. "
                                        "Merge operation includes __proto__ properties.",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Endpoint: {endpoint}",
                                 "Pollution marker in merged result",
                             ],
                             cvss_score=9.0,
-                            cwe="CWE-1321",
-                            confidence=95,
+                            cwe_id="CWE-1321",
+                            confidence_score=95,
                             remediation="Filter __proto__, constructor, and prototype keys before merge. "
                                        "Use safe merge implementation.",
                         ).to_dict())

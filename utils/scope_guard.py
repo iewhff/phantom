@@ -15,13 +15,11 @@ Princípio: Isto é OBRIGATÓRIO se algum dia sair do teu PC!
 
 import ipaddress
 import re
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum, auto
-from typing import Optional, List, Dict, Any, Set, Pattern
-from urllib.parse import urlparse, urljoin
-from pathlib import Path
+from enum import Enum
+from typing import Optional, List, Dict, Any, Pattern
+from urllib.parse import urlparse
 import fnmatch
 
 
@@ -81,7 +79,8 @@ class ScopeDefinition:
     allowed_ports: List[int] = field(default_factory=lambda: [80, 443, 8080, 8443])
     
     # Inclusions (override exclusions)
-    include_subdomains: bool = True
+    # Default: False for safety - only scan exact target domain unless explicitly enabled
+    include_subdomains: bool = False
     include_patterns: List[str] = field(default_factory=list)
     
     # Exclusions
@@ -127,7 +126,7 @@ class ScopeDefinition:
         return cls(**data)
     
     @classmethod
-    def from_target(cls, target: str, include_subdomains: bool = True) -> 'ScopeDefinition':
+    def from_target(cls, target: str, include_subdomains: bool = False) -> 'ScopeDefinition':
         """Create ScopeDefinition from a target URL"""
         parsed = urlparse(target)
         domain = parsed.netloc.split(':')[0]
@@ -223,21 +222,21 @@ class ScopeGuard:
             try:
                 regex = fnmatch.translate(pattern)
                 self._compiled_patterns["include"].append(re.compile(regex, re.IGNORECASE))
-            except Exception:
+            except re.error:
                 pass
-        
+
         for pattern in self.scope.excluded_patterns:
             try:
                 regex = fnmatch.translate(pattern)
                 self._compiled_patterns["exclude"].append(re.compile(regex, re.IGNORECASE))
-            except Exception:
+            except re.error:
                 pass
-        
+
         for pattern in self.scope.sensitive_paths:
             try:
                 regex = fnmatch.translate(pattern)
                 self._compiled_patterns["sensitive"].append(re.compile(regex, re.IGNORECASE))
-            except Exception:
+            except re.error:
                 pass
     
     def is_allowed(self, url: str) -> tuple:
@@ -285,8 +284,8 @@ class ScopeGuard:
                 return self._handle_violation(violation)
             
             return (True, None)
-            
-        except Exception as e:
+
+        except (ValueError, AttributeError) as e:
             return (False, ScopeViolation(
                 timestamp=datetime.now(),
                 violation_type=ScopeViolationType.EXPLICIT_EXCLUSION,
@@ -413,9 +412,11 @@ class ScopeGuard:
         
         for allowed in self.scope.allowed_domains:
             allowed_lower = allowed.lower()
-            
-            # Exact match
-            if host_lower == allowed_lower:
+            # Strip port from scope entry (e.g., "localhost:3000" → "localhost")
+            allowed_domain = allowed_lower.split(":")[0] if ":" in allowed_lower else allowed_lower
+
+            # Exact match (with or without port in scope entry)
+            if host_lower == allowed_lower or host_lower == allowed_domain:
                 # Check exclusions
                 if host_lower in [d.lower() for d in self.scope.excluded_domains]:
                     return ScopeViolation(
@@ -429,7 +430,7 @@ class ScopeGuard:
             
             # Subdomain match
             if self.scope.include_subdomains:
-                if host_lower.endswith('.' + allowed_lower):
+                if host_lower.endswith('.' + allowed_domain):
                     # Check excluded subdomains
                     if host_lower in [d.lower() for d in self.scope.excluded_domains]:
                         return ScopeViolation(
@@ -652,7 +653,7 @@ class ScopeViolationError(Exception):
 
 
 # Convenience functions
-def create_scope_from_url(url: str, include_subdomains: bool = True) -> ScopeGuard:
+def create_scope_from_url(url: str, include_subdomains: bool = False) -> ScopeGuard:
     """Create a scope guard from a single URL"""
     scope = ScopeDefinition.from_target(url, include_subdomains)
     return ScopeGuard(scope=scope)

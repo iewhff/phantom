@@ -132,18 +132,43 @@ MODULE_CATEGORIES = {
     "advanced": ["smuggling", "cache", "deser", "prototype", "dns_rebind", "rls_bypass"],
 
     # Standard scan - comprehensive web app testing (default for PHANTOM)
+    # FIX 2026-02-18: Synced with full_scanner.py CATEGORIES["standard"] (71 modules)
     "standard": [
-        "headers", "ssl", "cors",           # Infrastructure basics
-        "sqli", "xss", "dom_xss",           # Classic injections
-        "csrf", "idor", "authz",            # Access control
-        "api", "graphql",                   # API security
-        "jwt", "auth", "oauth",             # Authentication
-        "business",                         # Logic flaws
-        "race",                             # Race conditions
-        "ssrf", "lfi",                      # Server-side
-        "open_redirect",                    # Redirect issues
-        "info_disclosure",                  # Info leaks
-        "clickjacking",                     # UI redressing
+        # Critical Injections (MUST run)
+        "sqli", "xss", "dom_xss", "cmdi", "xxe", "ssrf", "lfi",
+        "nosql", "ssti", "ldap", "crlf",
+        # Authentication & Authorization
+        "auth", "oauth", "saml", "mfa", "jwt", "authz", "idor", "session_abuse",
+        # API Security
+        "api", "graphql", "grpc", "websocket", "sse",
+        # Infrastructure
+        "ssl", "headers", "cors", "cloud", "k8s", "dns_rebind",
+        # Advanced Attacks
+        "smuggling", "cache", "deser", "prototype", "cache_deception",
+        # Business Logic
+        "business", "race", "mass_assign", "ratelimit", "creative_exploiter",
+        # Discovery
+        "dir", "cms", "nuclei", "backend", "third_party",
+        # BaaS
+        "supabase", "firebase", "rls_bypass",
+        # Specialized
+        "mobile", "email", "host_header", "clickjacking",
+        "info_disclosure", "open_redirect", "file_upload",
+        "cookie", "subdomain_takeover", "csrf",
+        # Configuration & Integration Security
+        "config_exposure", "secrets_pattern", "webhook_security",
+        # Cross-Surface Analysis
+        "cross_surface",
+        # Concurrency Testing
+        "concurrency_stress", "concurrency_state",
+        # Advanced Business Logic & Access Control
+        "workflow_inference", "abac_context", "token_binding",
+        # Client-Side Security
+        "client_hardening",
+        # Authorization & Permission Logic
+        "permission_matrix",
+        # Integration Exploitation & Defensive Testing
+        "integration_exploiter", "defensive_evasion",
     ],
 
     # Smart scan - quick high-value modules

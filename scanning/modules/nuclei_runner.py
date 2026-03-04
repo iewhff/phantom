@@ -17,8 +17,10 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -108,14 +110,21 @@ class NucleiRunner(ScanModule):
         "info": 0.0,
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
         # Always use auto-detect to find the binary correctly
         self.nuclei_path = _find_nuclei_binary()
         logger.debug(f"[nuclei] Binary path: {self.nuclei_path}")
 
         # Get module config
-        module_config = settings.scanning.modules.get("nuclei", {})
+        # BUG-FIX: Handle both dict and object settings
+        module_config = settings.scanning.modules.get("nuclei", {}) if hasattr(settings, 'scanning') else {}
         self.templates_path = module_config.get(
             "templates_path",
             "~/.nuclei-templates"
@@ -168,10 +177,18 @@ class NucleiRunner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Run Nuclei scan on host with technology-aware template selection."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         logger.info(f"[nuclei] Starting enhanced scan on {host}")
 
         # Set detected technologies for targeted scanning
-        technologies = asset_data.get("technologies", [])
+        technologies = []
+        if isinstance(asset_data, dict):
+            # Removed invalid type check; ensure block logic
+                technologies = asset_data.get("technologies", [])
         if technologies:
             self.set_technologies(technologies)
             logger.info(f"[nuclei] Targeting technologies: {technologies[:5]}")
@@ -203,7 +220,7 @@ class NucleiRunner(ScanModule):
         except Exception as e:
             logger.error(f"[nuclei] Scan failed for {host}: {e}")
         
-        return {"vulns": findings, "info": info_items}
+        return {"findings": findings, "info": info_items}
     
     def _build_targets(
         self,
@@ -218,7 +235,9 @@ class NucleiRunner(ScanModule):
         targets.add(f"http://{host}")
         
         # Add discovered URLs
-        urls = asset_data.get("urls", [])
+        urls = []
+        if isinstance(asset_data, dict):
+            urls = asset_data.get("urls", [])
         for url in urls[:100]:  # Limit to first 100 URLs
             targets.add(url)
         
@@ -303,7 +322,7 @@ class NucleiRunner(ScanModule):
             )
 
             # Log stderr if any issues
-            stderr_text = stderr.decode().strip()
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 # Log first 1000 chars of stderr for debugging
                 logger.info(f"[nuclei] Output: {stderr_text[:1000]}")
@@ -314,7 +333,7 @@ class NucleiRunner(ScanModule):
 
             # Parse JSON lines
             results = []
-            stdout_text = stdout.decode()
+            stdout_text = stdout.decode("utf-8", errors="replace")
             logger.debug(f"[nuclei] stdout length: {len(stdout_text)} chars")
 
             for line in stdout_text.split('\n'):
@@ -339,22 +358,23 @@ class NucleiRunner(ScanModule):
         
         # Extract CVSS
         metadata = info.get("metadata", {})
+        # Removed invalid type check; ensure block logic
         cvss = metadata.get("cvss-score")
         if cvss is None:
             cvss = self.SEVERITY_CVSS.get(severity.lower(), 0.0)
         
         return Finding(
             id=result.get("template-id", ""),
-            type="nuclei",
+            vuln_type=VulnType.OTHER,
             name=info.get("name", "Unknown"),
             severity=severity,
             description=info.get("description", ""),
             host=host,
-            matched_at=result.get("matched-at", ""),
+            endpoint=result.get("matched-at", ""),
             evidence=result.get("extracted-results", []),
             cvss_score=float(cvss),
-            confidence=90,  # Nuclei templates are well-tested
-            cwe=info.get("classification", {}).get("cwe-id", ""),
+            confidence_score=90,  # Nuclei templates are well-tested
+            cwe_id=info.get("classification", {}).get("cwe-id", ""),
             remediation=info.get("remediation", ""),
             references=info.get("reference", []),
             metadata={

@@ -214,8 +214,6 @@ class PentestOrchestrator:
         self._state_manager = None
         self._safe_scanner = None
         self._threat_modeler = None
-        self._attack_chain_engine = None
-        
         logger.info(f"PentestOrchestrator v{self.VERSION} initialized")
     
     @property
@@ -244,14 +242,6 @@ class PentestOrchestrator:
                 abuse_generator=AbuseCaseGenerator(),
             )
         return self._threat_modeler
-    
-    @property
-    def attack_chain_engine(self):
-        """Get attack chain engine (lazy load)."""
-        if self._attack_chain_engine is None:
-            from analysis import AttackChainEngine
-            self._attack_chain_engine = AttackChainEngine()
-        return self._attack_chain_engine
     
     async def run_full_scan(
         self,

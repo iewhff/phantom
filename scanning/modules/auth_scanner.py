@@ -57,6 +57,7 @@ from .auth.auth_login_scanner import LoginScanner
 from .auth.auth_oauth_scanner import OAuthScanner
 from .auth.auth_privesc_scanner import PrivilegeEscalationScanner
 from .auth.auth_session_scanner import SessionScanner
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -86,9 +87,15 @@ class AuthScanner(ScanModule):
     name = "auth_scanner"
     version = "2.0-enterprise"
 
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
 
         # Initialize sub-scanners
         self.login_scanner = LoginScanner(settings)
@@ -126,6 +133,11 @@ class AuthScanner(ScanModule):
         9. Password reset flow analysis
         10. Account enumeration detection
         """
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[dict[str, Any]] = []
         self._partial_findings = []
 

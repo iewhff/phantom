@@ -11,9 +11,12 @@ from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -105,9 +108,15 @@ class KubernetesContainerScanner(ScanModule):
     DASHBOARD_PORTS = [8001, 30000, 443]
     REGISTRY_PORTS = [5000, 5001]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -116,12 +125,17 @@ class KubernetesContainerScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for Kubernetes and container vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         # Clean host for testing
         clean_host = host.replace("https://", "").replace("http://", "").split("/")[0]
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Test Kubernetes API
             k8s_findings = await self._test_kubernetes_api(
                 client, clean_host, rate_limiter
@@ -169,8 +183,8 @@ class KubernetesContainerScanner(ScanModule):
                 client, clean_host, rate_limiter
             )
             findings.extend(metrics_findings)
-        
-        return findings
+
+        return {"findings": [f.to_dict() for f in findings], "info": []}
     
     async def _test_kubernetes_api(
         self,
@@ -198,51 +212,51 @@ class KubernetesContainerScanner(ScanModule):
                                 if path == "/api/v1/secrets":
                                     findings.append(Finding(
                                         name="Kubernetes Secrets Exposed",
-                                        severity="CRITICAL",
-                                        confidence="HIGH",
+                                        severity=Severity.CRITICAL,
+                                        confidence_score=85.0,
                                         description="Kubernetes secrets API accessible without authentication",
-                                        matched_at=url,
-                                        evidence=[f"Secrets accessible: {len(data.get('items', []))} items"],
-                                        cwe="CWE-200",
+                                        endpoint=url,
+                                        evidence=[f"Secrets accessible: {len(data.get('items', []))} items"] if isinstance(data, dict) else [],
+                                        cwe_id="CWE-200",
                                         cvss_score=9.8,
                                         remediation="Enable RBAC. Restrict API access. Use network policies.",
                                     ))
                                 elif path == "/api/v1/pods":
                                     findings.append(Finding(
                                         name="Kubernetes Pods Exposed",
-                                        severity="HIGH",
-                                        confidence="HIGH",
+                                        severity=Severity.HIGH,
+                                        confidence_score=85.0,
                                         description="Kubernetes pods API accessible",
-                                        matched_at=url,
-                                        evidence=[f"Pods visible: {len(data.get('items', []))} items"],
-                                        cwe="CWE-200",
+                                        endpoint=url,
+                                        evidence=[f"Pods visible: {len(data.get('items', []))} items"] if isinstance(data, dict) else [],
+                                        cwe_id="CWE-200",
                                         cvss_score=7.5,
                                         remediation="Restrict API server access.",
                                     ))
                                 elif path == "/api" or path == "/version":
                                     findings.append(Finding(
                                         name="Kubernetes API Server Exposed",
-                                        severity="HIGH",
-                                        confidence="HIGH",
+                                        severity=Severity.HIGH,
+                                        confidence_score=85.0,
                                         description="Kubernetes API server publicly accessible",
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"API accessible",
-                                            f"Version info: {data.get('gitVersion', 'unknown')}",
+                                            f"Version info: {data.get('gitVersion', 'unknown')}" if isinstance(data, dict) else "Version info: unknown",
                                         ],
-                                        cwe="CWE-200",
+                                        cwe_id="CWE-200",
                                         cvss_score=7.5,
                                         remediation="Restrict API server to internal network. Use firewall rules.",
                                     ))
                                 elif path == "/metrics":
                                     findings.append(Finding(
                                         name="Kubernetes Metrics Exposed",
-                                        severity="MEDIUM",
-                                        confidence="HIGH",
+                                        severity=Severity.MEDIUM,
+                                        confidence_score=85.0,
                                         description="Kubernetes metrics endpoint accessible",
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=["Prometheus metrics exposed"],
-                                        cwe="CWE-200",
+                                        cwe_id="CWE-200",
                                         cvss_score=5.3,
                                         remediation="Protect metrics endpoint with authentication.",
                                     ))
@@ -251,12 +265,12 @@ class KubernetesContainerScanner(ScanModule):
                             elif response.status_code == 401:
                                 findings.append(Finding(
                                     name="Kubernetes API Server Detected",
-                                    severity="INFO",
-                                    confidence="HIGH",
+                                    severity=Severity.INFO,
+                                    confidence_score=85.0,
                                     description="Kubernetes API server detected (requires auth)",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=["API server responds but requires authentication"],
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     remediation="Ensure API server not publicly accessible.",
                                 ))
                                 break
@@ -292,12 +306,12 @@ class KubernetesContainerScanner(ScanModule):
                                 data = response.json()
                                 findings.append(Finding(
                                     name="Kubelet API Exposed (Pods)",
-                                    severity="CRITICAL",
-                                    confidence="HIGH",
+                                    severity=Severity.CRITICAL,
+                                    confidence_score=85.0,
                                     description="Kubelet API allows listing pods - can lead to RCE",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[f"Running pods visible"],
-                                    cwe="CWE-284",
+                                    cwe_id="CWE-284",
                                     cvss_score=9.8,
                                     remediation="Disable anonymous kubelet access. "
                                                "Set --anonymous-auth=false.",
@@ -308,12 +322,12 @@ class KubernetesContainerScanner(ScanModule):
                         elif path in ["/exec", "/run"]:
                             findings.append(Finding(
                                 name="Kubelet Exec/Run API Exposed",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description="Kubelet exec API allows command execution in containers",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Exec endpoint accessible"],
-                                cwe="CWE-78",
+                                cwe_id="CWE-78",
                                 cvss_score=10.0,
                                 remediation="Disable anonymous kubelet access immediately.",
                             ))
@@ -321,12 +335,12 @@ class KubernetesContainerScanner(ScanModule):
                         elif path == "/metrics":
                             findings.append(Finding(
                                 name="Kubelet Metrics Exposed",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Kubelet metrics reveal node information",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Kubelet Prometheus metrics accessible"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=5.3,
                                 remediation="Protect kubelet metrics with authentication.",
                             ))
@@ -357,12 +371,12 @@ class KubernetesContainerScanner(ScanModule):
                         if path == "/v2/keys" or path == "/v2/keys/":
                             findings.append(Finding(
                                 name="etcd Database Exposed",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description="etcd database publicly accessible - contains all K8s secrets",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["etcd keys endpoint accessible"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=10.0,
                                 remediation="Never expose etcd publicly. "
                                            "Use TLS client certificates. "
@@ -371,12 +385,12 @@ class KubernetesContainerScanner(ScanModule):
                         elif path == "/health" or path == "/version":
                             findings.append(Finding(
                                 name="etcd Endpoint Detected",
-                                severity="HIGH",
-                                confidence="HIGH",
+                                severity=Severity.HIGH,
+                                confidence_score=85.0,
                                 description="etcd endpoint publicly reachable",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[f"etcd health/version endpoint accessible"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=7.5,
                                 remediation="Restrict etcd access to internal network.",
                             ))
@@ -416,12 +430,12 @@ class KubernetesContainerScanner(ScanModule):
                             if "login" not in response.text.lower():
                                 findings.append(Finding(
                                     name="Kubernetes Dashboard Exposed (No Auth)",
-                                    severity="CRITICAL",
-                                    confidence="HIGH",
+                                    severity=Severity.CRITICAL,
+                                    confidence_score=85.0,
                                     description="Kubernetes Dashboard accessible without authentication",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=["Dashboard accessible without login"],
-                                    cwe="CWE-306",
+                                    cwe_id="CWE-306",
                                     cvss_score=9.8,
                                     remediation="Enable authentication for dashboard. "
                                                "Consider removing dashboard in production.",
@@ -429,12 +443,12 @@ class KubernetesContainerScanner(ScanModule):
                             else:
                                 findings.append(Finding(
                                     name="Kubernetes Dashboard Exposed",
-                                    severity="HIGH",
-                                    confidence="HIGH",
+                                    severity=Severity.HIGH,
+                                    confidence_score=85.0,
                                     description="Kubernetes Dashboard publicly accessible (requires login)",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=["Dashboard login page exposed"],
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     cvss_score=6.5,
                                     remediation="Restrict dashboard to internal access only. "
                                                "Use kubectl proxy or VPN.",
@@ -466,19 +480,21 @@ class KubernetesContainerScanner(ScanModule):
                         if path == "/v2/_catalog":
                             try:
                                 data = response.json()
-                                repos = data.get("repositories", [])
+                                repos = []
+                                if isinstance(asset_data, dict):
+                                    repos = data.get("repositories", [])
                                 
                                 findings.append(Finding(
                                     name="Container Registry Catalog Exposed",
-                                    severity="HIGH",
-                                    confidence="HIGH",
+                                    severity=Severity.HIGH,
+                                    confidence_score=85.0,
                                     description="Container registry allows listing all repositories",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Repositories: {len(repos)}",
                                         f"Sample: {repos[:5] if repos else 'empty'}",
                                     ],
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     cvss_score=7.5,
                                     remediation="Enable authentication for registry. "
                                                "Disable anonymous catalog listing.",
@@ -489,12 +505,12 @@ class KubernetesContainerScanner(ScanModule):
                         elif path == "/v2/":
                             findings.append(Finding(
                                 name="Container Registry Exposed",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Container registry API v2 accessible",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Registry API responds"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=5.3,
                                 remediation="Restrict registry access. Require authentication.",
                             ))
@@ -526,12 +542,12 @@ class KubernetesContainerScanner(ScanModule):
                 # If port responds at all, Tiller might be there
                 findings.append(Finding(
                     name="Helm Tiller Port Open",
-                    severity="HIGH",
-                    confidence="LOW",
+                    severity=Severity.HIGH,
+                    confidence_score=40.0,
                     description=f"Helm Tiller port {port} appears open",
-                    matched_at=f"{host}:{port}",
+                    endpoint=f"{host}:{port}",
                     evidence=["Port responds - may be Tiller"],
-                    cwe="CWE-284",
+                    cwe_id="CWE-284",
                     cvss_score=7.5,
                     remediation="Helm v3 doesn't use Tiller. "
                                "If using Helm v2, restrict Tiller access.",
@@ -572,12 +588,12 @@ class KubernetesContainerScanner(ScanModule):
                     if "docker" in response.text.lower() or "container" in response.text.lower():
                         findings.append(Finding(
                             name="Docker Socket/API Exposed via Web",
-                            severity="CRITICAL",
-                            confidence="MEDIUM",
+                            severity=Severity.CRITICAL,
+                            confidence_score=65.0,
                             description="Docker API or socket may be exposed via web",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["Docker-related endpoint accessible"],
-                            cwe="CWE-284",
+                            cwe_id="CWE-284",
                             cvss_score=9.8,
                             remediation="Never expose Docker socket to web. "
                                        "Use proper access controls.",
@@ -623,24 +639,24 @@ class KubernetesContainerScanner(ScanModule):
                     if path == "/debug/pprof":
                         findings.append(Finding(
                             name="Go pprof Debug Endpoint Exposed",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description="Go pprof profiling endpoint exposed",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["pprof endpoint accessible"],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=6.5,
                             remediation="Disable pprof in production or restrict access.",
                         ))
                     elif "/actuator" in path:
                         findings.append(Finding(
                             name="Spring Boot Actuator Exposed",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description="Spring Boot actuator endpoints exposed",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[f"Actuator endpoint: {path}"],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=6.5,
                             remediation="Restrict actuator endpoints. "
                                        "Use management.endpoints.web.exposure.include to limit.",
@@ -650,12 +666,12 @@ class KubernetesContainerScanner(ScanModule):
                         if "# HELP" in response.text or "# TYPE" in response.text:
                             findings.append(Finding(
                                 name="Prometheus Metrics Exposed",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Prometheus metrics endpoint publicly accessible",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Prometheus metrics format detected"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=4.3,
                                 remediation="Protect metrics endpoint with authentication.",
                             ))

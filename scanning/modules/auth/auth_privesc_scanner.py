@@ -33,13 +33,13 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
 from .auth_base import (
     ADMIN_PATHS_FORCED_BROWSING,
-    AUTH_BYPASS_HEADERS,
     HTTP_METHOD_TAMPERING,
     MASS_ASSIGNMENT_PAYLOADS,
     PARAM_POLLUTION_PAYLOADS,
@@ -63,7 +63,7 @@ class PrivilegeEscalationScanner:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
 
     async def scan(
         self,
@@ -155,7 +155,7 @@ class PrivilegeEscalationScanner:
     ) -> list[dict[str, Any]]:
         """Test for horizontal IDOR vulnerabilities."""
         findings = []
-        endpoints = asset_data.get("endpoints", [])
+        endpoints = asset_data.get("endpoints", []) if isinstance(asset_data, dict) else []
 
         # ID parameter patterns
         id_patterns = [
@@ -171,7 +171,7 @@ class PrivilegeEscalationScanner:
             r'[?&/]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in endpoints[:15]:
                 for pattern in id_patterns:
                     matches = re.findall(pattern, endpoint, re.IGNORECASE)
@@ -197,7 +197,8 @@ class PrivilegeEscalationScanner:
                         except (httpx.HTTPError, httpx.TimeoutException, OSError):
                             continue
 
-                        for test_id in test_ids[:5]:
+                        # FN-FIX 2026-02-08: Test ALL IDs (was [:5])
+                        for test_id in test_ids[:10]:
                             await rate_limiter.acquire()
 
                             # Build test URL
@@ -218,14 +219,14 @@ class PrivilegeEscalationScanner:
 
                                 if idor_result["vulnerable"]:
                                     findings.append(Finding(
-                                        type="authorization",
+                                        vuln_type=VulnType.BFLA,
                                         name="Horizontal IDOR Vulnerability",
                                         severity=idor_result["severity"],
                                         description=f"Horizontal privilege escalation via parameter '{param_name}'. "
                                                    f"Able to access other users' resources by modifying identifier. "
                                                    f"{idor_result['reason']}",
                                         host=base_url,
-                                        matched_at=test_endpoint,
+                                        endpoint=test_endpoint,
                                         evidence=[
                                             f"Vulnerable parameter: {param_name}",
                                             f"Original ID: {original_id}",
@@ -235,12 +236,12 @@ class PrivilegeEscalationScanner:
                                             *idor_result.get("extra_evidence", []),
                                         ],
                                         cvss_score=7.5,
-                                        cwe="CWE-639",
+                                        cwe_id="CWE-639",
                                         remediation="Implement proper authorization checks. "
                                                    "Verify that the authenticated user owns or has "
                                                    "permission to access the requested resource.",
                                     ).to_dict())
-                                    break
+                                    # FN-FIX 2026-02-08: Don't break - test ALL IDs to find enumeration scope
 
                             except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
                                 logger.debug(f"IDOR test failed for {test_endpoint}: {e}")
@@ -389,7 +390,7 @@ class PrivilegeEscalationScanner:
         """Test for vertical privilege escalation."""
         findings = []
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for func in PRIVILEGED_FUNCTIONS:
                 for method in func["methods"][:2]:
                     await rate_limiter.acquire()
@@ -412,13 +413,13 @@ class PrivilegeEscalationScanner:
                         if resp.status_code == 200:
                             if self._is_privileged_content(resp.text, func["path"]):
                                 findings.append(Finding(
-                                    type="authorization",
+                                    vuln_type=VulnType.BFLA,
                                     name="Vertical Privilege Escalation",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description=f"Admin/privileged function accessible without proper authorization. "
                                                f"Endpoint '{func['path']}' should require elevated privileges.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Privileged path: {func['path']}",
                                         f"HTTP method: {method}",
@@ -426,7 +427,7 @@ class PrivilegeEscalationScanner:
                                         f"Response length: {len(resp.text)} bytes",
                                     ],
                                     cvss_score=9.1,
-                                    cwe="CWE-269",
+                                    cwe_id="CWE-269",
                                     remediation="Implement role-based access control (RBAC). "
                                                "Verify user has required permissions before allowing "
                                                "access to privileged functions.",
@@ -518,13 +519,13 @@ class PrivilegeEscalationScanner:
 
                 if resp.status_code == 200 and len(resp.text) > 200:
                     return Finding(
-                        type="authorization",
+                        vuln_type=VulnType.BFLA,
                         name="403 Bypass - Privilege Escalation",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description=f"403 Forbidden bypass achieved using technique: {technique}. "
                                    "Access control can be circumvented.",
                         host=urlparse(url).netloc,
-                        matched_at=test_url,
+                        endpoint=test_url,
                         evidence=[
                             f"Original URL: {url}",
                             f"Bypass URL: {test_url}",
@@ -532,7 +533,7 @@ class PrivilegeEscalationScanner:
                             f"Response status: {resp.status_code}",
                         ],
                         cvss_score=7.5,
-                        cwe="CWE-285",
+                        cwe_id="CWE-285",
                         remediation="Fix access control to handle URL variations and "
                                    "header manipulation. Normalize URLs before authorization check.",
                     ).to_dict()
@@ -550,7 +551,7 @@ class PrivilegeEscalationScanner:
     ) -> list[dict[str, Any]]:
         """Test for role parameter manipulation vulnerabilities."""
         findings = []
-        endpoints = asset_data.get("endpoints", [])
+        endpoints = asset_data.get("endpoints", []) if isinstance(asset_data, dict) else []
 
         # Find user-related endpoints
         user_endpoints = [
@@ -566,7 +567,7 @@ class PrivilegeEscalationScanner:
 
         test_endpoints = list(set(user_endpoints[:5] + common_endpoints[:10]))
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in test_endpoints:
                 url = endpoint if endpoint.startswith("http") else urljoin(base_url, endpoint)
 
@@ -588,13 +589,13 @@ class PrivilegeEscalationScanner:
 
                                 if any(ind in resp_text for ind in success_indicators):
                                     findings.append(Finding(
-                                        type="authorization",
+                                        vuln_type=VulnType.BFLA,
                                         name="Role Manipulation Vulnerability",
-                                        severity="CRITICAL",
+                                        severity=Severity.CRITICAL,
                                         description=f"Possible privilege escalation via role parameter manipulation. "
                                                    f"Parameter '{role_payload['param']}' may allow role changes.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"Parameter: {role_payload['param']}",
                                             f"Value: {value}",
@@ -602,7 +603,7 @@ class PrivilegeEscalationScanner:
                                             f"Response snippet: {resp.text[:200]}",
                                         ],
                                         cvss_score=9.1,
-                                        cwe="CWE-269",
+                                        cwe_id="CWE-269",
                                         remediation="Never trust client-supplied role values. "
                                                    "Role assignment should be server-controlled.",
                                     ).to_dict())
@@ -621,7 +622,7 @@ class PrivilegeEscalationScanner:
         """Test for forced browsing to admin/privileged areas."""
         findings = []
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in ADMIN_PATHS_FORCED_BROWSING[:30]:
                 await rate_limiter.acquire()
 
@@ -646,13 +647,13 @@ class PrivilegeEscalationScanner:
                             severity = "CRITICAL" if "admin" in path.lower() else "HIGH"
 
                             findings.append(Finding(
-                                type="authorization",
+                                vuln_type=VulnType.BFLA,
                                 name="Forced Browsing - Admin Access",
                                 severity=severity,
                                 description=f"Admin/privileged area accessible via direct URL access. "
                                            f"No authentication required for '{path}'.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Admin path: {path}",
                                     f"Status code: {resp.status_code}",
@@ -660,7 +661,7 @@ class PrivilegeEscalationScanner:
                                     f"Admin indicators found: {indicator_count}",
                                 ],
                                 cvss_score=9.1,
-                                cwe="CWE-862",
+                                cwe_id="CWE-862",
                                 remediation="Implement authentication and authorization for all "
                                            "admin/privileged paths.",
                             ).to_dict())
@@ -678,7 +679,7 @@ class PrivilegeEscalationScanner:
     ) -> list[dict[str, Any]]:
         """Test for HTTP method tampering vulnerabilities."""
         findings = []
-        endpoints = asset_data.get("endpoints", [])
+        endpoints = asset_data.get("endpoints", []) if isinstance(asset_data, dict) else []
 
         sensitive_patterns = ["user", "account", "profile", "admin", "settings", "delete"]
         test_endpoints = [
@@ -693,7 +694,7 @@ class PrivilegeEscalationScanner:
 
         all_endpoints = list(set(test_endpoints[:10] + api_endpoints[:5]))
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in all_endpoints:
                 url = endpoint if endpoint.startswith("http") else urljoin(base_url, endpoint)
 
@@ -731,13 +732,13 @@ class PrivilegeEscalationScanner:
 
                         if self._is_method_tampering_vulnerable(get_resp, resp, tampering):
                             findings.append(Finding(
-                                type="authorization",
+                                vuln_type=VulnType.BFLA,
                                 name="HTTP Method Tampering Vulnerability",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"HTTP method tampering may allow unauthorized actions. "
                                            f"{tampering['description']}.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Original method: GET -> {method}",
                                     f"Technique: {tampering['description']}",
@@ -745,7 +746,7 @@ class PrivilegeEscalationScanner:
                                     f"Tampered status: {resp.status_code}",
                                 ],
                                 cvss_score=7.5,
-                                cwe="CWE-285",
+                                cwe_id="CWE-285",
                                 remediation="Implement method-aware access control. "
                                            "Validate permissions for each action type separately.",
                             ).to_dict())
@@ -784,14 +785,15 @@ class PrivilegeEscalationScanner:
     ) -> list[dict[str, Any]]:
         """Test for parameter pollution vulnerabilities."""
         findings = []
-        endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
 
         id_endpoints = [
             e for e in endpoints
             if re.search(r'[?&](id|user_id|userId|account)=', e, re.I)
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in id_endpoints[:10]:
                 await rate_limiter.acquire()
 
@@ -813,20 +815,20 @@ class PrivilegeEscalationScanner:
                             len(polluted_resp.text) > 100):
 
                             findings.append(Finding(
-                                type="authorization",
+                                vuln_type=VulnType.BFLA,
                                 name="Parameter Pollution Vulnerability",
-                                severity="MEDIUM",
+                                severity=Severity.MEDIUM,
                                 description=f"Parameter pollution may allow access control bypass. "
                                            f"{pollution['description']}.",
                                 host=base_url,
-                                matched_at=polluted_url,
+                                endpoint=polluted_url,
                                 evidence=[
                                     f"Pollution pattern: {pollution['pattern']}",
                                     f"Original endpoint: {endpoint}",
                                     "Response difference detected",
                                 ],
                                 cvss_score=6.5,
-                                cwe="CWE-235",
+                                cwe_id="CWE-235",
                                 remediation="Use strict parameter parsing. "
                                            "Reject requests with duplicate parameters.",
                             ).to_dict())
@@ -853,7 +855,7 @@ class PrivilegeEscalationScanner:
             "/settings", "/preferences",
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in update_endpoints:
                 url = urljoin(base_url, endpoint)
 
@@ -888,13 +890,13 @@ class PrivilegeEscalationScanner:
                                     "success" in resp_lower):
 
                                     findings.append(Finding(
-                                        type="authorization",
+                                        vuln_type=VulnType.BFLA,
                                         name="Mass Assignment Vulnerability",
-                                        severity="HIGH",
+                                        severity=Severity.HIGH,
                                         description=f"Privileged field '{field_name}' may be assignable. "
                                                    f"Mass assignment could allow privilege escalation.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"Payload: {json.dumps(payload)}",
                                             f"Method: {method}",
@@ -902,7 +904,7 @@ class PrivilegeEscalationScanner:
                                             "Field appears accepted",
                                         ],
                                         cvss_score=7.5,
-                                        cwe="CWE-915",
+                                        cwe_id="CWE-915",
                                         remediation="Use allowlists for permitted fields. "
                                                    "Never directly bind request data to models.",
                                     ).to_dict())
@@ -922,7 +924,7 @@ class PrivilegeEscalationScanner:
         """Test for path traversal authorization bypass."""
         findings = []
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in PATH_TRAVERSAL_AUTHZ_PAYLOADS:
                 await rate_limiter.acquire()
 
@@ -942,20 +944,20 @@ class PrivilegeEscalationScanner:
                                 severity = "CRITICAL"
 
                             findings.append(Finding(
-                                type="authorization",
+                                vuln_type=VulnType.BFLA,
                                 name="Path Traversal Authorization Bypass",
                                 severity=severity,
                                 description=f"Path manipulation allows access control bypass. "
                                            f"Admin content accessible via '{path}'.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Bypass path: {path}",
                                     f"Status: {resp.status_code}",
                                     "Admin content detected",
                                 ],
                                 cvss_score=8.1,
-                                cwe="CWE-22",
+                                cwe_id="CWE-22",
                                 remediation="Normalize paths before authorization check. "
                                            "Use canonical paths. Block path traversal sequences.",
                             ).to_dict())
@@ -989,7 +991,7 @@ class PrivilegeEscalationScanner:
             {"path": "/api/tokens", "method": "GET", "desc": "Access tokens"},
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for api in privileged_apis:
                 await rate_limiter.acquire()
 
@@ -1010,13 +1012,13 @@ class PrivilegeEscalationScanner:
                                    ["error", "forbidden", "unauthorized", "not found"]):
 
                             findings.append(Finding(
-                                type="authorization",
+                                vuln_type=VulnType.BFLA,
                                 name="Function-Level Access Control Missing",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"Privileged API function accessible without authorization. "
                                            f"{api['desc']} at {api['path']}.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Function: {api['desc']}",
                                     f"Endpoint: {api['path']}",
@@ -1024,7 +1026,7 @@ class PrivilegeEscalationScanner:
                                     f"Status: {resp.status_code}",
                                 ],
                                 cvss_score=7.5,
-                                cwe="CWE-285",
+                                cwe_id="CWE-285",
                                 remediation="Implement function-level access control. "
                                            "Verify permissions before executing any privileged operation.",
                             ).to_dict())

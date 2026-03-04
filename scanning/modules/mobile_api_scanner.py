@@ -6,18 +6,20 @@ Tests for mobile-specific API vulnerabilities and security misconfigurations.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
 import secrets
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -97,9 +99,15 @@ class MobileAPIScanner(ScanModule):
         "aws_key": r'AKIA[0-9A-Z]{16}',
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -108,11 +116,16 @@ class MobileAPIScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for mobile API security vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Discover mobile endpoints
             mobile_endpoints = await self._discover_mobile_endpoints(
                 client, base_url, rate_limiter
@@ -236,12 +249,12 @@ class MobileAPIScanner(ScanModule):
                         if "disable" in response_text or "bypass" in response_text:
                             findings.append(Finding(
                                 name="Certificate Pinning Bypass Indicator",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description="Certificate pinning configuration suggests bypass capability",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Pinning bypass indicators found in config"],
-                                cwe="CWE-295",
+                                cwe_id="CWE-295",
                                 cvss_score=7.4,
                                 remediation="Enforce certificate pinning without bypass options. "
                                            "Remove debug/bypass flags in production.",
@@ -255,14 +268,15 @@ class MobileAPIScanner(ScanModule):
             
             if response.status_code == 200:
                 findings.append(Finding(
+                    vuln_type=VulnType.SSL_TLS_ISSUE,
                     name="Server-Side Certificate Pinning Not Enforced",
-                    severity="INFO",
-                    confidence="MEDIUM",
+                    severity=Severity.INFO,
+                    confidence_score=65.0,
                     description="Server accepts connections without mutual TLS/cert pinning. "
                                "Client-side pinning should still be tested on mobile app.",
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=["API responds without certificate validation"],
-                    cwe="CWE-295",
+                    cwe_id="CWE-295",
                     remediation="Consider implementing mutual TLS for sensitive mobile APIs.",
                 ))
                 
@@ -344,21 +358,21 @@ class MobileAPIScanner(ScanModule):
                             if "token" in str(data).lower() or "success" in str(data).lower():
                                 findings.append(Finding(
                                     name="Weak Device Binding",
-                                    severity="HIGH",
-                                    confidence="MEDIUM",
+                                    severity=Severity.HIGH,
+                                    confidence_score=65.0,
                                     description="Device registration accepts arbitrary device IDs "
                                                "without proper validation",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Fake device ID accepted: {fake_device_ids[0][:16]}...",
                                         "Device registered successfully",
                                     ],
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     cvss_score=7.5,
                                     remediation="Implement proper device attestation (SafetyNet/DeviceCheck). "
                                                "Validate device fingerprints server-side.",
                                 ))
-                                break
+                                # BUG-FIX 2026-02-08: Removed break - continue testing other variations
                         except json.JSONDecodeError:
                             pass
                             
@@ -430,22 +444,22 @@ class MobileAPIScanner(ScanModule):
                             if any(ind in str(data).lower() for ind in success_indicators):
                                 findings.append(Finding(
                                     name="Biometric Authentication Bypass",
-                                    severity="CRITICAL",
-                                    confidence="MEDIUM",
+                                    severity=Severity.CRITICAL,
+                                    confidence_score=65.0,
                                     description="Biometric verification may be bypassable via "
                                                "parameter manipulation",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Bypass payload: {json.dumps(payload)}",
                                         "Authentication success indicators in response",
                                     ],
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     cvss_score=9.1,
                                     remediation="Verify biometric results server-side. "
                                                "Use platform APIs (LAContext, BiometricPrompt) properly. "
                                                "Never trust client-supplied verification results.",
                                 ))
-                                break
+                                # BUG-FIX 2026-02-08: Removed break - continue testing other variations
                         except json.JSONDecodeError:
                             pass
                             
@@ -488,22 +502,22 @@ class MobileAPIScanner(ScanModule):
                         if "X-Device-Attestation" in headers:
                             findings.append(Finding(
                                 name="Client-Side Root Detection Only",
-                                severity="MEDIUM",
-                                confidence="LOW",
+                                severity=Severity.MEDIUM,
+                                confidence_score=40.0,
                                 description="API accepts self-reported device integrity status. "
                                            "Root/jailbreak detection may be bypassable.",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     "Request with fake integrity headers accepted",
                                     f"Headers: {list(headers.keys())}",
                                 ],
-                                cwe="CWE-602",
+                                cwe_id="CWE-602",
                                 cvss_score=5.3,
                                 remediation="Implement server-side device attestation verification "
                                            "(SafetyNet Attestation API, DeviceCheck). "
                                            "Don't trust client-reported integrity status.",
                             ))
-                            break
+                            # BUG-FIX 2026-02-08: Removed break - continue testing other payloads
                             
                 except Exception as e:
                     logger.debug(f"Error testing root detection: {e}")
@@ -556,15 +570,15 @@ class MobileAPIScanner(ScanModule):
                         findings.append(Finding(
                             name=f"Sensitive Data Exposure - {pattern_name}",
                             severity=severity,
-                            confidence="HIGH",
+                            confidence_score=85.0,
                             description=f"API response contains exposed {pattern_name}",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Pattern: {pattern_name}",
                                 f"Matches found: {len(matches)}",
                                 f"Sample (redacted): {redacted}",
                             ],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             cvss_score=7.5 if severity == "HIGH" else 9.1,
                             remediation="Remove sensitive data from API responses. "
                                        "Use environment variables for secrets. "
@@ -616,15 +630,15 @@ class MobileAPIScanner(ScanModule):
                 if response.status_code in [200, 201]:
                     findings.append(Finding(
                         name="Push Token Registration Without Validation",
-                        severity="MEDIUM",
-                        confidence="MEDIUM",
+                        severity=Severity.MEDIUM,
+                        confidence_score=65.0,
                         description="Push notification tokens can be registered without validation",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             "Arbitrary push token accepted",
                             "Could allow push notification hijacking",
                         ],
-                        cwe="CWE-287",
+                        cwe_id="CWE-287",
                         cvss_score=5.3,
                         remediation="Validate push tokens with FCM/APNs before registration. "
                                    "Tie tokens to authenticated sessions.",
@@ -644,12 +658,12 @@ class MobileAPIScanner(ScanModule):
                         if isinstance(data, list) and len(data) > 0:
                             findings.append(Finding(
                                 name="Push Token Enumeration",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Push notification tokens can be enumerated",
-                                matched_at=urljoin(base_url, "/api/push/tokens"),
+                                endpoint=urljoin(base_url, "/api/push/tokens"),
                                 evidence=["Token list endpoint accessible"],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 remediation="Restrict access to push token lists.",
                             ))
                     except json.JSONDecodeError:
@@ -693,12 +707,12 @@ class MobileAPIScanner(ScanModule):
                         if "*" in data_str or "wildcard" in data_str:
                             findings.append(Finding(
                                 name="Overly Permissive Deep Link Configuration",
-                                severity="MEDIUM",
-                                confidence="HIGH",
+                                severity=Severity.MEDIUM,
+                                confidence_score=85.0,
                                 description="Deep link configuration contains wildcards",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["Wildcard patterns in app links config"],
-                                cwe="CWE-284",
+                                cwe_id="CWE-284",
                                 cvss_score=5.3,
                                 remediation="Use specific path patterns. Avoid wildcards.",
                             ))
@@ -708,12 +722,12 @@ class MobileAPIScanner(ScanModule):
                             if "sha256_cert_fingerprints" not in data_str:
                                 findings.append(Finding(
                                     name="Missing Certificate Fingerprint in App Links",
-                                    severity="MEDIUM",
-                                    confidence="HIGH",
+                                    severity=Severity.MEDIUM,
+                                    confidence_score=85.0,
                                     description="Android App Links missing certificate fingerprint",
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=["No sha256_cert_fingerprints found"],
-                                    cwe="CWE-295",
+                                    cwe_id="CWE-295",
                                     remediation="Add SHA256 certificate fingerprints to assetlinks.json",
                                 ))
                                 
@@ -774,16 +788,16 @@ class MobileAPIScanner(ScanModule):
                                     if exp_value > 2592000:
                                         findings.append(Finding(
                                             name="Long-Lived Mobile Session Token",
-                                            severity="MEDIUM",
-                                            confidence="HIGH",
+                                            severity=Severity.MEDIUM,
+                                            confidence_score=85.0,
                                             description=f"Mobile token has very long expiration: {exp_value} seconds",
-                                            matched_at=url,
+                                            endpoint=url,
                                             evidence=[f"Token expires in {exp_value // 86400} days"],
-                                            cwe="CWE-613",
+                                            cwe_id="CWE-613",
                                             remediation="Use shorter token lifetimes with refresh tokens. "
                                                        "Implement proper session management.",
                                         ))
-                                        break
+                                        # BUG-FIX 2026-02-08: Removed break - continue testing other endpoints
                                         
                     except (json.JSONDecodeError, ValueError):
                         pass
@@ -824,22 +838,24 @@ class MobileAPIScanner(ScanModule):
                     "User-Agent": self.MOBILE_USER_AGENTS["ios_app"]
                 })
                 
-                if response.status_code != 404:
+                # Only 2xx responses prove the endpoint exists
+                # 404 = not found, 5xx = server error, neither is evidence
+                if 200 <= response.status_code < 300:
                     found_versions.append(version)
-                    
+
                     # Check for debug/dev versions in production
                     if any(x in version for x in ["dev", "debug", "test", "beta", "v0"]):
                         findings.append(Finding(
                             name="Development API Version Exposed",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description=f"Development/debug API version accessible: {version}",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Endpoint: {version}",
                                 f"Status: {response.status_code}",
                             ],
-                            cwe="CWE-489",
+                            cwe_id="CWE-489",
                             cvss_score=6.5,
                             remediation="Disable development API versions in production. "
                                        "Use proper environment separation.",
@@ -852,12 +868,12 @@ class MobileAPIScanner(ScanModule):
         if len(found_versions) > 2:
             findings.append(Finding(
                 name="Multiple API Versions Exposed",
-                severity="LOW",
-                confidence="HIGH",
+                severity=Severity.LOW,
+                confidence_score=85.0,
                 description="Multiple API versions accessible - older versions may have vulnerabilities",
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Found versions: {found_versions}"],
-                cwe="CWE-1104",
+                cwe_id="CWE-1104",
                 remediation="Deprecate and remove old API versions. "
                            "Document supported versions.",
             ))

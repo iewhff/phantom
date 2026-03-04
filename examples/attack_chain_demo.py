@@ -6,12 +6,13 @@ Run this script to see a full demo of attack chain analysis and visualization.
 
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analysis import AttackChainIntegration
+from analysis import AttackChainEngine, ChainVisualizer, AttackChainDashboard
 
 
 # Sample findings simulating real scan results
@@ -37,7 +38,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/graphql",
         "evidence": ["Full schema with 127 types and 89 queries exposed"],
     },
-    
+
     # Initial Access Phase
     {
         "name": "JWT Algorithm Confusion - None Algorithm",
@@ -59,7 +60,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/oauth/token",
         "evidence": ["Token issued without code_verifier parameter"],
     },
-    
+
     # Execution Phase
     {
         "name": "SQL Injection - Union Based",
@@ -81,7 +82,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/render",
         "evidence": ["Payload: {{7*7}} rendered as 49", "OS command execution confirmed"],
     },
-    
+
     # Privilege Escalation Phase
     {
         "name": "IDOR - User Profile Access",
@@ -103,7 +104,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/admin/users",
         "evidence": ["Regular user token accepted on admin endpoint"],
     },
-    
+
     # Credential Access Phase
     {
         "name": "Hardcoded API Key in Response",
@@ -125,7 +126,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://app.example.com/dashboard?token=abc123",
         "evidence": ["Token visible in URL parameters"],
     },
-    
+
     # Lateral Movement Phase
     {
         "name": "SSRF to Cloud Metadata",
@@ -147,7 +148,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://k8s.example.com:6443/api/v1/pods",
         "evidence": ["Listed all pods in cluster", "Service account tokens exposed"],
     },
-    
+
     # Collection Phase
     {
         "name": "Mass Assignment - PII Exposure",
@@ -169,7 +170,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/download?file=../../../etc/passwd",
         "evidence": ["Successfully read /etc/passwd", "Database credentials in .env"],
     },
-    
+
     # Defense Evasion
     {
         "name": "WAF Bypass via HTTP Parameter Pollution",
@@ -191,7 +192,7 @@ SAMPLE_FINDINGS = [
         "matched_at": "https://api.example.com/login",
         "evidence": ["X-Forwarded-For rotation bypasses rate limit"],
     },
-    
+
     # Impact Phase
     {
         "name": "Account Takeover Chain",
@@ -209,72 +210,61 @@ SAMPLE_FINDINGS = [
 async def run_demo():
     """Run the attack chain analysis demo."""
     print("""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                    🔗 ATTACK CHAIN ENGINE DEMO                              ║
-║                                                                              ║
-║  This demo shows how the Attack Chain Engine:                               ║
-║  • Links isolated vulnerabilities into attack chains                        ║
-║  • Maps to MITRE ATT&CK framework                                           ║
-║  • Calculates business impact                                               ║
-║  • Generates visual reports                                                  ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+====================================================================
+              ATTACK CHAIN ENGINE DEMO
+====================================================================
     """)
-    
-    # Initialize integration
-    integration = AttackChainIntegration(output_dir="reports/demo")
-    
+
+    output_dir = Path("reports/demo")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    engine = AttackChainEngine()
+    visualizer = ChainVisualizer()
+
     # Analyze findings
-    print("\n[1/5] 🔍 Analyzing vulnerabilities...")
-    chains = await integration.analyze_from_scan_results(
-        findings=SAMPLE_FINDINGS,
-        target="example.com"
-    )
-    print(f"       ✅ Found {len(chains)} attack chains")
-    
+    print("[1/4] Analyzing vulnerabilities...")
+    chains = await engine.analyze_findings(SAMPLE_FINDINGS)
+    print(f"       Found {len(chains)} attack chains")
+
     # Show ASCII report preview
-    print("\n[2/5] 📊 Generating ASCII visualization...")
-    ascii_report = integration.generate_ascii_report()
-    
-    # Show first chain only in preview
-    lines = ascii_report.split("\n")
-    preview_end = min(80, len(lines))
-    print("\n" + "\n".join(lines[:preview_end]))
-    if len(lines) > preview_end:
-        print(f"\n       ... (truncated, full report saved to file)")
-    
+    print("\n[2/4] Generating ASCII visualization...")
+    for i, chain in enumerate(chains[:3], 1):
+        print(f"\n[Chain {i}/{len(chains)}]")
+        print(visualizer.generate_ascii(chain))
+        print("-" * 70)
+
+    if len(chains) > 3:
+        print(f"\n       ... and {len(chains) - 3} more chains")
+
     # Executive summary
-    print("\n[3/5] 📋 Generating executive summary...")
-    summary = integration.get_executive_summary()
-    print(summary)
-    
-    # Remediation roadmap
-    print("\n[4/5] 🗺️ Generating remediation roadmap...")
-    roadmap = integration.get_remediation_roadmap()
-    print("\n  TOP 5 PRIORITY FIXES:")
-    for i, item in enumerate(roadmap[:5], 1):
-        print(f"  {i}. [{item['priority_score']:.1f}] {item['vulnerability']}")
-        print(f"     → {item['endpoint'][:60]}")
-        print(f"     → In {item['chain_count']} chain(s)")
-    
+    print("\n[3/4] Executive summary...")
+    summary = engine.get_executive_summary()
+    print(f"  Total chains: {summary['total_chains']}")
+    print(f"  Critical: {summary['critical_chains']}")
+    print(f"  High priority: {summary['high_priority_chains']}")
+
     # Save reports
-    print("\n[5/5] 💾 Saving all reports...")
-    saved_files = await integration.save_all_reports(target="example.com", prefix="demo")
-    
-    print("\n  📁 SAVED FILES:")
-    for format_name, path in saved_files.items():
-        print(f"     • {format_name}: {path}")
-    
-    print("""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  ✅ DEMO COMPLETE                                                            ║
-║                                                                              ║
-║  Open the HTML files in your browser to see interactive visualizations:     ║
-║  • *_report.html   - Static HTML report                                     ║
-║  • *_dashboard.html - Interactive dashboard with charts                     ║
-║                                                                              ║
-║  The JSON file can be imported into your SIEM or ticketing system.          ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-    """)
+    print("\n[4/4] Saving reports...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # HTML report
+    html_path = output_dir / f"demo_{timestamp}_report.html"
+    html_path.write_text(visualizer.generate_html_report(chains, "example.com"), encoding="utf-8")
+    print(f"  HTML report: {html_path}")
+
+    # Dashboard
+    dashboard = AttackChainDashboard()
+    dashboard.set_data(chains, SAMPLE_FINDINGS)
+    dash_path = output_dir / f"demo_{timestamp}_dashboard.html"
+    dash_path.write_text(dashboard.generate_dashboard("example.com"), encoding="utf-8")
+    print(f"  Dashboard:   {dash_path}")
+
+    # JSON
+    json_path = output_dir / f"demo_{timestamp}.json"
+    json_path.write_text(visualizer.generate_json(chains), encoding="utf-8")
+    print(f"  JSON export: {json_path}")
+
+    print("\n  Open the HTML files in your browser to see interactive visualizations.")
 
 
 if __name__ == "__main__":

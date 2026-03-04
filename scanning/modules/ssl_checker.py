@@ -36,16 +36,18 @@ from __future__ import annotations
 import asyncio
 import ssl
 import socket
-import struct
 import hashlib
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, VulnCategory, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -133,7 +135,7 @@ class TLSVulnResult:
     vulnerable: bool
     evidence: list[str]
     cve: Optional[str] = None
-    cvss: float = 0.0
+    cvss_score: float = 0.0
 
 
 class SSLChecker(ScanModule):
@@ -387,9 +389,18 @@ class SSLChecker(ScanModule):
         "ECDH": 256,
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = getattr(settings.timeouts, 'request_timeout', 30)
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        # OPTIMIZATION: Use shorter socket timeout to prevent hangs on unresponsive hosts
+        # Individual socket operations should not take more than 10 seconds
+        request_timeout = getattr(settings.timeouts, 'request_timeout', 30)
+        self.timeout = min(request_timeout, 10)  # Cap at 10 seconds
         self._orchestrator: Optional["LinuxToolsOrchestrator"] = None
         self._use_external_tools = getattr(settings, 'use_linux_tools', True)
 
@@ -483,17 +494,19 @@ class SSLChecker(ScanModule):
             cwe = "CWE-295"  # Improper Certificate Validation
 
         return Finding(
-            type=finding_dict.get("type", "ssl_external_tool"),
+            vuln_type=VulnType.SSL_TLS_ISSUE,
+            category=VulnCategory.CRYPTOGRAPHY,
             name=finding_dict.get("name", "SSL Issue"),
-            severity=severity,
-            confidence=90.0,  # High confidence from external tools
+            severity=Severity(severity),
+            confidence_score=90.0,  # High confidence from external tools
             description=finding_dict.get("description", ""),
             host=hostname,
-            matched_at=f"{hostname}:{port}",
+            endpoint=f"{hostname}:{port}",
             evidence=[str(finding_dict.get("metadata", {}))],
             cvss_score=self._severity_to_cvss(severity),
-            cwe=cwe,
+            cwe_id=cwe,
             remediation=self._get_ssl_remediation(finding_dict),
+            scanner="ssl",
             metadata=finding_dict.get("metadata", {}),
         )
 
@@ -507,9 +520,10 @@ class SSLChecker(ScanModule):
         new_type = new_finding.get("type", "").lower()
 
         for existing in existing_findings:
+            existing_type = existing.vuln_type.value.lower()
             if (
-                new_type in existing.type.lower() or
-                existing.type.lower() in new_type or
+                new_type in existing_type or
+                existing_type in new_type or
                 new_name in existing.name.lower() or
                 existing.name.lower() in new_name
             ):
@@ -583,6 +597,11 @@ class SSLChecker(ScanModule):
         - Wasted time/resources
         - Duplicate findings requiring deduplication
         """
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         logger.info(f"[SSL Enterprise v2.0] Starting comprehensive scan on {host}")
 
         findings = []
@@ -648,37 +667,51 @@ class SSLChecker(ScanModule):
                 # External tools not available or didn't find enough - run full internal scan
                 logger.info("[SSL] Running full internal SSL analysis")
 
+                # OPTIMIZATION: Early termination helper
+                max_findings = 10
+
+                def should_continue() -> bool:
+                    if len(findings) >= max_findings:
+                        logger.info(f"[SSL] Reached {len(findings)} findings, limiting further tests")
+                        return False
+                    return True
+
                 # Phase 2: Protocol Version Testing
                 proto_findings = await self._test_protocols(hostname, port, rate_limiter)
                 findings.extend(proto_findings)
 
-                # Phase 3: Cipher Suite Analysis
-                cipher_findings, cipher_info = await self._analyze_ciphers(hostname, port)
-                findings.extend(cipher_findings)
-                if cipher_info:
-                    info_items.append({"type": "cipher_info", "ciphers": cipher_info})
+                if should_continue():
+                    # Phase 3: Cipher Suite Analysis
+                    cipher_findings, cipher_info = await self._analyze_ciphers(hostname, port)
+                    findings.extend(cipher_findings)
+                    if cipher_info:
+                        info_items.append({"type": "cipher_info", "ciphers": cipher_info})
 
-                # Phase 4: Known Vulnerability Testing
-                vuln_findings = await self._test_vulnerabilities(hostname, port, rate_limiter)
-                findings.extend(vuln_findings)
+                if should_continue():
+                    # Phase 4: Known Vulnerability Testing
+                    vuln_findings = await self._test_vulnerabilities(hostname, port, rate_limiter)
+                    findings.extend(vuln_findings)
 
-                # Phase 5: Security Headers (HSTS, etc.)
+                # Phase 5: Security Headers (HSTS, etc.) - ALWAYS RUN (fast)
                 header_findings = await self._check_security_headers(hostname, port)
                 findings.extend(header_findings)
 
-                # Phase 6: Key Exchange Analysis
-                kex_findings = await self._analyze_key_exchange(hostname, port)
-                findings.extend(kex_findings)
+                if should_continue():
+                    # Phase 6: Key Exchange Analysis
+                    kex_findings = await self._analyze_key_exchange(hostname, port)
+                    findings.extend(kex_findings)
 
-                # Phase 7: Forward Secrecy Check
-                pfs_findings = await self._check_forward_secrecy(hostname, port)
-                findings.extend(pfs_findings)
+                if should_continue():
+                    # Phase 7: Forward Secrecy Check
+                    pfs_findings = await self._check_forward_secrecy(hostname, port)
+                    findings.extend(pfs_findings)
 
-                # Phase 8: Compression Check (CRIME/BREACH)
-                compression_findings = await self._check_compression(hostname, port)
-                findings.extend(compression_findings)
+                if should_continue():
+                    # Phase 8: Compression Check (CRIME/BREACH)
+                    compression_findings = await self._check_compression(hostname, port)
+                    findings.extend(compression_findings)
 
-                # Phase 9: TLS 1.3 Features
+                # Phase 9: TLS 1.3 Features (just informational, always run)
                 tls13_info = await self._check_tls13_features(hostname, port)
                 if tls13_info:
                     info_items.append(tls13_info)
@@ -690,7 +723,7 @@ class SSLChecker(ScanModule):
         findings = self._deduplicate_findings(findings)
 
         logger.info(f"[SSL Enterprise v2.0] Found {len(findings)} issues on {host}")
-        return {"vulns": [f.to_dict() for f in findings], "info": info_items}
+        return {"findings": [f.to_dict() for f in findings], "info": info_items}
 
     def _deduplicate_findings(self, findings: list[Finding]) -> list[Finding]:
         """Remove duplicate findings, keeping the one with most detail."""
@@ -702,7 +735,7 @@ class SSLChecker(ScanModule):
         for finding in findings:
             # Create a key based on type and general issue
             key_parts = [
-                finding.type.lower(),
+                finding.vuln_type.value.lower(),
                 self._normalize_finding_name(finding.name),
             ]
             key = ":".join(key_parts)
@@ -808,19 +841,20 @@ class SSLChecker(ScanModule):
                 
                 if days_remaining < 0:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="Expired SSL Certificate",
-                        severity="CRITICAL",
-                        confidence="HIGH",
+                        severity=Severity.CRITICAL,
+                        confidence_score=85.0,
                         description=f"SSL certificate expired {abs(days_remaining)} days ago on {not_after.strftime('%Y-%m-%d')}",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Certificate expired: {not_after}",
                             f"Days since expiration: {abs(days_remaining)}",
                         ],
                         cvss_score=9.0,
-                        cwe="CWE-295",
+                        cwe_id="CWE-295",
                         remediation=(
                             "1. Renew the SSL certificate immediately\n"
                             "2. Set up certificate expiration monitoring\n"
@@ -829,32 +863,34 @@ class SSLChecker(ScanModule):
                     ))
                 elif days_remaining < 7:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="SSL Certificate Expiring in Less Than 7 Days",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"SSL certificate expires in {days_remaining} days",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Expiration date: {not_after}",
                             f"Days remaining: {days_remaining}",
                         ],
                         cvss_score=7.0,
-                        cwe="CWE-295",
+                        cwe_id="CWE-295",
                         remediation="Renew certificate urgently",
                     ))
                 elif days_remaining < 30:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="SSL Certificate Expiring Soon",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description=f"SSL certificate expires in {days_remaining} days",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         cvss_score=4.0,
-                        cwe="CWE-295",
+                        cwe_id="CWE-295",
                         remediation="Plan certificate renewal before expiration",
                     ))
                 
@@ -869,39 +905,41 @@ class SSLChecker(ScanModule):
                 
                 if not hostname_valid:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="SSL Certificate Hostname Mismatch",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Certificate doesn't match hostname {hostname}",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Requested hostname: {hostname}",
                             f"Certificate CN: {cn}",
                             f"SANs: {', '.join(san[:5])}...",
                         ],
                         cvss_score=7.5,
-                        cwe="CWE-295",
+                        cwe_id="CWE-295",
                         remediation="Obtain certificate with correct hostname in CN or SAN",
                     ))
                 
                 # Check 3: Self-signed certificate
                 if self_signed:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="Self-Signed SSL Certificate",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="Certificate is self-signed (not issued by trusted CA)",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Subject: {subject.get('commonName', '')}",
                             f"Issuer: {issuer.get('commonName', '')}",
                         ],
                         cvss_score=5.0,
-                        cwe="CWE-295",
+                        cwe_id="CWE-295",
                         remediation="Use certificate from trusted Certificate Authority",
                     ))
                 
@@ -909,30 +947,32 @@ class SSLChecker(ScanModule):
                 sig_alg = cert_info.signature_algorithm.lower()
                 if "md5" in sig_alg or "sha1" in sig_alg:
                     findings.append(Finding(
-                        type="ssl_certificate",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="Weak Certificate Signature Algorithm",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description=f"Certificate uses weak signature algorithm: {cert_info.signature_algorithm}",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[f"Signature algorithm: {cert_info.signature_algorithm}"],
                         cvss_score=5.3,
-                        cwe="CWE-327",
+                        cwe_id="CWE-327",
                         remediation="Reissue certificate with SHA-256 or stronger signature",
                     ))
                     
         except ssl.SSLCertVerificationError as e:
             findings.append(Finding(
-                type="ssl_certificate",
+                vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                 name="SSL Certificate Verification Failed",
-                severity="HIGH",
-                confidence="HIGH",
+                severity=Severity.HIGH,
+                confidence_score=85.0,
                 description=f"Certificate verification failed: {str(e)[:200]}",
                 host=hostname,
-                matched_at=f"{hostname}:{port}",
+                endpoint=f"{hostname}:{port}",
                 cvss_score=7.5,
-                cwe="CWE-295",
+                cwe_id="CWE-295",
                 remediation="Fix certificate chain or obtain valid certificate from trusted CA",
             ))
         except Exception as e:
@@ -985,20 +1025,21 @@ class SSLChecker(ScanModule):
                 
                 if supported:
                     findings.append(Finding(
-                        type="ssl_protocol",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name=f"Deprecated Protocol Supported: {version_name}",
-                        severity=severity,
-                        confidence="HIGH",
+                        severity=Severity(severity),
+                        confidence_score=85.0,
                         description=f"Server supports deprecated {version_name} protocol which is vulnerable to known attacks",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Protocol: {version_name}",
                             f"Actual version negotiated: {actual_version}",
                             "Deprecated by RFC 8996",
                         ],
                         cvss_score=cvss,
-                        cwe=cwe,
+                        cwe_id=cwe,
                         remediation=(
                             f"1. Disable {version_name} on the server\n"
                             "2. Require TLS 1.2 or TLS 1.3 as minimum\n"
@@ -1007,57 +1048,62 @@ class SSLChecker(ScanModule):
                             "   - Nginx: ssl_protocols TLSv1.2 TLSv1.3;"
                         ),
                     ))
-                    
-            except Exception:
-                pass
-        
+
+            except Exception as e:
+                # FIX 2026-02-12: Log for audit (DEBUG since protocol not supported is expected)
+                logger.debug(f"[SSL] Weak protocol test error: {e}")
+
         # Test for SSLv3 (POODLE)
         await rate_limiter.acquire()
         try:
             sslv3_supported = await self._test_sslv3(hostname, port)
             if sslv3_supported:
                 findings.append(Finding(
-                    type="ssl_protocol",
+                    vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                     name="SSLv3 Protocol Supported (POODLE Vulnerable)",
-                    severity="HIGH",
-                    confidence="HIGH",
+                    severity=Severity.HIGH,
+                    confidence_score=85.0,
                     description="Server supports SSLv3, vulnerable to POODLE attack",
                     host=hostname,
-                    matched_at=f"{hostname}:{port}",
+                    endpoint=f"{hostname}:{port}",
                     evidence=[
                         "SSLv3 protocol enabled",
                         "Vulnerable to CVE-2014-3566 (POODLE)",
                     ],
                     cvss_score=7.5,
-                    cwe="CWE-327",
+                    cwe_id="CWE-327",
                     remediation="Disable SSLv3 completely. Use TLS 1.2+ only.",
                 ))
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log for audit (DEBUG since SSLv3 not supported is expected)
+            logger.debug(f"[SSL] SSLv3 test error: {e}")
+
         # Check for TLS 1.3 support
         await rate_limiter.acquire()
         try:
             tls13_supported = await self._test_tls13(hostname, port)
             if not tls13_supported:
                 findings.append(Finding(
-                    type="ssl_protocol",
+                    vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                     name="TLS 1.3 Not Supported",
-                    severity="INFO",
-                    confidence="HIGH",
+                    severity=Severity.INFO,
+                    confidence_score=85.0,
                     description="Server does not support TLS 1.3 (latest protocol version)",
                     host=hostname,
-                    matched_at=f"{hostname}:{port}",
+                    endpoint=f"{hostname}:{port}",
                     evidence=["TLS 1.3 not available"],
                     cvss_score=0.0,
-                    cwe="CWE-757",
+                    cwe_id="CWE-757",
                     remediation="Enable TLS 1.3 support for improved security and performance",
                 ))
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # FIX 2026-02-12: Log for audit (DEBUG since TLS 1.3 not supported is common)
+            logger.debug(f"[SSL] TLS 1.3 test error: {e}")
+
         return findings
-    
+
     async def _test_sslv3(self, hostname: str, port: int) -> bool:
         """Test for SSLv3 support."""
         try:
@@ -1161,20 +1207,21 @@ class SSLChecker(ScanModule):
                 for pattern, description in self.INSECURE_CIPHERS:
                     if re.search(pattern, cipher_name, re.I):
                         findings.append(Finding(
-                            type="ssl_cipher",
+                            vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                             name=f"Insecure Cipher in Use: {cipher_name}",
-                            severity="HIGH",
-                            confidence="HIGH",
+                            severity=Severity.HIGH,
+                            confidence_score=85.0,
                             description=f"Server selected insecure cipher: {description}",
                             host=hostname,
-                            matched_at=f"{hostname}:{port}",
+                            endpoint=f"{hostname}:{port}",
                             evidence=[
                                 f"Cipher: {cipher_name}",
                                 f"Issue: {description}",
                                 f"Protocol: {protocol}",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-327",
+                            cwe_id="CWE-327",
                             remediation="Configure server to use only secure ciphers (AES-GCM, ChaCha20)",
                         ))
                         break
@@ -1183,19 +1230,20 @@ class SSLChecker(ScanModule):
                 for pattern, description in self.WEAK_CIPHERS:
                     if re.search(pattern, cipher_name, re.I):
                         findings.append(Finding(
-                            type="ssl_cipher",
+                            vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                             name=f"Weak Cipher in Use: {cipher_name}",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description=f"Server selected cipher with known weaknesses: {description}",
                             host=hostname,
-                            matched_at=f"{hostname}:{port}",
+                            endpoint=f"{hostname}:{port}",
                             evidence=[
                                 f"Cipher: {cipher_name}",
                                 f"Weakness: {description}",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-327",
+                            cwe_id="CWE-327",
                             remediation="Prefer AEAD ciphers (GCM, ChaCha20-Poly1305)",
                         ))
                         break
@@ -1203,16 +1251,17 @@ class SSLChecker(ScanModule):
                 # Check key size
                 if key_bits and key_bits < 128:
                     findings.append(Finding(
-                        type="ssl_cipher",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="Weak Cipher Key Size",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Cipher uses only {key_bits}-bit key (minimum 128-bit recommended)",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[f"Key size: {key_bits} bits"],
                         cvss_score=7.5,
-                        cwe="CWE-326",
+                        cwe_id="CWE-326",
                         remediation="Use ciphers with at least 128-bit keys (AES-128, AES-256)",
                     ))
                     
@@ -1236,16 +1285,17 @@ class SSLChecker(ScanModule):
         if heartbleed_result.vulnerable:
             cve_info = self.CVE_DATABASE[TLSVulnerability.HEARTBLEED]
             findings.append(Finding(
-                type="ssl_vulnerability",
+                vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                 name=f"Heartbleed Vulnerability ({cve_info['cve']})",
-                severity="CRITICAL",
-                confidence="HIGH",
+                severity=Severity.CRITICAL,
+                confidence_score=85.0,
                 description=cve_info["description"],
                 host=hostname,
-                matched_at=f"{hostname}:{port}",
+                endpoint=f"{hostname}:{port}",
                 evidence=heartbleed_result.evidence,
                 cvss_score=cve_info["cvss"],
-                cwe="CWE-126",
+                cwe_id="CWE-126",
                 remediation=(
                     "1. Update OpenSSL to version 1.0.1g or later\n"
                     "2. Regenerate all SSL certificates and private keys\n"
@@ -1306,25 +1356,24 @@ class SSLChecker(ScanModule):
         findings = []
         
         try:
-            import httpx
-            
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
-                response = await client.get(f"https://{hostname}:{port}/")
+            async with get_scan_client(verify_ssl=False, timeout=10) as client:
+                response = await client.get(f"https://{hostname}:{port}/", timeout=10.0)
                 
                 # Check HSTS
                 hsts = response.headers.get("strict-transport-security", "")
                 if not hsts:
                     findings.append(Finding(
-                        type="ssl_header",
+                        vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+                        category=VulnCategory.CONFIGURATION,
                         name="Missing HSTS Header",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="HTTP Strict Transport Security header not present",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=["Strict-Transport-Security header missing"],
                         cvss_score=5.0,
-                        cwe="CWE-319",
+                        cwe_id="CWE-319",
                         remediation=(
                             "Add HSTS header:\n"
                             "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload"
@@ -1338,31 +1387,33 @@ class SSLChecker(ScanModule):
                             max_age = int(max_age_match.group(1))
                             if max_age < 31536000:  # Less than 1 year
                                 findings.append(Finding(
-                                    type="ssl_header",
+                                    vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+                        category=VulnCategory.CONFIGURATION,
                                     name="Short HSTS Max-Age",
-                                    severity="LOW",
-                                    confidence="HIGH",
+                                    severity=Severity.LOW,
+                                    confidence_score=85.0,
                                     description=f"HSTS max-age is {max_age} seconds (less than recommended 1 year)",
                                     host=hostname,
-                                    matched_at=f"{hostname}:{port}",
+                                    endpoint=f"{hostname}:{port}",
                                     evidence=[f"Current: {hsts}"],
                                     cvss_score=2.0,
-                                    cwe="CWE-319",
+                                    cwe_id="CWE-319",
                                     remediation="Set max-age to at least 31536000 (1 year)",
                                 ))
                     
                     if "includesubdomains" not in hsts.lower():
                         findings.append(Finding(
-                            type="ssl_header",
+                            vuln_type=VulnType.SECURITY_HEADERS_MISSING,
+                        category=VulnCategory.CONFIGURATION,
                             name="HSTS Missing includeSubDomains",
-                            severity="LOW",
-                            confidence="HIGH",
+                            severity=Severity.LOW,
+                            confidence_score=85.0,
                             description="HSTS header doesn't include subdomains directive",
                             host=hostname,
-                            matched_at=f"{hostname}:{port}",
+                            endpoint=f"{hostname}:{port}",
                             evidence=[f"Current: {hsts}"],
                             cvss_score=2.0,
-                            cwe="CWE-319",
+                            cwe_id="CWE-319",
                             remediation="Add includeSubDomains to HSTS header",
                         ))
                         
@@ -1405,35 +1456,37 @@ class SSLChecker(ScanModule):
                 # Check for RSA key exchange (no PFS)
                 if cipher_name.startswith("TLS_RSA") or cipher_name.startswith("RSA"):
                     findings.append(Finding(
-                        type="ssl_kex",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="RSA Key Exchange (No Forward Secrecy)",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="Server uses RSA key exchange which doesn't provide Perfect Forward Secrecy",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[
                             f"Cipher: {cipher_name}",
                             "RSA key exchange doesn't provide PFS",
                         ],
                         cvss_score=4.0,
-                        cwe="CWE-320",
+                        cwe_id="CWE-320",
                         remediation="Configure server to prefer ECDHE or DHE key exchange",
                     ))
                 
                 # Check for static DH/ECDH
                 if "DH_" in cipher_name and "DHE" not in cipher_name:
                     findings.append(Finding(
-                        type="ssl_kex",
+                        vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                         name="Static DH Key Exchange",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="Server uses static DH key exchange (no PFS)",
                         host=hostname,
-                        matched_at=f"{hostname}:{port}",
+                        endpoint=f"{hostname}:{port}",
                         evidence=[f"Cipher: {cipher_name}"],
                         cvss_score=4.0,
-                        cwe="CWE-320",
+                        cwe_id="CWE-320",
                         remediation="Use ephemeral Diffie-Hellman (DHE/ECDHE)",
                     ))
                     
@@ -1477,16 +1530,17 @@ class SSLChecker(ScanModule):
             
             if not has_pfs:
                 findings.append(Finding(
-                    type="ssl_pfs",
+                    vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                     name="Perfect Forward Secrecy Not Enabled",
-                    severity="MEDIUM",
-                    confidence="HIGH",
+                    severity=Severity.MEDIUM,
+                    confidence_score=85.0,
                     description="Server doesn't use Perfect Forward Secrecy for selected cipher",
                     host=hostname,
-                    matched_at=f"{hostname}:{port}",
+                    endpoint=f"{hostname}:{port}",
                     evidence=["Selected cipher doesn't use ECDHE or DHE key exchange"],
                     cvss_score=4.0,
-                    cwe="CWE-320",
+                    cwe_id="CWE-320",
                     remediation=(
                         "Configure server to prefer PFS ciphers:\n"
                         "- ECDHE-ECDSA-AES256-GCM-SHA384\n"
@@ -1531,19 +1585,20 @@ class SSLChecker(ScanModule):
             if compression:
                 cve_info = self.CVE_DATABASE[TLSVulnerability.CRIME]
                 findings.append(Finding(
-                    type="ssl_vulnerability",
+                    vuln_type=VulnType.SSL_TLS_ISSUE,
+                        category=VulnCategory.CRYPTOGRAPHY,
                     name=f"TLS Compression Enabled (CRIME - {cve_info['cve']})",
-                    severity="MEDIUM",
-                    confidence="HIGH",
+                    severity=Severity.MEDIUM,
+                    confidence_score=85.0,
                     description=f"Server has TLS compression enabled, vulnerable to {cve_info['name']} attack",
                     host=hostname,
-                    matched_at=f"{hostname}:{port}",
+                    endpoint=f"{hostname}:{port}",
                     evidence=[
                         f"Compression method: {compression}",
                         "CRIME attack possible",
                     ],
                     cvss_score=cve_info["cvss"],
-                    cwe="CWE-310",
+                    cwe_id="CWE-310",
                     remediation=(
                         "Disable TLS compression:\n"
                         "- Apache: SSLCompression off\n"

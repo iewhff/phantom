@@ -18,11 +18,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
-import yaml
 
 
 # =============================================================================
@@ -548,7 +546,8 @@ class KnowledgeLoader:
                                     self._add_entry(entry)
                                     loaded_count += 1
 
-                    except Exception:
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.debug(f"Failed to load payload from {path}: {e}")
                         continue
 
         return loaded_count
@@ -591,7 +590,8 @@ class KnowledgeLoader:
                                 self._add_entry(entry)
                                 loaded_count += 1
 
-                except Exception:
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"Failed to load HackTricks from {path}: {e}")
                     continue
 
         return loaded_count
@@ -967,7 +967,7 @@ class KnowledgeLoader:
             return
 
         try:
-            with open(cache_file, 'r') as f:
+            with open(cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
 
             # Check cache expiry
@@ -996,9 +996,9 @@ class KnowledgeLoader:
 
             self._update_statistics()
 
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError, ValueError) as e:
             # Cache loading failed, start fresh
-            pass
+            logger.debug(f"Cache loading failed, starting fresh: {e}")
 
     def _save_cache(self) -> None:
         """Save knowledge base to cache."""

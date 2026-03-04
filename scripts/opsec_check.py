@@ -292,7 +292,7 @@ async def full_check():
     print(f"\n{Colors.BOLD}{Colors.MAGENTA}═══════════════════════════════════════════════════════════════════{Colors.END}")
     print(f"{Colors.BOLD}{Colors.MAGENTA}                    FULL OPSEC VERIFICATION                         {Colors.END}")
     print(f"{Colors.BOLD}{Colors.MAGENTA}═══════════════════════════════════════════════════════════════════{Colors.END}")
-    
+
     results = {
         "ip_check": False,
         "tor_available": False,
@@ -300,38 +300,38 @@ async def full_check():
         "dns_check": False,
         "advanced_opsec": False,
     }
-    
+
     # 1. Current IP
     original_ip = await check_current_ip()
     results["ip_check"] = original_ip is not None
-    
+
     # 2. Tor availability
     results["tor_available"] = await check_tor_availability()
-    
+
     # 3. Tor anonymity test
     if results["tor_available"]:
         results["tor_working"] = await test_tor_anonymity()
-    
+
     # 4. DNS leak check
     results["dns_check"] = await check_dns_leaks()
-    
+
     # 5. Advanced OPSEC
     results["advanced_opsec"] = await check_advanced_opsec()
-    
+
     # Summary
     print(f"\n{Colors.BOLD}═══════════════════════════════════════════════════════════════════{Colors.END}")
     print(f"{Colors.BOLD}                         VERIFICATION SUMMARY                        {Colors.END}")
     print(f"{Colors.BOLD}═══════════════════════════════════════════════════════════════════{Colors.END}")
-    
-    passed = sum(results.values())
+
+    passed = sum(1 for v in results.values() if v)
     total = len(results)
-    
+
     for check, result in results.items():
         icon = f"{Colors.GREEN}✅{Colors.END}" if result else f"{Colors.RED}❌{Colors.END}"
         print(f"  {icon} {check.replace('_', ' ').title()}")
-    
+
     print(f"\n  {Colors.BOLD}Result: {passed}/{total} checks passed{Colors.END}")
-    
+
     if passed == total:
         print(f"\n  {Colors.GREEN}🔒 FULL OPSEC PROTECTION VERIFIED{Colors.END}")
         print(f"  {Colors.GREEN}   You are ready for anonymous pentesting!{Colors.END}")
@@ -341,8 +341,9 @@ async def full_check():
     else:
         print(f"\n  {Colors.RED}❌ INSUFFICIENT PROTECTION{Colors.END}")
         print(f"  {Colors.RED}   Do NOT run scans with current configuration{Colors.END}")
-    
+
     return passed == total
+
 
 
 async def main():
@@ -364,7 +365,7 @@ async def main():
     # Full verification
     if full_test or paranoid_test:
         await full_check()
-        return
+        return 
     
     # Run basic checks
     print(f"{Colors.BOLD}Running security checks...{Colors.END}")

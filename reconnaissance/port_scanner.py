@@ -16,8 +16,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from utils.logger import get_logger
 
@@ -189,8 +188,12 @@ class PortScanner:
     
     async def _execute_scan(self, cmd: list[str]) -> str:
         """Execute nmap scan."""
-        timeout = self.settings.timeouts.port_scan
-        
+        # Get timeout with fallback (default 300s = 5 min)
+        try:
+            timeout = getattr(self.settings.timeouts, 'port_scan', 300)
+        except (AttributeError, TypeError):
+            timeout = 300  # 5 minute default if settings unavailable
+
         logger.debug(f"Executing: {' '.join(cmd)}")
         
         proc = await asyncio.create_subprocess_exec(
@@ -209,12 +212,12 @@ class PortScanner:
             raise TimeoutError(f"Port scan timed out after {timeout}s")
         
         if proc.returncode != 0:
-            error = stderr.decode().strip()
+            error = stderr.decode("utf-8", errors="replace").strip()
             # Nmap returns 1 sometimes for no open ports, check if output exists
             if not stdout:
                 raise RuntimeError(f"nmap failed: {error}")
-        
-        return stdout.decode()
+
+        return stdout.decode("utf-8", errors="replace")
     
     def _parse_output(self, output: str) -> list[PortInfo]:
         """Parse nmap grepable output."""
@@ -304,7 +307,7 @@ class PortScanner:
                 timeout=300,  # 5 min timeout for full scan
             )
 
-            return self._parse_masscan_output(stdout.decode())
+            return self._parse_masscan_output(stdout.decode("utf-8", errors="replace"))
 
         except asyncio.TimeoutError:
             logger.warning("[PortScanner] masscan timed out")

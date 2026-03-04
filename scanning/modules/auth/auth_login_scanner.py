@@ -29,7 +29,8 @@ from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 from utils.http_client import is_brute_force_allowed, is_bug_bounty_mode
@@ -56,7 +57,7 @@ class LoginScanner:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.max_attempts = 5  # Limit to avoid lockout
         self.discovered_login_pages: list[str] = []
 
@@ -134,7 +135,7 @@ class LoginScanner:
         """Find login pages on the target."""
         login_pages = []
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in LOGIN_PATHS:
                 await rate_limiter.acquire()
 
@@ -173,16 +174,19 @@ class LoginScanner:
         findings = []
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 response = await client.get(login_url)
                 form_data = extract_form_fields(response.text)
 
                 if not form_data:
                     return findings
 
-                username_field = form_data.get("username_field", "username")
-                password_field = form_data.get("password_field", "password")
-                action = form_data.get("action", login_url)
+                if isinstance(data, dict):
+                    username_field = form_data.get("username_field", "username")
+                if isinstance(data, dict):
+                    password_field = form_data.get("password_field", "password")
+                if isinstance(data, dict):
+                    action = form_data.get("action", login_url)
 
                 # Test limited credentials to avoid lockout
                 for username, password in ENTERPRISE_CREDENTIALS[:self.max_attempts]:
@@ -194,8 +198,9 @@ class LoginScanner:
                     }
 
                     # Include hidden fields
-                    for field, value in form_data.get("hidden_fields", {}).items():
-                        test_data[field] = value
+                    if isinstance(data, dict):
+                        for field, value in form_data.get("hidden_fields", {}).items():
+                            test_data[field] = value
 
                     try:
                         login_response = await client.post(
@@ -206,20 +211,20 @@ class LoginScanner:
 
                         if check_successful_login(login_response, response):
                             findings.append(Finding(
-                                type="authentication",
+                                vuln_type=VulnType.AUTH_BYPASS,
                                 name="Default Credentials",
-                                severity="CRITICAL",
+                                severity=Severity.CRITICAL,
                                 description=f"Default credentials found: {username}:{password}. "
                                            f"The application accepts commonly known default credentials.",
                                 host=login_url,
-                                matched_at=login_url,
+                                endpoint=login_url,
                                 evidence=[
                                     f"Username: {username}",
                                     f"Password: {password}",
                                     "Response indicates successful login",
                                 ],
                                 cvss_score=9.8,
-                                cwe="CWE-798",
+                                cwe_id="CWE-798",
                                 remediation="Change all default credentials immediately. "
                                            "Implement strong password requirements. "
                                            "Force password change on first login.",
@@ -227,7 +232,8 @@ class LoginScanner:
                                     "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication_Testing/02-Testing_for_Default_Credentials"
                                 ],
                             ).to_dict())
-                            return findings
+                            # FN-FIX 2026-02-08: Don't return - test ALL credentials
+                            # Multiple default accounts may exist (admin, guest, user, etc.)
 
                     except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
                         logger.debug(f"Login test failed: {e}")
@@ -246,21 +252,25 @@ class LoginScanner:
         findings = []
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 response = await client.get(login_url)
                 form_data = extract_form_fields(response.text)
 
                 if not form_data:
                     return findings
 
-                username_field = form_data.get("username_field", "username")
-                password_field = form_data.get("password_field", "password")
-                action = form_data.get("action", login_url)
+                if isinstance(data, dict):
+                    username_field = form_data.get("username_field", "username")
+                if isinstance(data, dict):
+                    password_field = form_data.get("password_field", "password")
+                if isinstance(data, dict):
+                    action = form_data.get("action", login_url)
 
                 failed_attempts = 0
                 blocked = False
 
-                for i in range(10):
+                # FN-FIX 2026-02-08: Increased from 10 to 25 - some systems rate limit after 20+
+                for i in range(25):
                     await rate_limiter.acquire()
 
                     test_data = {
@@ -285,21 +295,22 @@ class LoginScanner:
                     except (httpx.HTTPError, httpx.TimeoutException, OSError):
                         break
 
-                if not blocked and failed_attempts >= 10:
+                # FN-FIX 2026-02-08: Adjusted threshold from 10 to 20
+                if not blocked and failed_attempts >= 20:
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="Missing Brute Force Protection",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         description="The login page does not implement brute force protection. "
                                    "An attacker could attempt unlimited password guesses.",
                         host=login_url,
-                        matched_at=login_url,
+                        endpoint=login_url,
                         evidence=[
                             f"Completed {failed_attempts} failed login attempts",
                             "No rate limiting or account lockout detected",
                         ],
                         cvss_score=5.3,
-                        cwe="CWE-307",
+                        cwe_id="CWE-307",
                         remediation="Implement account lockout after failed attempts. "
                                    "Add CAPTCHA after failed attempts. "
                                    "Implement rate limiting on login endpoints.",
@@ -324,7 +335,7 @@ class LoginScanner:
 
         registration_paths = ["/register", "/signup", "/create-account", "/join"]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in registration_paths:
                 await rate_limiter.acquire()
 
@@ -345,16 +356,16 @@ class LoginScanner:
 
                         if not has_policy_indicator:
                             findings.append(Finding(
-                                type="authentication",
+                                vuln_type=VulnType.AUTH_BYPASS,
                                 name="Weak Password Policy Indicators",
-                                severity="LOW",
+                                severity=Severity.LOW,
                                 description="Registration page does not appear to enforce or communicate "
                                            "password complexity requirements.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=["No password policy indicators found on registration page"],
                                 cvss_score=3.7,
-                                cwe="CWE-521",
+                                cwe_id="CWE-521",
                                 remediation="Implement and display password complexity requirements.",
                             ).to_dict())
                         break
@@ -373,16 +384,20 @@ class LoginScanner:
         findings = []
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 response = await client.get(login_url)
                 form_data = extract_form_fields(response.text)
 
-                if not form_data.get("password_field"):
-                    return findings
+                if isinstance(data, dict):
+                    if not form_data.get("password_field"):
+                        return findings
 
-                username_field = form_data.get("username_field", "username")
-                password_field = form_data.get("password_field", "password")
-                action = form_data.get("action", login_url)
+                if isinstance(data, dict):
+                    username_field = form_data.get("username_field", "username")
+                if isinstance(data, dict):
+                    password_field = form_data.get("password_field", "password")
+                if isinstance(data, dict):
+                    action = form_data.get("action", login_url)
 
                 test_users = ["admin", "test", "user", "nonexistent_user_xyz123"]
                 timings = {}
@@ -396,8 +411,9 @@ class LoginScanner:
                         password_field: "wrongpassword123",
                     }
 
-                    for field, value in form_data.get("hidden_fields", {}).items():
-                        test_data[field] = value
+                    if isinstance(data, dict):
+                        for field, value in form_data.get("hidden_fields", {}).items():
+                            test_data[field] = value
 
                     start_time = time.time()
                     try:
@@ -416,20 +432,20 @@ class LoginScanner:
                 for user, timing in timings.items():
                     if abs(timing - avg_timing) > 0.5:
                         findings.append(Finding(
-                            type="authentication",
+                            vuln_type=VulnType.AUTH_BYPASS,
                             name="Account Enumeration via Timing",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description=f"Timing difference detected for user '{user}'. "
                                        f"This may allow attackers to enumerate valid usernames.",
                             host=login_url,
-                            matched_at=login_url,
+                            endpoint=login_url,
                             evidence=[
                                 f"User '{user}' timing: {timing:.3f}s",
                                 f"Average timing: {avg_timing:.3f}s",
                                 f"Difference: {abs(timing - avg_timing):.3f}s",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-203",
+                            cwe_id="CWE-203",
                             remediation="Ensure consistent response times for all login attempts. "
                                        "Use constant-time comparison functions.",
                         ).to_dict())
@@ -443,16 +459,16 @@ class LoginScanner:
 
                 if len(unique_responses) > 1:
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="Account Enumeration via Response Differences",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         description="Different error messages for valid vs invalid usernames. "
                                    "This allows attackers to enumerate valid accounts.",
                         host=login_url,
-                        matched_at=login_url,
+                        endpoint=login_url,
                         evidence=["Response messages differ based on username existence"],
                         cvss_score=5.3,
-                        cwe="CWE-204",
+                        cwe_id="CWE-204",
                         remediation="Use identical error messages for all failed login attempts. "
                                    "e.g., 'Invalid username or password'",
                     ).to_dict())
@@ -476,7 +492,7 @@ class LoginScanner:
             "/api/mfa", "/api/2fa", "/auth/mfa", "/auth/verify",
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in mfa_paths:
                 await rate_limiter.acquire()
 
@@ -489,15 +505,15 @@ class LoginScanner:
                         continue
 
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="MFA Endpoint Discovered",
-                        severity="INFO",
+                        severity=Severity.INFO,
                         description=f"MFA endpoint found at {path}. Manual testing recommended.",
                         host=base_url,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[f"Endpoint: {url}", f"Status: {resp.status_code}"],
                         cvss_score=0.0,
-                        cwe="CWE-287",
+                        cwe_id="CWE-287",
                         remediation="Ensure MFA cannot be bypassed. Test all bypass techniques.",
                     ).to_dict())
 
@@ -509,20 +525,20 @@ class LoginScanner:
                             bypass_resp = await client.get(urljoin(base_url, protected))
                             if bypass_resp.status_code == 200 and len(bypass_resp.text) > 500:
                                 findings.append(Finding(
-                                    type="authentication",
+                                    vuln_type=VulnType.AUTH_BYPASS,
                                     name="Potential MFA Bypass - Direct Access",
-                                    severity="HIGH",
+                                    severity=Severity.HIGH,
                                     description="Protected resource accessible without completing MFA. "
                                                "User may be able to skip MFA step.",
                                     host=base_url,
-                                    matched_at=urljoin(base_url, protected),
+                                    endpoint=urljoin(base_url, protected),
                                     evidence=[
                                         f"MFA at: {url}",
                                         f"Protected resource: {protected}",
                                         f"Response length: {len(bypass_resp.text)}",
                                     ],
                                     cvss_score=8.1,
-                                    cwe="CWE-287",
+                                    cwe_id="CWE-287",
                                     remediation="Enforce MFA completion before allowing access. "
                                                "Use server-side session state to track MFA status.",
                                 ).to_dict())
@@ -551,7 +567,7 @@ class LoginScanner:
             "/api/password/reset", "/api/forgot-password",
         ]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for path in reset_paths:
                 await rate_limiter.acquire()
 
@@ -564,15 +580,15 @@ class LoginScanner:
                         continue
 
                     findings.append(Finding(
-                        type="authentication",
+                        vuln_type=VulnType.AUTH_BYPASS,
                         name="Password Reset Endpoint Found",
-                        severity="INFO",
+                        severity=Severity.INFO,
                         description=f"Password reset functionality at {path}.",
                         host=base_url,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[f"Endpoint: {url}"],
                         cvss_score=0.0,
-                        cwe="CWE-640",
+                        cwe_id="CWE-640",
                         remediation="Review password reset flow for security issues.",
                     ).to_dict())
 
@@ -586,19 +602,19 @@ class LoginScanner:
 
                         if "evil.com" in evil_host_resp.text:
                             findings.append(Finding(
-                                type="authentication",
+                                vuln_type=VulnType.AUTH_BYPASS,
                                 name="Password Reset Host Header Injection",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description="Password reset may be vulnerable to host header injection. "
                                            "Reset links could be sent to attacker-controlled domain.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "Host header reflected in response",
                                     "Test header: Host: evil.com",
                                 ],
                                 cvss_score=8.1,
-                                cwe="CWE-640",
+                                cwe_id="CWE-640",
                                 remediation="Use a whitelist for allowed hosts. "
                                            "Generate absolute URLs from configuration, not headers.",
                             ).to_dict())

@@ -499,17 +499,20 @@ class UnifiedIntelligence:
         has_params = result.parameters_analyzed > 0
         has_endpoints_with_params = len(result.endpoints_with_params) > 0
 
-        # Injection modules need parameters to test
-        injection_modules = {
-            'sqli', 'xss', 'cmdi', 'nosql', 'ssti', 'crlf',
-            'xxe', 'ldap', 'ssrf', 'lfi'
-        }
-
+        # DEF-6 FIX: DON'T skip injection modules just because crawler didn't find params!
+        # This was causing massive false negatives because:
+        # 1. SPAs hide parameters in JavaScript (not visible to crawlers)
+        # 2. Modules can discover their own parameters during testing
+        # 3. Path-based injection (LFI, SSRF) doesn't need query params
+        # 4. Headers, cookies, POST bodies are injectable without visible URL params
+        #
+        # Instead of SKIPPING, we just LOG a warning. Modules will run anyway.
+        # NEVER_SKIP_MODULES in full_scanner.py provides additional protection.
         if not has_params and not has_endpoints_with_params:
-            for mod in injection_modules:
-                if mod not in skip:
-                    skip.add(mod)
-                    skip_reasons[mod] = "No injectable parameters discovered"
+            logger.warning(
+                "[Intelligence] No parameters discovered in crawl - "
+                "injection modules will still run (they discover their own params)"
+            )
 
         # Always include infrastructure modules
         infrastructure_modules = {'headers', 'ssl', 'cors', 'secrets'}

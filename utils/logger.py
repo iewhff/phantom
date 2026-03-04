@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -326,7 +327,6 @@ class PentestLogger:
     def _write_json_log(self, data: dict) -> None:
         """Write structured JSON log entry."""
         import json
-        from datetime import datetime
 
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -596,8 +596,6 @@ class PentestLogger:
 
     def log_session_end(self, summary: dict) -> None:
         """Log pentest session end."""
-        from datetime import datetime
-
         end_time = datetime.now()
         duration = (end_time - self.start_time).total_seconds()
 
@@ -675,10 +673,6 @@ def create_pentest_logger(
     )
     set_pentest_logger(logger)
     return logger
-
-
-# Import datetime for PentestLogger
-from datetime import datetime
 
 
 # Initialize default logging on import

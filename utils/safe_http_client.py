@@ -24,6 +24,7 @@ HACKERONE/BUGCROWD SAFE: This module ensures compliance with bug bounty rules:
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import re
 import json
@@ -31,7 +32,6 @@ import hashlib
 import unicodedata
 from datetime import datetime
 from typing import Any, Optional, List
-from functools import wraps
 from urllib.parse import unquote_plus
 
 import httpx
@@ -84,8 +84,8 @@ def _normalize_payload(payload: str) -> str:
     # This handles lookalike characters: ᴅROP → DROP
     try:
         normalized = unicodedata.normalize('NFKC', normalized)
-    except Exception:
-        pass
+    except (ValueError, TypeError):
+        pass  # Normalization failed - continue with unnormalized string
 
     # 4. Remove SQL comments (bypass attempt: DR/**/OP TABLE)
     # Handle: /* ... */, --, #
@@ -150,8 +150,8 @@ def _decode_base64_payloads(payload: str) -> str:
             # Only add if it looks like meaningful content (has some printable chars)
             if decoded and len(decoded) >= 4 and any(c.isalpha() for c in decoded):
                 decoded_parts.append(decoded)
-        except Exception:
-            continue
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue  # Invalid base64 or non-UTF-8 content
 
     return ' '.join(decoded_parts)
 
@@ -163,12 +163,22 @@ def _decode_base64_payloads(payload: str) -> str:
 # Track all blocked operations for audit trail
 _BLOCKED_OPERATIONS_LOG: List[dict] = []
 _SAFETY_ENABLED = True
-_AGGRESSIVE_EXPLICITLY_ALLOWED = os.environ.get("PHANTOM_ALLOW_AGGRESSIVE", "").lower() in ("1", "true", "yes", "authorized")
+# FIX 2026-02-12: Don't cache at import time - check dynamically
+# Previous version cached at import, which fails if env var set after import
+def _is_aggressive_allowed() -> bool:
+    """Check if aggressive mode is allowed (dynamic, not cached)."""
+    # Support both PATHFINDER_ and legacy PHANTOM_ env vars
+    pathfinder_val = os.environ.get("PATHFINDER_ALLOW_AGGRESSIVE", "").lower()
+    phantom_val = os.environ.get("PHANTOM_ALLOW_AGGRESSIVE", "").lower()
+    return pathfinder_val in ("1", "true", "yes", "authorized") or phantom_val in ("1", "true", "yes", "authorized")
 
 # UNRESTRICTED MODE: Bypasses ALL safety checks including ABSOLUTELY_BLOCKED_PATTERNS
 # This is for authorized penetration testing in controlled environments (labs, CTFs, etc.)
-# Requires: PHANTOM_UNRESTRICTED=i-understand-the-risks
-_UNRESTRICTED_MODE = os.environ.get("PHANTOM_UNRESTRICTED", "").lower() == "i-understand-the-risks"
+# Requires: PATHFINDER_UNRESTRICTED=i-understand-the-risks (or legacy PHANTOM_UNRESTRICTED)
+_UNRESTRICTED_MODE = (
+    os.environ.get("PATHFINDER_UNRESTRICTED", "").lower() == "i-understand-the-risks" or
+    os.environ.get("PHANTOM_UNRESTRICTED", "").lower() == "i-understand-the-risks"
+)
 
 if _UNRESTRICTED_MODE:
     logger.warning("⚠️ UNRESTRICTED MODE ENABLED - ALL SAFETY CHECKS BYPASSED")
@@ -194,12 +204,13 @@ def get_safety_mode() -> str:
     if _UNRESTRICTED_MODE:
         return "unrestricted"
 
-    mode = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+    # Support both PATHFINDER_ and legacy PHANTOM_ env vars
+    mode = os.environ.get("PATHFINDER_SAFE_MODE", os.environ.get("PHANTOM_SAFE_MODE", "safe")).lower()
 
     # SECURITY: Block aggressive mode unless explicitly authorized
-    if mode == "aggressive" and not _AGGRESSIVE_EXPLICITLY_ALLOWED:
+    if mode == "aggressive" and not _is_aggressive_allowed():
         logger.warning("🛡️ SECURITY: aggressive mode requested but not authorized. Falling back to 'standard'.")
-        logger.warning("🛡️ To enable aggressive mode, set PHANTOM_ALLOW_AGGRESSIVE=authorized")
+        logger.warning("🛡️ To enable aggressive mode, set PATHFINDER_ALLOW_AGGRESSIVE=authorized")
         return "standard"
 
     return mode
@@ -262,19 +273,18 @@ def set_aggressive_mode(enabled: bool, confirmation: str = "") -> bool:
     Returns:
         True if changed successfully, False otherwise
     """
-    global _AGGRESSIVE_EXPLICITLY_ALLOWED
-
+    # FIX 2026-02-12: Set env var instead of module-level variable
     if enabled:
         if confirmation != "authorized":
             logger.error("🛡️ SECURITY: Cannot enable aggressive mode without confirmation")
             logger.error("🛡️ Use: set_aggressive_mode(True, 'authorized')")
             return False
 
-        _AGGRESSIVE_EXPLICITLY_ALLOWED = True
+        os.environ["PHANTOM_ALLOW_AGGRESSIVE"] = "authorized"
         logger.warning("⚠️ Aggressive mode AUTHORIZED dynamically")
         return True
     else:
-        _AGGRESSIVE_EXPLICITLY_ALLOWED = False
+        os.environ.pop("PHANTOM_ALLOW_AGGRESSIVE", None)
         logger.info("✅ Aggressive mode authorization REVOKED")
         return True
 
@@ -289,7 +299,7 @@ def get_current_mode_status() -> dict:
     return {
         "safety_mode": get_safety_mode(),
         "unrestricted_enabled": _UNRESTRICTED_MODE,
-        "aggressive_authorized": _AGGRESSIVE_EXPLICITLY_ALLOWED,
+        "aggressive_authorized": _is_aggressive_allowed(),
         "safe_mode_active": is_safe_mode_active(),
         "env_vars": {
             "PHANTOM_SAFE_MODE": os.environ.get("PHANTOM_SAFE_MODE", "safe"),
@@ -636,10 +646,12 @@ class SafeHttpClient:
     def __init__(
         self,
         timeout: float = 30.0,
-        verify: bool = False,
+        # BUG-FIX 2026-02-08: Changed default from False to True for security
+        # Modules that need to disable SSL verification must do so explicitly
+        verify: bool = True,
         follow_redirects: bool = True,
-        **kwargs
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Initialize safe HTTP client."""
         self._client_kwargs = {
             "timeout": timeout,
@@ -656,7 +668,12 @@ class SafeHttpClient:
         self._client = httpx.AsyncClient(**self._client_kwargs)
         return self
     
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         """Async context manager exit."""
         if self._client:
             await self._client.aclose()
@@ -688,7 +705,7 @@ class SafeHttpClient:
                 # FIX: Properly decode bytes
                 try:
                     parts.append(data.decode("utf-8", errors="ignore"))
-                except Exception:
+                except (UnicodeDecodeError, AttributeError):
                     parts.append(str(data))
             elif isinstance(data, dict):
                 parts.append(json.dumps(data))
@@ -701,8 +718,8 @@ class SafeHttpClient:
             if isinstance(content, bytes):
                 try:
                     parts.append(content.decode("utf-8", errors="ignore"))
-                except Exception:
-                    pass
+                except (UnicodeDecodeError, AttributeError):
+                    pass  # Skip non-decodable binary content
             else:
                 parts.append(str(content))
 
@@ -725,15 +742,15 @@ class SafeHttpClient:
                             if isinstance(item, bytes):
                                 try:
                                     parts.append(item.decode("utf-8", errors="ignore"))
-                                except Exception:
-                                    pass
+                                except (UnicodeDecodeError, AttributeError):
+                                    pass  # Skip non-decodable binary content
                             elif isinstance(item, str):
                                 parts.append(item)
                     elif isinstance(file_data, bytes):
                         try:
                             parts.append(file_data.decode("utf-8", errors="ignore"))
-                        except Exception:
-                            pass
+                        except (UnicodeDecodeError, AttributeError):
+                            pass  # Skip non-decodable binary content
 
         return " ".join(parts)
     
@@ -878,7 +895,7 @@ class SafeHttpClient:
                     merged_headers = dict(existing_headers)
                     merged_headers.update(custom_headers)
                     kwargs["headers"] = merged_headers
-                except:
+                except (TypeError, ValueError, AttributeError):
                     kwargs["headers"] = custom_headers
 
         self._allowed_count += 1
@@ -942,12 +959,60 @@ _original_asyncclient = httpx.AsyncClient
 class SafeAsyncClient(httpx.AsyncClient):
     """
     Drop-in replacement for httpx.AsyncClient with safety checks.
-    
+
     This class can be used to replace httpx.AsyncClient globally,
     ensuring all HTTP operations go through safety checks.
+
+    LOCALHOST BYPASS (2026-02-16):
+    When PHANTOM_LOCALHOST_TARGET=1 or PHANTOM_NO_TOR=1 is set,
+    proxy settings are automatically removed to allow localhost scanning.
+    This is critical because Tor/SOCKS proxies cannot route to 127.0.0.1.
     """
-    
-    def __init__(self, *args, **kwargs):
+
+    # Localhost hosts that cannot be reached via proxy
+    _LOCALHOST_HOSTS = frozenset([
+        "localhost", "127.0.0.1", "::1", "0.0.0.0",
+    ])
+
+    @classmethod
+    def _is_localhost(cls, url: str) -> bool:
+        """Check if URL points to localhost."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(str(url))
+            host = (parsed.hostname or "").lower()
+            return host in cls._LOCALHOST_HOSTS
+        except Exception:
+            return False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # ═══════════════════════════════════════════════════════════════════════
+        # LOCALHOST PROXY BYPASS (2026-02-16)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Remove proxy for localhost targets - Tor/SOCKS cannot route to 127.0.0.1
+        # This is set by full_scanner.py when target is localhost
+        self._original_proxy = kwargs.get("proxy") or kwargs.get("proxies")
+
+        bypass_proxy = (
+            os.environ.get("PATHFINDER_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes") or
+            os.environ.get("PHANTOM_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes") or
+            os.environ.get("PATHFINDER_NO_TOR", "").lower() in ("1", "true", "yes") or
+            os.environ.get("PHANTOM_NO_TOR", "").lower() in ("1", "true", "yes")
+        )
+
+        if bypass_proxy:
+            removed = False
+            if "proxy" in kwargs:
+                logger.info("🔌 [SafeAsyncClient] Proxy REMOVED (PATHFINDER_NO_TOR or localhost)")
+                del kwargs["proxy"]
+                removed = True
+            if "proxies" in kwargs:
+                logger.info("🔌 [SafeAsyncClient] Proxies REMOVED (PATHFINDER_NO_TOR or localhost)")
+                del kwargs["proxies"]
+                removed = True
+            if not removed:
+                logger.debug("[SafeAsyncClient] Proxy bypass active, no proxy in kwargs")
+
         super().__init__(*args, **kwargs)
         self._blocked_count = 0
         self._allowed_count = 0
@@ -1027,7 +1092,7 @@ class SafeAsyncClient(httpx.AsyncClient):
                 # FIX: Properly decode bytes instead of str(bytes) which gives b'...'
                 try:
                     payload_parts.append(data.decode("utf-8", errors="ignore"))
-                except Exception:
+                except (UnicodeDecodeError, AttributeError):
                     payload_parts.append(str(data))
             elif isinstance(data, dict):
                 payload_parts.append(json.dumps(data))
@@ -1041,8 +1106,8 @@ class SafeAsyncClient(httpx.AsyncClient):
                 # FIX: Properly decode bytes
                 try:
                     payload_parts.append(content.decode("utf-8", errors="ignore"))
-                except Exception:
-                    pass
+                except (UnicodeDecodeError, AttributeError):
+                    pass  # Skip non-decodable binary content
             else:
                 payload_parts.append(str(content))
 
@@ -1101,7 +1166,7 @@ class SafeAsyncClient(httpx.AsyncClient):
 
         return True, ""
     
-    async def request(self, method: str, url, **kwargs):
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         allowed, reason = self._check_safety(method, str(url), **kwargs)
         if not allowed:
             self._blocked_count += 1
@@ -1142,36 +1207,54 @@ class SafeAsyncClient(httpx.AsyncClient):
                     merged_headers = dict(existing_headers)
                     merged_headers.update(custom_headers)
                     kwargs["headers"] = merged_headers
-                except:
+                except (TypeError, ValueError, AttributeError):
                     # Fallback: just use custom headers
                     kwargs["headers"] = custom_headers
 
         self._allowed_count += 1
-        return await super().request(method, url, **kwargs)
-    
-    async def get(self, url, **kwargs):
+        response = await super().request(method, url, **kwargs)
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # AUDIT-LOG FIX 2026-02-13: Log HTTP requests to audit trail
+        # ═══════════════════════════════════════════════════════════════════════
+        try:
+            from utils.audit_logger import get_audit_logger
+            audit = get_audit_logger()
+            if audit:
+                audit.log_http_request(
+                    url=str(url)[:200],  # Truncate long URLs
+                    method=method,
+                    status_code=response.status_code,
+                )
+        except Exception:
+            pass  # Audit logging is best-effort, don't break requests
+        # ═══════════════════════════════════════════════════════════════════════
+
+        return response
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
-    
-    async def head(self, url, **kwargs):
+
+    async def head(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("HEAD", url, **kwargs)
-    
-    async def options(self, url, **kwargs):
+
+    async def options(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("OPTIONS", url, **kwargs)
-    
-    async def post(self, url, **kwargs):
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("POST", url, **kwargs)
-    
-    async def put(self, url, **kwargs):
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("PUT", url, **kwargs)
-    
-    async def patch(self, url, **kwargs):
+
+    async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("PATCH", url, **kwargs)
-    
-    async def delete(self, url, **kwargs):
+
+    async def delete(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("DELETE", url, **kwargs)
 
 
-def enable_global_safety():
+def enable_global_safety() -> None:
     """
     Enable global safety by replacing httpx.AsyncClient.
     
@@ -1184,7 +1267,7 @@ def enable_global_safety():
     logger.info("🛡️ Global HTTP safety enabled - httpx.AsyncClient replaced with SafeAsyncClient")
 
 
-def disable_global_safety():
+def disable_global_safety() -> None:
     """Restore original httpx.AsyncClient."""
     httpx.AsyncClient = _original_asyncclient
     logger.info("⚠️ Global HTTP safety disabled - original httpx.AsyncClient restored")

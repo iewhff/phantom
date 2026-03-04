@@ -262,8 +262,8 @@ class AuthManager:
                     if target_ip in network:
                         return self._check_target_validity(authorized)
             except ValueError:
-                continue
-        
+                continue  # FIX 2026-02-12: Expected - invalid IP/CIDR format
+
         return False
     
     def _is_excluded_ip(self, target: str) -> bool:
@@ -282,10 +282,10 @@ class AuthManager:
                 if target_ip in network:
                     return True
             except ValueError:
-                continue
-        
+                continue  # FIX 2026-02-12: Expected - invalid IP/CIDR format
+
         return False
-    
+
     def add_target(
         self,
         target: str,

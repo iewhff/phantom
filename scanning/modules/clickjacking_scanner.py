@@ -21,14 +21,13 @@ Author: PHANTOM AI Team
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, parse_qs
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -821,6 +820,8 @@ class ClickjackingScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         endpoints: Optional[List[ClickjackEndpoint]] = None,
         **kwargs,
     ) -> List[ClickjackFinding]:
@@ -829,6 +830,8 @@ class ClickjackingScanner:
 
         Args:
             target_url: Target URL to scan
+            asset_data: Asset data with endpoints (optional)
+            rate_limiter: Rate limiter (optional)
             endpoints: Pre-configured endpoints (optional)
             **kwargs: Additional configuration
 
@@ -836,6 +839,9 @@ class ClickjackingScanner:
             List of discovered vulnerabilities
         """
         logger.info(f"[Clickjacking] Starting scan: {target_url}")
+
+        # FIX: Store rate limiter for use in HTTP requests
+        self._rate_limiter = rate_limiter
 
         # Create config if not provided
         if not self.config:
@@ -853,6 +859,14 @@ class ClickjackingScanner:
 
         logger.info(f"[Clickjacking] Scan complete. Found {len(self.findings)} vulnerabilities")
         return self.findings
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if hasattr(self, '_rate_limiter') and self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception:
+                pass  # Proceed if rate limiter fails
 
     async def _discover_endpoints(self, target_url: str) -> List[ClickjackEndpoint]:
         """Discover endpoints to test."""
@@ -911,6 +925,7 @@ class ClickjackingScanner:
 
         try:
             if self.http_client:
+                await self._acquire_rate_limit()  # FIX: Rate limit before request
                 response = await self.http_client.get(
                     endpoint.url,
                     follow_redirects=self.config.follow_redirects if self.config else True,

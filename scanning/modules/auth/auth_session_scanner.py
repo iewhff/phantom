@@ -24,7 +24,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from scanning.vuln_scanner import Finding
+from scanning.findings import Finding, Severity, VulnType
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
@@ -45,13 +46,22 @@ class SessionScanner:
     """
 
     # Session cookie indicators
+    # FN-FIX 2026-02-08: Expanded from 7 to 25+ patterns for modern apps
     SESSION_INDICATORS = [
         "session", "sess", "sid", "jsessionid",
         "phpsessid", "asp.net_sessionid", "aspsessionid",
+        # Modern auth tokens
+        "auth", "token", "jwt", "access_token", "id_token",
+        "refresh_token", "bearer", "apikey", "api_key",
+        # Framework-specific
+        "connect.sid", "express.sid", "laravel_session",
+        "django", "flask", "rails", "_session",
+        # Custom patterns
+        "login", "user", "authenticated", "identity",
     ]
 
     def __init__(self, settings: Settings) -> None:
-        self.timeout = settings.timeouts.request_timeout
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.detected_sessions: list[SessionInfo] = []
 
     async def scan(
@@ -94,7 +104,7 @@ class SessionScanner:
         await rate_limiter.acquire()
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 response = await client.get(base_url)
 
                 # Check session cookies
@@ -137,16 +147,16 @@ class SessionScanner:
         # Check for missing Secure flag
         if not getattr(cookie, 'secure', False) and base_url.startswith("https"):
             findings.append(Finding(
-                type="session",
+                vuln_type=VulnType.INSECURE_SESSION,
                 name="Session Cookie Missing Secure Flag",
-                severity="MEDIUM",
+                severity=Severity.MEDIUM,
                 description=f"Session cookie '{cookie.name}' is missing the Secure flag. "
                            f"This allows the cookie to be transmitted over unencrypted connections.",
                 host=base_url,
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Cookie: {cookie.name}", "Secure flag: Not set"],
                 cvss_score=4.3,
-                cwe="CWE-614",
+                cwe_id="CWE-614",
                 remediation="Set the Secure flag on all session cookies.",
             ).to_dict())
 
@@ -172,48 +182,48 @@ class SessionScanner:
         # Check HttpOnly
         if "httponly" not in header_lower:
             findings.append(Finding(
-                type="session",
+                vuln_type=VulnType.INSECURE_SESSION,
                 name="Session Cookie Missing HttpOnly Flag",
-                severity="MEDIUM",
+                severity=Severity.MEDIUM,
                 description="Session cookie is missing HttpOnly flag. "
                            "JavaScript can access this cookie, enabling XSS-based session theft.",
                 host=base_url,
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Set-Cookie: {header[:100]}...", "HttpOnly flag: Not set"],
                 cvss_score=4.3,
-                cwe="CWE-1004",
+                cwe_id="CWE-1004",
                 remediation="Set HttpOnly flag on all session cookies.",
             ).to_dict())
 
         # Check SameSite
         if "samesite" not in header_lower:
             findings.append(Finding(
-                type="session",
+                vuln_type=VulnType.INSECURE_SESSION,
                 name="Session Cookie Missing SameSite Attribute",
-                severity="LOW",
+                severity=Severity.LOW,
                 description="Session cookie is missing SameSite attribute. "
                            "This may allow CSRF attacks.",
                 host=base_url,
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Set-Cookie: {header[:100]}..."],
                 cvss_score=3.1,
-                cwe="CWE-1275",
+                cwe_id="CWE-1275",
                 remediation="Set SameSite=Strict or SameSite=Lax on session cookies.",
             ).to_dict())
 
         # Check for weak SameSite value
         if "samesite=none" in header_lower and "secure" not in header_lower:
             findings.append(Finding(
-                type="session",
+                vuln_type=VulnType.INSECURE_SESSION,
                 name="Session Cookie SameSite=None Without Secure",
-                severity="MEDIUM",
+                severity=Severity.MEDIUM,
                 description="Session cookie has SameSite=None without Secure flag. "
                            "Modern browsers reject this combination.",
                 host=base_url,
-                matched_at=base_url,
+                endpoint=base_url,
                 evidence=[f"Set-Cookie: {header[:100]}..."],
                 cvss_score=4.3,
-                cwe="CWE-1275",
+                cwe_id="CWE-1275",
                 remediation="When using SameSite=None, always set the Secure flag.",
             ).to_dict())
 
@@ -231,7 +241,7 @@ class SessionScanner:
         await rate_limiter.acquire()
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
                 # Get initial session
                 resp1 = await client.get(base_url)
                 initial_cookies = dict(resp1.cookies)
@@ -265,19 +275,19 @@ class SessionScanner:
                     # If session ID doesn't change, possible fixation
                     if initial_session == new_session and initial_session:
                         findings.append(Finding(
-                            type="session",
+                            vuln_type=VulnType.INSECURE_SESSION,
                             name="Potential Session Fixation",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description="Session ID does not regenerate after state change. "
                                        "An attacker may be able to fixate a session ID.",
                             host=base_url,
-                            matched_at=base_url,
+                            endpoint=base_url,
                             evidence=[
                                 f"Cookie: {session_cookie_name}",
                                 f"Session ID remained: {initial_session[:20]}...",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-384",
+                            cwe_id="CWE-384",
                             remediation="Regenerate session IDs after authentication. "
                                        "Invalidate old session IDs after login.",
                         ).to_dict())

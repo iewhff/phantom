@@ -140,9 +140,11 @@ class EndpointValidator:
                 exists = await self.endpoint_exists(base_url, path, rate_limiter)
                 return (path, exists)
 
-        results = await asyncio.gather(*[check_one(p) for p in paths])
+        results = await asyncio.gather(*[check_one(p) for p in paths], return_exceptions=True)
+        # Filter out exceptions - treat them as non-existent
+        valid_results = [r for r in results if isinstance(r, tuple)]
 
-        existing = [path for path, exists in results if exists]
+        existing = [path for path, exists in valid_results if exists]
         skipped = len(paths) - len(existing)
 
         if skipped > 0:

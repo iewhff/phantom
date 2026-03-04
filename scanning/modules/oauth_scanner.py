@@ -11,13 +11,16 @@ import json
 import re
 import secrets
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -107,9 +110,15 @@ class OAuthScanner(ScanModule):
         {"alg": "HS512"},
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.discovered_config: dict[str, Any] = {}
     
     async def scan(
@@ -119,11 +128,16 @@ class OAuthScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for OAuth/OIDC vulnerabilities."""
+        
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Discover OAuth configuration
             config = await self._discover_oauth_config(client, base_url, rate_limiter)
             self.discovered_config = config
@@ -214,16 +228,18 @@ class OAuthScanner(ScanModule):
                 if response.status_code == 200:
                     try:
                         data = response.json()
-                        config.update({
-                            "authorization_endpoint": data.get("authorization_endpoint"),
-                            "token_endpoint": data.get("token_endpoint"),
-                            "userinfo_endpoint": data.get("userinfo_endpoint"),
-                            "jwks_uri": data.get("jwks_uri"),
-                            "response_types_supported": data.get("response_types_supported", []),
-                            "grant_types_supported": data.get("grant_types_supported", []),
-                            "scopes_supported": data.get("scopes_supported", []),
-                            "issuer": data.get("issuer"),
-                        })
+                        if isinstance(asset_data, dict):
+                            config.update({
+                                "authorization_endpoint": data.get("authorization_endpoint"),
+                                "token_endpoint": data.get("token_endpoint"),
+                                "userinfo_endpoint": data.get("userinfo_endpoint"),
+                                "jwks_uri": data.get("jwks_uri"),
+                                "response_types_supported": data.get("response_types_supported", []),
+                                "grant_types_supported": data.get("grant_types_supported", []),
+                                "scopes_supported": data.get("scopes_supported", []),
+                                "issuer": data.get("issuer"),
+                            })
+
                         config["discovered_via"] = path
                         logger.info(f"OAuth config discovered at {path}")
                         return config
@@ -296,18 +312,20 @@ class OAuthScanner(ScanModule):
                     if any(bad in location.lower() for bad in ["evil.com", "javascript:", "data:"]):
                         findings.append(Finding(
                             name="OAuth Redirect URI Bypass",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description=f"OAuth redirect_uri validation can be bypassed allowing token theft",
-                            matched_at=auth_endpoint,
+                            endpoint=auth_endpoint,
                             evidence=[
                                 f"Payload: {payload}",
                                 f"Response redirected to: {location[:200]}",
                             ],
-                            cwe="CWE-601",
+                            cwe_id="CWE-601",
                             cvss_score=9.1,
                             remediation="Implement strict redirect URI validation with exact matching. "
                                        "Do not allow wildcards or pattern matching in redirect URIs.",
+                            vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                            scanner="oauth_scanner",
                         ))
                         break  # One finding is enough
                 
@@ -318,16 +336,18 @@ class OAuthScanner(ScanModule):
                         # Might be accepting the redirect
                         findings.append(Finding(
                             name="Potential OAuth Redirect URI Bypass",
-                            severity="HIGH",
-                            confidence="MEDIUM",
+                            severity=Severity.HIGH,
+                            confidence_score=65.0,
                             description="OAuth endpoint may accept arbitrary redirect URIs",
-                            matched_at=auth_endpoint,
+                            endpoint=auth_endpoint,
                             evidence=[
                                 f"Payload: {payload}",
                                 f"No explicit error returned",
                             ],
-                            cwe="CWE-601",
+                            cwe_id="CWE-601",
                             remediation="Review redirect URI validation logic.",
+                            vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                            scanner="oauth_scanner",
                         ))
                         
             except Exception as e:
@@ -372,19 +392,21 @@ class OAuthScanner(ScanModule):
                    "required" not in response.text.lower():
                     findings.append(Finding(
                         name="OAuth CSRF - Missing State Parameter",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description="OAuth flow accepts requests without state parameter, "
                                    "enabling CSRF attacks on the authorization flow",
-                        matched_at=auth_endpoint,
+                        endpoint=auth_endpoint,
                         evidence=[
                             "Request without state parameter was accepted",
                             f"Response status: {response.status_code}",
                         ],
-                        cwe="CWE-352",
+                        cwe_id="CWE-352",
                         cvss_score=7.5,
                         remediation="Require and validate state parameter in all OAuth flows. "
                                    "Use cryptographically secure random values.",
+                        vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                        scanner="oauth_scanner",
                     ))
             
             # Test with predictable state
@@ -402,13 +424,15 @@ class OAuthScanner(ScanModule):
                 if response.status_code in [200, 302]:
                     findings.append(Finding(
                         name="OAuth Weak State Parameter Accepted",
-                        severity="MEDIUM",
-                        confidence="MEDIUM",
+                        severity=Severity.MEDIUM,
+                        confidence_score=65.0,
                         description="OAuth accepts predictable state values",
-                        matched_at=auth_endpoint,
+                        endpoint=auth_endpoint,
                         evidence=[f"Weak state '{weak_state}' was accepted"],
-                        cwe="CWE-330",
+                        cwe_id="CWE-330",
                         remediation="Validate state parameter entropy and binding to user session.",
+                        vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                        scanner="oauth_scanner",
                     ))
                     break
                     
@@ -454,18 +478,20 @@ class OAuthScanner(ScanModule):
                    "pkce" not in response_text:
                     findings.append(Finding(
                         name="OAuth PKCE Not Enforced",
-                        severity="HIGH",
-                        confidence="MEDIUM",
+                        severity=Severity.HIGH,
+                        confidence_score=65.0,
                         description="Token endpoint does not require PKCE code_verifier, "
                                    "making authorization codes vulnerable to interception",
-                        matched_at=token_endpoint,
+                        endpoint=token_endpoint,
                         evidence=[
                             "Token request without code_verifier did not fail",
                             f"Response: {response.text[:200]}",
                         ],
-                        cwe="CWE-287",
+                        cwe_id="CWE-287",
                         cvss_score=7.4,
                         remediation="Enforce PKCE for all public clients and consider for confidential clients.",
+                        vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                        scanner="oauth_scanner",
                     ))
             
             # Test with mismatched code_verifier
@@ -478,21 +504,24 @@ class OAuthScanner(ScanModule):
             ).rstrip(b'=').decode()
             
             # Use different verifier
-            data["code_verifier"] = "wrong_verifier_value"
+            if isinstance(asset_data, dict):
+                data["code_verifier"] = "wrong_verifier_value"
             
             response = await client.post(token_endpoint, data=data)
             
             if response.status_code == 200:
                 findings.append(Finding(
                     name="OAuth PKCE Validation Bypass",
-                    severity="CRITICAL",
-                    confidence="HIGH",
+                    severity=Severity.CRITICAL,
+                    confidence_score=85.0,
                     description="Token endpoint accepts invalid code_verifier values",
-                    matched_at=token_endpoint,
+                    endpoint=token_endpoint,
                     evidence=["Invalid code_verifier was accepted"],
-                    cwe="CWE-287",
+                    cwe_id="CWE-287",
                     cvss_score=9.1,
                     remediation="Properly validate code_verifier against stored code_challenge.",
+                    vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                    scanner="oauth_scanner",
                 ))
                 
         except Exception as e:
@@ -557,17 +586,19 @@ class OAuthScanner(ScanModule):
                        "unauthorized" not in response.text.lower():
                         findings.append(Finding(
                             name="OAuth Scope Escalation",
-                            severity="HIGH",
-                            confidence="MEDIUM",
+                            severity=Severity.HIGH,
+                            confidence_score=65.0,
                             description=f"OAuth endpoint accepts elevated scope '{scope}'",
-                            matched_at=auth_endpoint,
+                            endpoint=auth_endpoint,
                             evidence=[
                                 f"Scope '{scope}' was accepted",
                                 f"Response status: {response.status_code}",
                             ],
-                            cwe="CWE-269",
+                            cwe_id="CWE-269",
                             cvss_score=7.5,
                             remediation="Implement strict scope validation against allowed scopes per client.",
+                            vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                            scanner="oauth_scanner",
                         ))
                         
             except Exception as e:
@@ -622,18 +653,20 @@ class OAuthScanner(ScanModule):
                     if response.status_code == 200:
                         findings.append(Finding(
                             name=f"JWT Algorithm Confusion - {alg_payload.get('alg')}",
-                            severity="CRITICAL",
-                            confidence="HIGH",
+                            severity=Severity.CRITICAL,
+                            confidence_score=85.0,
                             description=f"Server accepts JWT with '{alg_payload.get('alg')}' algorithm",
-                            matched_at=userinfo_endpoint,
+                            endpoint=userinfo_endpoint,
                             evidence=[
                                 f"Malicious JWT accepted",
                                 f"Algorithm: {alg_payload.get('alg')}",
                             ],
-                            cwe="CWE-327",
+                            cwe_id="CWE-327",
                             cvss_score=9.8,
                             remediation="Explicitly verify JWT algorithm against expected value. "
                                        "Never accept 'none' algorithm in production.",
+                            vuln_type=VulnType.JWT_VULNERABILITY,
+                            scanner="oauth_scanner",
                         ))
                         break
                         
@@ -651,22 +684,25 @@ class OAuthScanner(ScanModule):
                     jwks_data = response.json()
                     
                     # Check for weak keys
-                    for key in jwks_data.get("keys", []):
-                        if key.get("kty") == "RSA":
-                            # Check key size if 'n' is available
-                            n = key.get("n", "")
-                            if len(n) < 300:  # Roughly indicates < 2048 bits
-                                findings.append(Finding(
-                                    name="Weak RSA Key in JWKS",
-                                    severity="HIGH",
-                                    confidence="MEDIUM",
-                                    description="JWKS contains potentially weak RSA key",
-                                    matched_at=jwks_uri,
-                                    evidence=[f"Key ID: {key.get('kid')}"],
-                                    cwe="CWE-326",
-                                    remediation="Use RSA keys of at least 2048 bits.",
-                                ))
-                                
+                    if isinstance(asset_data, dict):
+                        for key in jwks_data.get("keys", []):
+                            if key.get("kty") == "RSA":
+                                # Check key size if 'n' is available
+                                n = key.get("n", "")
+                                if len(n) < 300:  # Roughly indicates < 2048 bits
+                                    findings.append(Finding(
+                                        name="Weak RSA Key in JWKS",
+                                        severity=Severity.HIGH,
+                                        confidence_score=65.0,
+                                        description="JWKS contains potentially weak RSA key",
+                                        endpoint=jwks_uri,
+                                        evidence=[f"Key ID: {key.get('kid')}"],
+                                        cwe_id="CWE-326",
+                                        remediation="Use RSA keys of at least 2048 bits.",
+                                        vuln_type=VulnType.JWT_VULNERABILITY,
+                                        scanner="oauth_scanner",
+                                    ))
+                                    
             except Exception as e:
                 logger.debug(f"Error checking JWKS: {e}")
         
@@ -714,17 +750,19 @@ class OAuthScanner(ScanModule):
                     if "unsupported_response_type" not in response.text.lower():
                         findings.append(Finding(
                             name="OAuth Implicit Flow Enabled",
-                            severity="MEDIUM",
-                            confidence="HIGH",
+                            severity=Severity.MEDIUM,
+                            confidence_score=85.0,
                             description=f"OAuth implicit flow ({response_type}) is enabled. "
                                        "Implicit flow exposes tokens in URL fragments.",
-                            matched_at=auth_endpoint,
+                            endpoint=auth_endpoint,
                             evidence=[
                                 f"Response type '{response_type}' is supported",
                             ],
-                            cwe="CWE-522",
+                            cwe_id="CWE-522",
                             cvss_score=5.3,
                             remediation="Disable implicit flow and use authorization code flow with PKCE.",
+                            vuln_type=VulnType.OAUTH_MISCONFIGURATION,
+                            scanner="oauth_scanner",
                         ))
                         break
                         
@@ -777,13 +815,15 @@ class OAuthScanner(ScanModule):
                     if re.search(pattern, response.text):
                         findings.append(Finding(
                             name="Potential Token Leakage via Referrer",
-                            severity="MEDIUM",
-                            confidence="MEDIUM",
+                            severity=Severity.MEDIUM,
+                            confidence_score=65.0,
                             description="OAuth page includes external resources that may leak tokens via Referer header",
-                            matched_at=auth_endpoint,
+                            endpoint=auth_endpoint,
                             evidence=["External resources found on OAuth page"],
-                            cwe="CWE-200",
+                            cwe_id="CWE-200",
                             remediation="Use Referrer-Policy header to prevent token leakage.",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
+                            scanner="oauth_scanner",
                         ))
                         break
                 
@@ -791,13 +831,15 @@ class OAuthScanner(ScanModule):
                 if "referrer-policy" not in [h.lower() for h in response.headers.keys()]:
                     findings.append(Finding(
                         name="Missing Referrer-Policy on OAuth Endpoint",
-                        severity="LOW",
-                        confidence="HIGH",
+                        severity=Severity.LOW,
+                        confidence_score=85.0,
                         description="OAuth endpoint missing Referrer-Policy header",
-                        matched_at=auth_endpoint,
+                        endpoint=auth_endpoint,
                         evidence=["Referrer-Policy header not set"],
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         remediation="Set Referrer-Policy: no-referrer or same-origin.",
+                        vuln_type=VulnType.INFO_DISCLOSURE,
+                        scanner="oauth_scanner",
                     ))
                     
         except Exception as e:
@@ -849,17 +891,19 @@ class OAuthScanner(ScanModule):
                 if cors_origin == "*" or "evil.com" in cors_origin:
                     findings.append(Finding(
                         name="OAuth Token Endpoint CORS Misconfiguration",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description="Token endpoint allows requests from arbitrary origins",
-                        matched_at=token_endpoint,
+                        endpoint=token_endpoint,
                         evidence=[
                             f"CORS header: {cors_origin}",
                             "Request from evil.com origin was processed",
                         ],
-                        cwe="CWE-346",
+                        cwe_id="CWE-346",
                         cvss_score=7.5,
                         remediation="Restrict CORS to specific trusted origins only.",
+                        vuln_type=VulnType.CORS_MISCONFIGURATION,
+                        scanner="oauth_scanner",
                     ))
                     
         except Exception as e:

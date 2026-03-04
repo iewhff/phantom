@@ -62,7 +62,7 @@ network_protection:
     socks_port: 9050
     control_port: 9051
     password: null
-    rotate_circuit_every: 10
+    # NOTE: Circuit rotation is configured in circuit_rotation section below
 
   # SSL/TLS verification for HTTP client
   # SECURITY: Keep verify_ssl=true in production for MITM protection
@@ -72,27 +72,29 @@ network_protection:
     verify_hostname: true      # Verify hostname matches certificate
     allow_self_signed: false   # Allow self-signed certificates (DANGEROUS)
 
-  # User-Agent settings - Consistent professional UA
+  # User-Agent settings - ROTATE for anonymity
   user_agent:
-    rotate: false
+    rotate: true
     use_realistic: true
-    custom: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 PentestFramework/2.0"
+    custom: null  # Use realistic browser UAs from pool
 
-  # Header randomization - DISABLED
+  # Header randomization - ENABLED for fingerprint evasion
   headers:
-    randomize: false
+    randomize: true
     add_dnt: true
-    
-  # IP Leak protection - DISABLED (not needed)
+
+  # IP Leak protection - ENABLED
   leak_protection:
-    check_before_scan: false
-    abort_on_leak: false
-    verify_every_n_requests: 0
-    
-  # DNS leak prevention - DISABLED
+    check_before_scan: true
+    abort_on_leak: true
+    verify_every_n_requests: 100
+
+  # DNS leak prevention - ENABLED
   dns:
-    use_proxy_dns: false
-    custom_servers: []
+    use_proxy_dns: true
+    custom_servers:
+      - "1.1.1.1"       # Cloudflare (no-log)
+      - "9.9.9.9"       # Quad9 (threat-blocking)
   
   # ═══════════════════════════════════════════════════════════════════
   # OPSEC SETTINGS - DISABLED FOR CLIENT MODE
@@ -223,8 +225,17 @@ timeouts:
   crawl: 3600              # 1 hour (was 15 min) - deep crawling
 
   # Heavy module timeouts
-  module_heavy: 3600       # 1 hour per heavy module
-  module_normal: 1800      # 30 minutes per normal module
+  module_heavy: 600        # 10 minutes per heavy module (sqli, xss, etc.)
+  module_normal: 300       # 5 minutes per normal module
+
+  # Per-phase timeouts (L9 fix: configurable phase timeouts)
+  phase_timeouts:
+    discovery: 300           # Phase 0-1: Target classification, tech intelligence
+    auth_acquisition: 180    # Phase 2.5: Auth token acquisition
+    module_execution: 7200   # Phase 3: Module execution (total)
+    proof_engine: 600        # Phase 4.2: Exploit proof engine
+    chain_analysis: 300      # Phase 4.3-4.47: Chain analysis and amplification
+    validation: 300          # Phase 5: Finding validation
 
   # AI operations
   ai_analysis: 300         # 5 minutes
@@ -447,6 +458,156 @@ scanning:
       test_origins: ["null", "https://evil.com", "http://attacker.com"]
       test_wildcard: true
       test_subdomain: true
+
+# =============================================================================
+# Scan Execution Parameters
+# =============================================================================
+# Controls for module execution timing, jitter, and circuit breaker behavior.
+# L1-L3 Fix: Previously hardcoded, now configurable.
+# =============================================================================
+scan_execution:
+  # L2 Fix: Jitter range between module starts (seconds)
+  # Prevents burst fingerprinting - random delay added between modules
+  jitter:
+    min: 0.1               # Minimum delay in seconds
+    max: 0.5               # Maximum delay in seconds
+    gaussian_sigma: 0.2    # Gaussian jitter factor (±sigma of base_delay)
+
+  # L3 Fix: Circuit breaker configuration
+  # Pauses scanning when rate limiting or blocking is detected
+  circuit_breaker:
+    max_consecutive_blocks: 3    # Pause after this many consecutive blocks
+    pause_duration: 30           # Base pause duration in seconds
+    max_backoff_multiplier: 8    # Max exponential backoff (pause * 2^n, capped)
+    reset_on_success: true       # Reset block counter on successful request
+
+  # Module concurrency
+  concurrency:
+    default: 5             # Default concurrent modules
+    waf_reduction: 2       # Reduce to max(this, concurrent // 2) if WAF detected
+
+# =============================================================================
+# Module Categories - L10 Fix: Configurable module presets
+# =============================================================================
+# Define custom module presets. These override the hardcoded CATEGORIES in
+# full_scanner.py when present. Use 'custom' category in CLI to load yours.
+# =============================================================================
+module_categories:
+  # Custom category example - create your own focused scans
+  # Uncomment and customize as needed:
+  #
+  # custom:
+  #   - sqli
+  #   - xss
+  #   - idor
+  #   - auth
+  #
+  # fast_api:
+  #   - api
+  #   - graphql
+  #   - jwt
+  #   - idor
+  #   - auth
+  #
+  # legacy_web:
+  #   - sqli
+  #   - xss
+  #   - lfi
+  #   - csrf
+  #   - headers
+
+# =============================================================================
+# Scanner Limits - Configurable limits for all scanning modules
+# =============================================================================
+# These values replace hardcoded limits scattered across modules.
+# Adjust based on target size, time budget, and thoroughness required.
+# =============================================================================
+scanner_limits:
+  # === IDOR/Access Control Testing ===
+  idor:
+    max_ids_per_endpoint: 10       # IDs to test per endpoint (was hardcoded [:10])
+    max_id_variations: 5           # ID mutation attempts (±1, ±100, etc.)
+    max_horizontal_ids: 5          # Horizontal escalation IDs to try
+    max_vertical_ids: 3            # Vertical escalation IDs (admin: 0, 1, etc.)
+
+  # === Business Logic Testing ===
+  business_logic:
+    max_negative_payloads: 14      # Negative value variations to test
+    max_boundary_tests: 10         # Boundary value tests per field
+    max_flow_variations: 5         # Workflow bypass attempts
+
+  # === SQLi/Injection Testing ===
+  injection:
+    max_payloads_per_param: 50     # Injection payloads per parameter
+    max_extraction_attempts: 20    # Data extraction queries
+    max_tamper_variations: 10      # WAF bypass variations
+
+  # === LFI/Path Traversal ===
+  lfi:
+    max_traversal_depth: 10        # Directory traversal depth (../)
+    max_wrapper_tests: 8           # PHP wrapper variations
+    max_encoding_variations: 6     # URL/Unicode encoding attempts
+
+  # === Race Condition Testing ===
+  race_condition:
+    concurrent_requests: 10        # Parallel requests per race test
+    max_race_attempts: 5           # Race condition retries
+    timing_window_ms: 100          # Window for parallel execution
+
+  # === Authentication Testing ===
+  auth:
+    max_login_attempts: 10         # Login brute-force limit
+    max_token_variations: 20       # JWT/token mutation tests
+    max_bypass_techniques: 15      # Auth bypass attempts
+
+  # === Discovery/Enumeration ===
+  discovery:
+    max_hidden_paths: 100          # Hidden admin paths to probe
+    max_endpoints_per_phase: 500   # Endpoints to process per scan phase
+    max_parameters_per_endpoint: 50 # Parameters to test per endpoint
+
+  # === Proof Engine Budgets ===
+  proof_engine:
+    safe:
+      max_requests: 0              # No requests in safe mode
+      allow_write: false
+      allow_auth: false
+    cautious:
+      max_requests: 5              # Very limited probing
+      allow_write: false
+      allow_auth: false
+    standard:
+      max_requests: 15             # Reasonable proof budget
+      allow_write: false
+      allow_auth: true
+    aggressive:
+      max_requests: 50             # Full exploitation proof
+      allow_write: true
+      allow_auth: true
+
+  # === Amplification Engine ===
+  amplification:
+    max_actions_per_finding: 10    # Amplification actions per finding
+    max_total_actions: 50          # Total amplification queue size
+    max_depth: 3                   # Amplification depth (finding → action → finding)
+
+  # === Chain Analysis ===
+  chains:
+    max_chain_length: 5            # Maximum steps in attack chain
+    max_chains_per_finding: 10     # Chains to explore per finding
+    min_confidence_threshold: 0.5  # Minimum chain confidence
+
+  # === Validation Pipeline ===
+  validation:
+    max_replay_attempts: 3         # Replay verification attempts
+    max_negative_control_tests: 2  # Negative control checks
+    timeout_per_test_ms: 5000      # Timeout for each validation test
+
+  # === General Concurrency ===
+  concurrency:
+    max_parallel_modules: 10       # Modules running in parallel
+    max_requests_per_module: 1000  # Request cap per module
+    max_findings_per_module: 500   # Finding cap (prevents flooding)
 
 # =============================================================================
 # AI Analysis Settings
@@ -915,7 +1076,7 @@ quality_assurance:
   # Verification of findings
   verify_findings: true
   retest_attempts: 3
-  manual_verification_required: true  # Flag findings for manual review
+  manual_verification_required: false  # Automatic verification via ProofEngine
   
   # Peer review
   peer_review:

@@ -23,18 +23,17 @@ Author: PHANTOM AI Team
 Version: 3.0.0
 """
 
-import re
 import hashlib
 import logging
-from enum import Enum, auto
+import time
+from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any, Callable
+from typing import Dict, List, Optional, Set, Tuple, Any
 from collections import defaultdict
 import asyncio
 
 # PHANTOM AI Components
 from phantom.tech_fingerprinter import (
-    TechFingerprinter,
     FingerprintResult,
     TechCategory,
 )
@@ -46,8 +45,6 @@ from phantom.waf_bypass_engine import (
     BehaviourFamily,
 )
 from phantom.parameter_analyzer import (
-    ParameterAnalyzer,
-    AnalysisResult,
     AnalyzedParameter,
     InferredType,
     VulnerabilityContext,
@@ -57,14 +54,48 @@ from phantom.parameter_analyzer import (
 from utils.payload_library import (
     PayloadLibrary,
     PayloadCategory,
-    Payload,
-    WAFBypassTechnique,
-    DatabaseType,
-    XSSContext,
-    PayloadEncoder,
 )
 
 logger = logging.getLogger("phantom.context_payload_selector")
+
+# =============================================================================
+# PUBLIC API (H1 FIX 2026-02-13)
+# =============================================================================
+
+__all__ = [
+    # Core classes
+    "ContextPayloadSelector",
+    "PayloadContext",
+    "RankedPayload",
+    "SelectionResult",
+    # Enums
+    "SelectionStrategy",
+    "PayloadPriority",
+    "TechPayloadAffinity",
+    # Helpers
+    "TechPayloadMapper",
+    "ContextualPayloadGenerator",
+    # Convenience functions
+    "select_payloads_for_parameter",
+]
+
+# =============================================================================
+# CONSTANTS (M1 FIX 2026-02-13)
+# =============================================================================
+
+DEFAULT_MAX_PAYLOADS = 50
+MAX_WAF_VARIANTS_PER_PAYLOAD = 3
+MAX_DB_SPECIFIC_PAYLOADS = 2
+MAX_ENGINE_SPECIFIC_PAYLOADS = 2
+MAX_INTERNAL_IPS_TO_TEST = 10
+MAX_CACHE_ENTRIES = 10000  # H4 FIX: Prevent unbounded cache growth
+
+# L2 FIX 2026-02-13: Extensible template engine list
+TEMPLATE_ENGINES = frozenset([
+    "jinja", "jinja2", "twig", "freemarker", "velocity", "erb",
+    "mako", "pebble", "thymeleaf", "blade", "nunjucks", "handlebars",
+    "mustache", "ejs", "pug", "jade", "liquid", "smarty", "django",
+])
 
 
 # =============================================================================
@@ -896,7 +927,7 @@ class ContextualPayloadGenerator:
 
         # Internal IP scanning
         if internal_ips:
-            for ip in internal_ips[:10]:  # Limit to 10 IPs
+            for ip in internal_ips[:MAX_INTERNAL_IPS_TO_TEST]:  # M1 FIX
                 payloads.append((f"http://{ip}", f"Internal IP {ip}"))
 
         return payloads
@@ -989,7 +1020,56 @@ class ContextPayloadSelector:
         # Locks for thread safety
         self._lock = asyncio.Lock()
 
+        # H2 FIX 2026-02-13: Initialize metrics tracking
+        self._init_metrics()
+
         logger.info(f"ContextPayloadSelector v{self.VERSION} initialized")
+
+    def _init_metrics(self) -> None:
+        """Initialize metrics tracking. H2 FIX 2026-02-13."""
+        self._metrics = {
+            "selections_attempted": 0,
+            "payloads_selected": 0,
+            "payloads_generated": 0,
+            "payloads_mutated": 0,
+            "waf_mutations_applied": 0,
+            "cache_hits": 0,
+            "cache_size": 0,
+            "by_category": defaultdict(int),
+            "by_strategy": defaultdict(int),
+        }
+
+    def get_metrics(self) -> dict:
+        """Return current metrics. H2 FIX 2026-02-13."""
+        metrics = dict(self._metrics)
+        metrics["by_category"] = dict(metrics["by_category"])
+        metrics["by_strategy"] = dict(metrics["by_strategy"])
+        metrics["cache_size"] = sum(len(v) for v in self._effectiveness_cache.values())
+        return metrics
+
+    def reset_metrics(self) -> None:
+        """Reset metrics to initial state. H2 FIX 2026-02-13."""
+        self._init_metrics()
+
+    def _prune_cache_if_needed(self) -> None:
+        """Prune effectiveness cache if it exceeds limit. H4 FIX 2026-02-13."""
+        total_entries = sum(len(v) for v in self._effectiveness_cache.values())
+        if total_entries > MAX_CACHE_ENTRIES:
+            # Remove lowest-scored entries until under limit
+            all_entries = []
+            for cache_key, payloads in self._effectiveness_cache.items():
+                for payload, score in payloads.items():
+                    all_entries.append((cache_key, payload, score))
+
+            # Sort by score (ascending) and remove bottom 20%
+            all_entries.sort(key=lambda x: x[2])
+            entries_to_remove = int(len(all_entries) * 0.2)
+
+            for cache_key, payload, _ in all_entries[:entries_to_remove]:
+                if cache_key in self._effectiveness_cache:
+                    self._effectiveness_cache[cache_key].pop(payload, None)
+
+            logger.debug(f"[CACHE] Pruned {entries_to_remove} entries from effectiveness cache")
 
     async def select_payloads(
         self,
@@ -1004,7 +1084,7 @@ class ContextPayloadSelector:
         Returns:
             SelectionResult with ranked payloads
         """
-        import time
+        # H3 FIX 2026-02-13: import time moved to module level
         start_time = time.time()
 
         async with self._lock:
@@ -1194,12 +1274,17 @@ class ContextPayloadSelector:
 
         # Generate database-specific SQLi payloads
         if context.detected_databases:
-            for db in context.detected_databases[:2]:  # Limit to first 2
-                db_payloads = self.generator.generate_sqli_for_db(
-                    db,
-                    with_waf_bypass=False,  # We'll apply bypass later
-                    waf_detection=context.waf_detection,
-                )
+            for db in context.detected_databases[:MAX_DB_SPECIFIC_PAYLOADS]:  # M1 FIX
+                # M2 FIX 2026-02-13: Error handling for generator
+                try:
+                    db_payloads = self.generator.generate_sqli_for_db(
+                        db,
+                        with_waf_bypass=False,  # We'll apply bypass later
+                        waf_detection=context.waf_detection,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to generate SQLi payloads for {db}: {e}")
+                    db_payloads = []
                 for payload, desc in db_payloads:
                     ranked = RankedPayload(
                         payload=payload,
@@ -1220,10 +1305,8 @@ class ContextPayloadSelector:
         template_engines = []
         for tech in context.detected_technologies + context.detected_frameworks:
             tech_lower = tech.lower()
-            if any(engine in tech_lower for engine in [
-                "jinja", "twig", "freemarker", "velocity", "erb",
-                "mako", "pebble", "thymeleaf", "blade"
-            ]):
+            # L2 FIX 2026-02-13: Use extensible constant
+            if any(engine in tech_lower for engine in TEMPLATE_ENGINES):
                 template_engines.append(tech_lower)
 
         # Also check if Flask is detected (implies Jinja2)
@@ -1231,12 +1314,17 @@ class ContextPayloadSelector:
             if "jinja2" not in template_engines and "jinja" not in template_engines:
                 template_engines.append("jinja2")
 
-        for engine in template_engines[:2]:  # Limit to first 2
-            ssti_payloads = self.generator.generate_ssti_for_engine(
-                engine,
-                with_waf_bypass=False,
-                waf_detection=context.waf_detection,
-            )
+        for engine in template_engines[:MAX_ENGINE_SPECIFIC_PAYLOADS]:  # M1 FIX
+            # M2 FIX 2026-02-13: Error handling for generator
+            try:
+                ssti_payloads = self.generator.generate_ssti_for_engine(
+                    engine,
+                    with_waf_bypass=False,
+                    waf_detection=context.waf_detection,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate SSTI payloads for {engine}: {e}")
+                ssti_payloads = []
             for payload, desc in ssti_payloads:
                 ranked = RankedPayload(
                     payload=payload,
@@ -1255,11 +1343,16 @@ class ContextPayloadSelector:
 
         # Generate XSS payloads based on reflection context
         if context.has_reflection and context.reflection_context:
-            xss_payloads = self.generator.generate_xss_for_context(
-                context.reflection_context,
-                with_waf_bypass=False,
-                waf_detection=context.waf_detection,
-            )
+            # M2 FIX 2026-02-13: Error handling for generator
+            try:
+                xss_payloads = self.generator.generate_xss_for_context(
+                    context.reflection_context,
+                    with_waf_bypass=False,
+                    waf_detection=context.waf_detection,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate XSS payloads for {context.reflection_context}: {e}")
+                xss_payloads = []
             for payload, desc in xss_payloads:
                 ranked = RankedPayload(
                     payload=payload,
@@ -1292,9 +1385,14 @@ class ContextPayloadSelector:
                     cloud_provider = "azure"
                     break
 
-            ssrf_payloads = self.generator.generate_ssrf_for_cloud(
-                cloud_provider=cloud_provider
-            )
+            # M2 FIX 2026-02-13: Error handling for generator
+            try:
+                ssrf_payloads = self.generator.generate_ssrf_for_cloud(
+                    cloud_provider=cloud_provider
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate SSRF payloads for {cloud_provider}: {e}")
+                ssrf_payloads = []
             for payload, desc in ssrf_payloads:
                 ranked = RankedPayload(
                     payload=payload,
@@ -1329,11 +1427,11 @@ class ContextPayloadSelector:
             # Keep original
             mutated_payloads.append(ranked)
 
-            # Generate bypass variants
+            # Generate bypass variants (M1 FIX: use constant)
             bypass_variants = self.waf_engine.generate_bypass_variants(
                 ranked.payload,
                 waf_detection,
-                max_variants=3,  # Limit variants per payload
+                max_variants=MAX_WAF_VARIANTS_PER_PAYLOAD,
             )
 
             for bypassed_payload, techniques in bypass_variants:
@@ -1446,8 +1544,7 @@ class ContextPayloadSelector:
 
         # For targeted mode, focus on highest effectiveness
         elif strategy == SelectionStrategy.TARGETED:
-            # Already sorted by effectiveness
-            pass
+            pass  # Already sorted by effectiveness
 
         return payloads[:limit]
 
@@ -1461,7 +1558,7 @@ class ContextPayloadSelector:
         }
         return mapping.get(severity.lower(), PayloadPriority.MEDIUM)
 
-    def record_result(
+    async def record_result(
         self,
         target_url: str,
         category: PayloadCategory,
@@ -1476,17 +1573,24 @@ class ContextPayloadSelector:
             category: Payload category
             payload: The payload that was tested
             success: Whether it was successful
+
+        Note: This method is async for thread safety with the shared cache.
         """
-        cache_key = f"{target_url}:{category.name}"
+        # C1 FIX 2026-02-13: Thread-safe cache mutation
+        async with self._lock:
+            cache_key = f"{target_url}:{category.name}"
 
-        # Update effectiveness based on result
-        current = self._effectiveness_cache[cache_key].get(payload, 0.5)
-        if success:
-            new_score = min(current * 1.5, 1.0)  # Boost successful payloads
-        else:
-            new_score = current * 0.8  # Reduce unsuccessful payloads
+            # Update effectiveness based on result
+            current = self._effectiveness_cache[cache_key].get(payload, 0.5)
+            if success:
+                new_score = min(current * 1.5, 1.0)  # Boost successful payloads
+            else:
+                new_score = current * 0.8  # Reduce unsuccessful payloads
 
-        self._effectiveness_cache[cache_key][payload] = new_score
+            self._effectiveness_cache[cache_key][payload] = new_score
+
+            # Prune cache if too large (H4 FIX)
+            self._prune_cache_if_needed()
 
         logger.debug(
             f"Recorded result for {category.name}: "
@@ -1597,11 +1701,13 @@ async def select_payloads_for_parameter(
             else:
                 context.detected_technologies.append(tech.name)
 
+    # C2 FIX 2026-02-13: Create selector once and reuse
+    selector = ContextPayloadSelector()
+
     # Extract from WAF detection
     if waf_detection:
         context.waf_behaviour = waf_detection.behaviour_family
-        # Get bypass strategies
-        selector = ContextPayloadSelector()
+        # Get bypass strategies using the same selector instance
         context.bypass_strategies = selector.waf_engine.get_bypass_strategies(
             waf_detection
         )
@@ -1616,8 +1722,7 @@ async def select_payloads_for_parameter(
         if parameter_analysis.reflection_contexts:
             context.reflection_context = parameter_analysis.reflection_contexts[0]
 
-    # Select payloads
-    selector = ContextPayloadSelector()
+    # Select payloads using the same selector instance
     return await selector.select_payloads(context)
 
 

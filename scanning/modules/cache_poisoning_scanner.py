@@ -34,19 +34,20 @@ Version: 2.0.0-enterprise
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import secrets
-import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlparse, urlencode, quote
+from urllib.parse import urljoin, urlparse, quote
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -302,9 +303,15 @@ class CachePoisoningScanner(ScanModule):
         "timestamp={random}",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.cache_wait = 0.5  # Time to wait for cache
     
     async def scan(
@@ -319,6 +326,11 @@ class CachePoisoningScanner(ScanModule):
         SAFETY: Cache poisoning can affect real users by injecting malicious
         content into shared caches. Blocked in passive, safe, and cautious modes.
         """
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[dict[str, Any]] = []
 
         # ═══════════════════════════════════════════════════════════════════════
@@ -339,24 +351,29 @@ class CachePoisoningScanner(ScanModule):
 
         base_url = f"https://{host}" if not host.startswith("http") else host
 
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        # FIX: Pass auth headers for authenticated endpoint testing
+        async with get_scan_client(
+            verify_ssl=False,
+            timeout=self.timeout,
+            custom_headers=self._auth_headers,
+        ) as client:
             # Phase 1: Detect caching and CDN
             cdn_info = await self._detect_cdn_enterprise(client, base_url, rate_limiter)
             
             if cdn_info.has_cache:
                 findings.append(Finding(
-                    type="cache_poisoning",
+                    vuln_type=VulnType.CACHE_POISONING,
                     name=f"Cache Detected: {cdn_info.cdn_type.name}",
-                    severity="INFO",
+                    severity=Severity.INFO,
                     description=f"Caching layer detected. CDN: {cdn_info.cdn_type.name}. "
                                f"Cache headers: {', '.join(cdn_info.cache_headers)}",
                     host=urlparse(base_url).netloc,
-                    matched_at=base_url,
+                    endpoint=base_url,
                     evidence=[f"CDN: {cdn_info.cdn_type.name}", *cdn_info.cache_headers],
                     cvss_score=0.0,
-                    cwe="CWE-444",
+                    cwe_id="CWE-444",
                     remediation="Informational - caching detected.",
-                    confidence=100,
+                    confidence_score=100,
                 ).to_dict())
             
             # Phase 2: Test unkeyed headers
@@ -503,14 +520,14 @@ class CachePoisoningScanner(ScanModule):
                     if canary in response2.text:
                         # CONFIRMED: Cache poisoning
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name=f"Cache Poisoning via {header_name}",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description=f"Cache poisoning confirmed via unkeyed header '{header_name}'. "
                                        f"The header is reflected but not included in cache key. "
                                        f"Attackers can poison cache for all users.",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Header: {header_name}",
                                 f"Type: {header_type}",
@@ -518,30 +535,30 @@ class CachePoisoningScanner(ScanModule):
                                 "Verified: Second request returned poisoned content",
                             ],
                             cvss_score=9.0,
-                            cwe="CWE-444",
+                            cwe_id="CWE-444",
                             remediation="Include this header in cache key using Vary header, "
                                        "or strip it before caching. "
                                        "Review CDN configuration for unkeyed headers.",
-                            confidence=90,
+                            confidence_score=90,
                         ).to_dict())
                     else:
                         # Reflected but not cached
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name=f"Header Reflection: {header_name}",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description=f"Header '{header_name}' is reflected in response but "
                                        f"not cached. May still be exploitable for XSS.",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Header: {header_name}",
                                 "Reflected but not cached",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-79",
+                            cwe_id="CWE-79",
                             remediation="Sanitize header values before reflection.",
-                            confidence=80,
+                            confidence_score=80,
                         ).to_dict())
                         
             except Exception as e:
@@ -591,24 +608,24 @@ class CachePoisoningScanner(ScanModule):
                     
                     if canary in response2.text:
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name="Host Header Cache Poisoning",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description="Cache poisoning via Host header manipulation. "
                                        "Attacker-controlled host value persists in cache.",
                             host=original_host,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Attack headers: {attack_headers}",
                                 f"Canary '{canary}' cached",
                                 "Poisoned response served to clean requests",
                             ],
                             cvss_score=9.0,
-                            cwe="CWE-444",
+                            cwe_id="CWE-444",
                             remediation="Validate Host header strictly. "
                                        "Include Host in cache key. "
                                        "Use absolute URLs in responses.",
-                            confidence=90,
+                            confidence_score=90,
                         ).to_dict())
                         return findings  # One finding is enough
                         
@@ -650,22 +667,22 @@ class CachePoisoningScanner(ScanModule):
                     
                     if canary in response2.text:
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name="Parameter Cloaking Cache Poisoning",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description=f"Cache key excludes certain parameters. "
                                        f"Cloaked parameter: {payload_template.split('=')[0]}",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Cloaking payload: {payload}",
                                 "Poisoned response served to request without cloaked param",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-444",
+                            cwe_id="CWE-444",
                             remediation="Include all parameters in cache key. "
                                        "Use consistent parameter parsing.",
-                            confidence=85,
+                            confidence_score=85,
                         ).to_dict())
                         break
                         
@@ -716,22 +733,22 @@ class CachePoisoningScanner(ScanModule):
                     
                     if canary in response2.text:
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name="Fat GET Cache Poisoning",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description="Cache poisoning via GET request with body. "
                                        "Backend processes body, cache ignores it.",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Content-Type: {content_type}",
                                 "GET body content cached",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-444",
+                            cwe_id="CWE-444",
                             remediation="Reject GET requests with body. "
                                        "Include Content-Length in cache key.",
-                            confidence=85,
+                            confidence_score=85,
                         ).to_dict())
                         return findings
                         
@@ -782,24 +799,24 @@ class CachePoisoningScanner(ScanModule):
                         
                         if has_sensitive:
                             findings.append(Finding(
-                                type="cache_poisoning",
+                                vuln_type=VulnType.CACHE_POISONING,
                                 name="Web Cache Deception",
-                                severity="HIGH" if is_cached else "MEDIUM",
+                                severity=Severity.HIGH if is_cached else "MEDIUM",
                                 description=f"Sensitive data may be cached via static extension trick. "
                                            f"Path: {path}",
                                 host=urlparse(base_url).netloc,
-                                matched_at=test_url,
+                                endpoint=test_url,
                                 evidence=[
                                     f"Path: {path}",
                                     f"Status: {cache_status}",
                                     "Response contains sensitive data patterns",
                                 ],
                                 cvss_score=7.5 if is_cached else 5.3,
-                                cwe="CWE-525",
+                                cwe_id="CWE-525",
                                 remediation="Don't cache based on file extension alone. "
                                            "Use Cache-Control: no-store for dynamic content. "
                                            "Validate path normalization.",
-                                confidence=85 if is_cached else 80,
+                                confidence_score=85 if is_cached else 80,
                             ).to_dict())
                             break
                             
@@ -821,7 +838,8 @@ class CachePoisoningScanner(ScanModule):
         
         cache_buster = secrets.token_hex(8)
         
-        for esi_payload in ESI_PAYLOADS[:3]:
+        # AUDIT-FIX 2026-02-11: Increased from [:3] to [:8] for better ESI coverage
+        for esi_payload in ESI_PAYLOADS[:8]:
             canary = secrets.token_hex(6)
             payload = esi_payload.format(evil=f"{canary}.evil.com")
             
@@ -835,33 +853,64 @@ class CachePoisoningScanner(ScanModule):
                     headers={"X-ESI-Test": payload}
                 )
                 
-                # Check for ESI processing indicators
-                esi_indicators = [
-                    "esi:include", "esi:comment", "<!--esi",
-                    canary, "ESI", "edge side"
+                # FIX 2026-02-18: Separate TRUE indicators from weak/generic ones
+                response_lower = response.text.lower()
+
+                # TRUE indicator: Our canary appeared in response = ESI was PROCESSED
+                if canary.lower() in response_lower:
+                    findings.append(Finding(
+                        vuln_type=VulnType.CACHE_POISONING,
+                        name="ESI Injection Confirmed",
+                        severity=Severity.CRITICAL,
+                        description="Edge Side Include injection confirmed. "
+                                   "Injected ESI payload was processed by the server.",
+                        host=urlparse(base_url).netloc,
+                        endpoint=test_url,
+                        evidence=[
+                            f"Canary '{canary}' found in response",
+                            "ESI payload was processed",
+                            f"Payload: {payload[:50]}...",
+                        ],
+                        cvss_score=9.0,
+                        cwe_id="CWE-94",
+                        remediation="Disable ESI processing or sanitize input strictly. "
+                                   "Filter ESI tags from all user input.",
+                        confidence_score=95,
+                    ).to_dict())
+                    return findings
+
+                # WEAK indicators: ESI tags in response (might just be in HTML, not processed)
+                # These need to be the EXACT ESI syntax, not generic strings
+                weak_esi_patterns = [
+                    "<esi:include",   # Full ESI tag pattern
+                    "<esi:comment",   # ESI comment tag
+                    "<!--esi",        # ESI in HTML comment
+                    "<esi:inline",    # ESI inline tag
                 ]
-                
-                for indicator in esi_indicators:
-                    if indicator.lower() in response.text.lower():
+
+                for pattern in weak_esi_patterns:
+                    if pattern in response_lower:
                         findings.append(Finding(
-                            type="cache_poisoning",
-                            name="ESI Injection Potential",
-                            severity="HIGH",
-                            description="Edge Side Include injection may be possible. "
-                                       "ESI tags or processing detected.",
+                            vuln_type=VulnType.CACHE_POISONING,
+                            name="ESI Tags Present (Unverified)",
+                            severity=Severity.MEDIUM,  # Downgraded - not confirmed
+                            description="ESI tag patterns detected in response. "
+                                       "May indicate ESI processing capability, but injection not confirmed.",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
-                                f"ESI indicator found: {indicator}",
-                                "Manual verification required",
+                                f"ESI pattern found: {pattern}",
+                                "Note: Presence of ESI tags does not confirm injection",
                             ],
-                            cvss_score=8.0,
-                            cwe="CWE-94",
-                            remediation="Disable ESI processing or sanitize input strictly. "
-                                       "Filter ESI tags from all user input.",
-                            confidence=85,
+                            cvss_score=5.0,
+                            cwe_id="CWE-94",
+                            remediation="Verify if ESI processing is enabled. If so, ensure strict input sanitization.",
+                            confidence_score=45,  # LOW - needs manual verification
                         ).to_dict())
                         return findings
+
+                # FIX: REMOVED generic "ESI" and "edge side" - these are NOT evidence!
+                # Many pages contain "ESI" without being vulnerable (e.g., "rESIdent", file names)
                         
             except Exception as e:
                 logger.debug(f"ESI injection test error: {e}")
@@ -914,23 +963,23 @@ class CachePoisoningScanner(ScanModule):
                     # Different response lengths suggest different cache entries
                     if abs(len(response1.text) - len(response2.text)) > 100:
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name="Path Normalization Inconsistency",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description="Cache key normalization may be inconsistent. "
                                        "Different paths may map to same or different cache entries.",
                             host=urlparse(base_url).netloc,
-                            matched_at=url1,
+                            endpoint=url1,
                             evidence=[
                                 f"Path 1: {path1}",
                                 f"Path 2: {path2}",
                                 "Different response sizes for similar paths",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-436",
+                            cwe_id="CWE-436",
                             remediation="Normalize paths before cache key generation. "
                                        "Use consistent URL handling.",
-                            confidence=80,
+                            confidence_score=80,
                         ).to_dict())
                         break
                         
@@ -965,25 +1014,26 @@ class CachePoisoningScanner(ScanModule):
                 vary_components = [v.strip() for v in vary_header.split(",")]
                 
                 findings.append(Finding(
-                    type="cache_poisoning",
+                    vuln_type=VulnType.CACHE_POISONING,
                     name="Vary Header Analysis",
-                    severity="INFO",
+                    severity=Severity.INFO,
                     description=f"Vary header present with components: {vary_components}",
                     host=urlparse(base_url).netloc,
-                    matched_at=test_url,
+                    endpoint=test_url,
                     evidence=[
                         f"Vary: {vary_header}",
                         f"Components: {vary_components}",
                     ],
                     cvss_score=0.0,
-                    cwe="CWE-444",
+                    cwe_id="CWE-444",
                     remediation="Ensure all user-controlled headers are in Vary.",
-                    confidence=100,
+                    confidence_score=100,
                 ).to_dict())
                 
                 # Test if Vary is respected
                 canary = secrets.token_hex(6)
-                for component in vary_components[:3]:
+                # AUDIT-FIX 2026-02-11: Increased from [:3] to [:8]
+                for component in vary_components[:8]:
                     if component in ["accept-encoding", "accept-language", "*"]:
                         continue
                     
@@ -997,21 +1047,21 @@ class CachePoisoningScanner(ScanModule):
                     
                     if canary in response2.text:
                         findings.append(Finding(
-                            type="cache_poisoning",
+                            vuln_type=VulnType.CACHE_POISONING,
                             name=f"Vary Header Reflection: {component}",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description=f"Vary header component '{component}' is reflected. "
                                        f"May enable targeted cache poisoning.",
                             host=urlparse(base_url).netloc,
-                            matched_at=test_url,
+                            endpoint=test_url,
                             evidence=[
                                 f"Vary component: {component}",
                                 "Value reflected in response",
                             ],
                             cvss_score=5.3,
-                            cwe="CWE-444",
+                            cwe_id="CWE-444",
                             remediation="Sanitize header values before reflection.",
-                            confidence=80,
+                            confidence_score=80,
                         ).to_dict())
                         
         except Exception as e:

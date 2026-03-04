@@ -138,7 +138,8 @@ MODULE_RECOMMENDATIONS = {
 
     TargetType.STATIC_SITE: {
         "recommended": ["ssl", "headers", "cors", "cloud", "supply_chain", "secrets", "subdomain_takeover"],
-        "skip": ["auth", "csrf", "sqli", "ssrf", "oauth", "nosql", "ssti", "cmdi", "lfi", "xxe", "deserialization", "graphql"],
+        # FIX 2026-02-19: Added prototype_pollution - static sites have no backend
+        "skip": ["auth", "csrf", "sqli", "ssrf", "oauth", "nosql", "ssti", "cmdi", "lfi", "xxe", "deserialization", "graphql", "prototype_pollution"],
         "skip_reasons": {
             "auth": "Not tested: No authentication endpoints identified in scope",
             "csrf": "Not tested: No state-changing forms identified",
@@ -152,6 +153,7 @@ MODULE_RECOMMENDATIONS = {
             "xxe": "Not tested: No XML processing endpoints identified",
             "deserialization": "Not tested: No deserialization endpoints identified",
             "graphql": "Not tested: No GraphQL endpoint identified",
+            "prototype_pollution": "Not applicable: Static site, no JavaScript backend",
         }
     },
     TargetType.SPA: {
@@ -190,9 +192,12 @@ MODULE_RECOMMENDATIONS = {
     TargetType.BACKEND_CLASSIC: {
         "recommended": ["sqli", "xss", "csrf", "auth", "lfi", "ssti", "cmdi", "ssrf", "xxe",
                        "headers", "ssl", "cors", "nosql", "secrets", "upload", "idor", "api"],
-        "skip": ["graphql"],
+        # FIX 2026-02-19: Skip JS-only modules for server-rendered backends (PHP, Ruby, Python, Java)
+        "skip": ["graphql", "prototype_pollution", "dom_xss"],
         "skip_reasons": {
             "graphql": "Not tested: No GraphQL endpoint identified",
+            "prototype_pollution": "Not applicable: Backend is not JavaScript (Node.js/Express)",
+            "dom_xss": "Not applicable: Server-rendered pages, no client-side DOM manipulation",
         }
     },
     TargetType.API_FIRST: {
@@ -209,8 +214,9 @@ MODULE_RECOMMENDATIONS = {
     },
     TargetType.CLOUD_ONLY: {
         "recommended": ["cloud", "s3", "cors", "headers", "ssl", "subdomain_takeover", "secrets"],
+        # FIX 2026-02-19: Added prototype_pollution to skip list
         "skip": ["sqli", "xss", "csrf", "auth", "ssrf", "ssti", "cmdi", "lfi", "xxe",
-                "nosql", "graphql", "deserialization", "oauth", "jwt"],
+                "nosql", "graphql", "deserialization", "oauth", "jwt", "prototype_pollution"],
         "skip_reasons": {
             "sqli": "Not tested: No injectable database endpoints identified (unauthenticated scope)",
             "xss": "Not tested: No exploitable dynamic rendering identified (unauthenticated scope)",
@@ -226,12 +232,14 @@ MODULE_RECOMMENDATIONS = {
             "deserialization": "Not tested: No deserialization endpoints identified",
             "oauth": "Not tested: OAuth requires authenticated testing",
             "jwt": "Not tested: JWT requires authenticated testing",
+            "prototype_pollution": "Not applicable: Cloud resources, no JavaScript backend",
         }
     },
     TargetType.BAAS_SUPABASE: {
         "recommended": ["supabase_rls", "jwt", "auth", "api", "cors", "headers", "ssl",
                        "secrets", "storage", "realtime", "edge_functions"],
-        "skip": ["sqli", "ssti", "cmdi", "lfi", "xxe", "deserialization", "smuggling"],
+        # FIX 2026-02-19: Added prototype_pollution - BaaS backends are not Node.js
+        "skip": ["sqli", "ssti", "cmdi", "lfi", "xxe", "deserialization", "smuggling", "prototype_pollution"],
         "skip_reasons": {
             "sqli": "Not tested: Supabase uses RLS - test RLS bypass instead",
             "ssti": "Not tested: No template-rendering endpoints identified",
@@ -240,12 +248,14 @@ MODULE_RECOMMENDATIONS = {
             "xxe": "Not tested: No XML processing endpoints identified",
             "deserialization": "Not tested: No custom deserialization identified",
             "smuggling": "Not tested: Managed infrastructure",
+            "prototype_pollution": "Not applicable: BaaS backend, no Node.js runtime",
         }
     },
     TargetType.BAAS_FIREBASE: {
         "recommended": ["firebase_auth", "firebase_rules", "jwt", "api", "cors", "headers",
                        "ssl", "secrets", "storage", "nosql"],
-        "skip": ["sqli", "ssti", "cmdi", "lfi", "xxe", "deserialization", "smuggling"],
+        # FIX 2026-02-19: Added prototype_pollution - Firebase backend is not Node.js
+        "skip": ["sqli", "ssti", "cmdi", "lfi", "xxe", "deserialization", "smuggling", "prototype_pollution"],
         "skip_reasons": {
             "sqli": "Not tested: Firebase uses NoSQL - test security rules instead",
             "ssti": "Not tested: No template-rendering endpoints identified",
@@ -254,6 +264,7 @@ MODULE_RECOMMENDATIONS = {
             "xxe": "Not tested: No XML processing endpoints identified",
             "deserialization": "Not tested: No custom deserialization identified",
             "smuggling": "Not tested: Managed infrastructure",
+            "prototype_pollution": "Not applicable: BaaS backend, no Node.js runtime",
         }
     },
     TargetType.UNKNOWN: {
@@ -613,12 +624,27 @@ class TargetClassifier:
         for path in api_paths:
             try:
                 resp = await client.get(f"{target.rstrip('/')}{path}", timeout=5.0)
-                # Consider 200, 401, 403, 500 as valid API responses
-                if resp.status_code in (200, 201, 401, 403, 500):
+                # Consider 200, 201, 401, 403, 500 as valid API responses
+                # FIX 2026-02-18: Added 400 — GraphQL returns 400 for malformed queries but still indicates endpoint exists
+                if resp.status_code in (200, 201, 400, 401, 403, 500):
                     signals[f"api_endpoint_{path}"] = True
                     # Check if it returns JSON
                     if 'application/json' in resp.headers.get('content-type', ''):
                         signals[f"api_endpoint_{path}_json"] = True
+                # FIX 2026-02-18: Also try POST for GraphQL (GET may return 405)
+                if path == '/graphql' and resp.status_code == 405:
+                    try:
+                        post_resp = await client.post(
+                            f"{target.rstrip('/')}{path}",
+                            json={"query": "{ __typename }"},
+                            timeout=5.0
+                        )
+                        if post_resp.status_code in (200, 400):
+                            signals[f"api_endpoint_{path}"] = True
+                            if 'application/json' in post_resp.headers.get('content-type', ''):
+                                signals[f"api_endpoint_{path}_json"] = True
+                    except Exception:
+                        pass
             except Exception:
                 pass
 

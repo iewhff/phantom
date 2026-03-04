@@ -10,10 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import jinja2
 from jinja2 import Environment, FileSystemLoader
 
 from ai_engine.model_manager import ModelManager
-from reporting.charts import ChartGenerator, integrate_charts_with_report
+from reporting.charts import integrate_charts_with_report
 from utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -381,8 +382,9 @@ class ReportGenerator:
         try:
             tmpl = self.jinja_env.get_template(f"{template}.j2")
             return tmpl.render(**data)
-        except Exception:
+        except (jinja2.TemplateError, jinja2.TemplateNotFound) as e:
             # Use default template
+            logger.debug(f"Template rendering failed, using default: {e}")
             return self._default_html_template(data)
     
     def _render_markdown(self, data: dict[str, Any]) -> str:
@@ -434,16 +436,44 @@ class ReportGenerator:
         if data.get("exploit_chains"):
             lines.append(f"## Exploit Chains")
             lines.append(f"")
-            
+
             for chain in data["exploit_chains"]:
                 lines.append(f"### {chain.get('name', 'Unknown')}")
                 lines.append(f"")
-                lines.append(f"- **Severity:** {chain.get('severity', 'N/A')}")
                 lines.append(f"- **Impact:** {chain.get('impact', 'N/A')}")
+                lines.append(f"- **Difficulty:** {chain.get('difficulty', 'N/A')}")
+                if chain.get("vulnerabilities"):
+                    lines.append(f"- **Required Vulnerabilities:** {', '.join(chain['vulnerabilities'])}")
                 lines.append(f"")
-                lines.append(chain.get("description", ""))
+                if chain.get("poc_steps"):
+                    lines.append("**Attack Steps:**")
+                    for step in chain["poc_steps"]:
+                        lines.append(f"  {step}")
+                    lines.append(f"")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ATTACKER NEXT-STEP SUGGESTIONS (Advisory, NOT findings)
+        # ═══════════════════════════════════════════════════════════════════
+        if data.get("attacker_next_steps"):
+            lines.append(f"## What an Attacker Would Likely Do Next")
+            lines.append(f"")
+            lines.append(f"> **Note:** These are advisory suggestions based on detected vulnerability chains.")
+            lines.append(f"> They describe hypothetical attacker behavior, not confirmed exploitations.")
+            lines.append(f"")
+
+            for suggestion in data["attacker_next_steps"]:
+                lines.append(f"### {suggestion.get('category', 'General').title()}")
                 lines.append(f"")
-        
+                lines.append(f"*{suggestion.get('narrative', '')}*")
+                lines.append(f"")
+                if suggestion.get("steps"):
+                    for step in suggestion["steps"]:
+                        lines.append(f"- {step}")
+                    lines.append(f"")
+                if suggestion.get("risk_context"):
+                    lines.append(f"**Context:** {suggestion['risk_context']}")
+                    lines.append(f"")
+
         return "\n".join(lines)
     
     def _default_html_template(self, data: dict[str, Any]) -> str:
@@ -555,22 +585,50 @@ class ReportGenerator:
             return "N/A"
     
     def _calculate_risk_score(self, by_severity: dict) -> float:
-        """Calculate overall risk score (0-10)."""
-        weights = {
-            "CRITICAL": 10,
-            "HIGH": 7,
-            "MEDIUM": 4,
-            "LOW": 2,
-            "INFO": 0,
-        }
-        
-        total = sum(
-            len(findings) * weights[sev]
-            for sev, findings in by_severity.items()
-        )
-        
-        # Normalize to 0-10
-        return min(10.0, total / 10)
+        """Calculate overall risk score (0-10).
+
+        Uses a diminishing returns model to prevent inflation:
+        - Base score from highest severity finding (0-7)
+        - Additional points for multiple findings (diminishing returns)
+        - Maximum 10.0
+
+        This prevents:
+        - 50 LOW findings from exceeding 1 CRITICAL
+        - Many duplicate findings from inflating the score
+        """
+        crit_count = len(by_severity.get("CRITICAL", []))
+        high_count = len(by_severity.get("HIGH", []))
+        med_count = len(by_severity.get("MEDIUM", []))
+        low_count = len(by_severity.get("LOW", []))
+
+        # Base score from highest severity present
+        if crit_count > 0:
+            base = 8.0  # CRITICAL starts at 8
+        elif high_count > 0:
+            base = 6.0  # HIGH starts at 6
+        elif med_count > 0:
+            base = 4.0  # MEDIUM starts at 4
+        elif low_count > 0:
+            base = 2.0  # LOW starts at 2
+        else:
+            return 0.0  # No findings
+
+        # Diminishing returns for additional findings
+        # Each additional finding adds less (log-like growth)
+        import math
+        additional = 0.0
+
+        if crit_count > 1:
+            additional += min(1.0, math.log(crit_count) * 0.5)
+        if high_count > 0:
+            # HIGH findings add 0.3-0.8 based on count (if CRITICAL is base)
+            additional += min(0.8, math.log(high_count + 1) * 0.4)
+        if med_count > 0:
+            additional += min(0.5, math.log(med_count + 1) * 0.2)
+        if low_count > 0:
+            additional += min(0.2, math.log(low_count + 1) * 0.1)
+
+        return min(10.0, round(base + additional, 1))
     
     @staticmethod
     def _severity_color(severity: str) -> str:

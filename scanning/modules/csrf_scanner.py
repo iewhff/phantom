@@ -58,7 +58,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import math
 import re
 import secrets
@@ -67,16 +66,24 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlencode, urlparse, urljoin
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
+from utils.shared_findings_store import SharedFindingsStore, VulnType as StoreVulnType
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
 
 logger = get_logger(__name__)
+
+# FIX SAFE-08: Safety mode check - CSRF testing uses POST requests
+import os
+SAFE_MODE = os.environ.get("PHANTOM_SAFE_MODE", "safe").lower()
+ALLOW_CSRF_TESTING = SAFE_MODE in ("standard", "aggressive")
 
 
 # ============================================================================
@@ -100,6 +107,7 @@ class CSRFVulnType(Enum):
     WEBSOCKET_CSRF = auto()
     CORS_CSRF_COMBO = auto()
     TOKEN_FIXATION = auto()
+    WORKFLOW_BYPASS = auto()  # Multi-step workflow CSRF bypass
 
 
 @dataclass
@@ -183,7 +191,7 @@ class CSRFFinding:
     remediation: str = ""
     cwe: str = "CWE-352"
     vuln_type: CSRFVulnType | None = None
-    confidence: str = "MEDIUM"
+    confidence: float = 60.0
     cvss: float = 0.0
     
     def to_dict(self) -> dict:
@@ -246,6 +254,49 @@ class CSRFScanner:
     
     # State-changing HTTP methods
     STATE_CHANGING_METHODS = ["POST", "PUT", "PATCH", "DELETE"]
+
+    # SPA framework markers — detect when a response is an SPA shell, not an action result
+    _SPA_MARKERS = [
+        # Angular 1.x
+        "ng-app", "ng-controller",
+        # Angular 2+ / modern Angular
+        "<app-root", "angular", "data-beasties",
+        # React
+        "react-root", "data-reactroot", "__next",
+        # Vue / Nuxt
+        "vue-app", "nuxt", "__nuxt",
+        # Svelte / SvelteKit
+        "svelte", "sveltekit",
+        # Generic SPA root elements
+        'id="app"', 'id="root"', 'id="__next"',
+    ]
+
+    # URL path fragments that indicate action endpoints (not page routes)
+    _ACTION_PATH_FRAGMENTS = [
+        "/api/", "/profile", "/account", "/admin",
+        "/user", "/delete", "/update", "/password",
+        "/email", "/settings", "/transfer", "/payment",
+    ]
+
+    @staticmethod
+    def _is_spa_shell(body: str, content_type: str, url: str) -> bool:
+        """Detect if an HTTP response is an SPA shell page, not an action result.
+
+        SPAs return 200 + full HTML for all routes because the client-side router
+        handles routing. This does NOT mean the server processed the action.
+        """
+        is_html = "text/html" in content_type.lower()
+        if not is_html or len(body) < 2000:
+            return False
+        body_lower = body.lower() if body == body.lower() else body.lower()
+        # Check 1: Known framework markers
+        if any(m in body_lower for m in CSRFScanner._SPA_MARKERS):
+            return True
+        # Check 2: Full HTML document returned for an action/API endpoint
+        if ("<!doctype html" in body_lower and "<script" in body_lower
+                and any(p in url.lower() for p in CSRFScanner._ACTION_PATH_FRAGMENTS)):
+            return True
+        return False
     
     # ==========================================================================
     # HIGH-IMPACT CSRF ENDPOINTS - These make CSRF CRITICAL, not just "checkbox"
@@ -331,17 +382,21 @@ class CSRFScanner:
         r"/unban",
         r"/suspend",
         
-        # Juice Shop specific
-        r"/rest/user",
-        r"/api/Users",
-        r"/api/Cards",
-        r"/api/Addresss",
-        r"/api/Deliverys",
-        r"/api/Recycles",
-        r"/api/Complaints",
-        r"/api/Feedbacks",
-        r"/rest/basket",
-        r"/rest/order",
+        # E-commerce/REST API patterns (generic)
+        r"/api/users?",           # User management
+        r"/api/cards?",           # Payment cards
+        r"/api/address(?:es)?",   # Addresses
+        r"/api/deliver(?:y|ies)", # Delivery
+        r"/api/complaints?",      # Complaints
+        r"/api/feedbacks?",       # Feedbacks
+        r"/api/reviews?",         # Reviews
+        r"/api/products?",        # Products
+        r"/api/orders?",          # Orders
+        r"/rest/user",            # REST user endpoints
+        r"/rest/basket",          # REST basket
+        r"/rest/order",           # REST order
+        r"/rest/product",         # REST product
+        r"/graphql",              # GraphQL mutations
     ]
     
     # Common CSRF token parameter names - Extended
@@ -483,31 +538,63 @@ class CSRFScanner:
     ) -> dict:
         """
         Scan for CSRF vulnerabilities - Enterprise Edition with HIGH-IMPACT DETECTION.
-        
+
         Now detects CSRF on critical actions:
         - Password change → Account Takeover
         - Email change → Account Takeover via password reset
         - Account deletion → Data loss / DoS
         - Financial transactions → Theft
         - Admin actions → Privilege escalation
-        
+
         Args:
             host: Target hostname
             asset_data: Contains endpoints, forms, cookies
             rate_limiter: Optional rate limiter
         """
+        # FIX SAFE-08: CSRF testing requires POST - block in safe/cautious modes
+        if not ALLOW_CSRF_TESTING:
+            logger.info(f"⚠️ CSRF Scanner SKIPPED (safe_mode={SAFE_MODE}, requires standard/aggressive)")
+            return {
+                "findings": [],
+                "info": [{"message": f"CSRF testing requires standard/aggressive mode (current: {SAFE_MODE})"}],
+            }
+
         logger.info(f"🔍 CSRF Scanner Enterprise v3.0 starting for {host}")
         logger.info("🎯 HIGH-IMPACT mode: Targeting password/email/account/financial endpoints")
-        
+
         base_url = f"https://{host}" if not host.startswith("http") else host
-        
-        endpoints = asset_data.get("endpoints", [])
-        forms = asset_data.get("forms", [])
-        
-        async with httpx.AsyncClient(
+
+        # FIX: Add ScanContext for auth headers - CSRF testing needs auth to test authenticated endpoints
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+        if self._ctx.has_auth:
+            logger.info(f"[CSRF] Using authenticated session ({self._ctx.auth_method})")
+        else:
+            logger.warning("[CSRF] No auth token — CSRF tests will be unauthenticated (may miss vulns on protected endpoints)")
+
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            forms = asset_data.get("forms", [])
+
+        # PERF-FIX 2026-02-12: Limit endpoints to prevent timeout in full scans
+        max_endpoints = 30
+        max_forms = 20
+        scan_start = time.time()
+        max_total_time = 180.0  # Max 3 minutes
+
+        if len(endpoints) > max_endpoints:
+            logger.info(f"[CSRF] Limiting endpoints from {len(endpoints)} to {max_endpoints}")
+            endpoints = endpoints[:max_endpoints]
+        if len(forms) > max_forms:
+            logger.info(f"[CSRF] Limiting forms from {len(forms)} to {max_forms}")
+            forms = forms[:max_forms]
+
+        async with get_scan_client(
             timeout=self.timeout,
             follow_redirects=True,
-            verify=False,
+            verify_ssl=False,
+            custom_headers=self._auth_headers,  # FIX: Pass auth headers
         ) as client:
             # 0. PRIORITY: Test high-impact endpoints FIRST
             logger.info("🔴 Phase 0: Testing HIGH-IMPACT endpoints (password/email/account)")
@@ -522,18 +609,26 @@ class CSRFScanner:
             
             # 3. Test endpoints for CSRF protection
             for endpoint in endpoints:
+                # PERF-FIX 2026-02-12: Check time limit
+                if time.time() - scan_start > max_total_time:
+                    logger.info(f"[CSRF] Time limit reached, stopping endpoint tests")
+                    break
                 if rate_limiter:
                     await rate_limiter.acquire(host)
                 await self._test_endpoint_csrf(client, endpoint, base_url)
-            
-            # 4. Enterprise: Token entropy analysis
-            await self._analyze_token_entropy(client, base_url)
-            
-            # 5. Enterprise: JSON CSRF attacks
-            for endpoint in endpoints:
-                if rate_limiter:
-                    await rate_limiter.acquire(host)
-                await self._test_json_csrf(client, endpoint, base_url)
+
+            # 4. Enterprise: Token entropy analysis (skip if time exceeded)
+            if time.time() - scan_start < max_total_time:
+                await self._analyze_token_entropy(client, base_url)
+
+            # 5. Enterprise: JSON CSRF attacks (skip if time exceeded)
+            if time.time() - scan_start < max_total_time:
+                for endpoint in endpoints[:15]:  # PERF-FIX: Limit to 15 for JSON tests
+                    if time.time() - scan_start > max_total_time:
+                        break
+                    if rate_limiter:
+                        await rate_limiter.acquire(host)
+                    await self._test_json_csrf(client, endpoint, base_url)
             
             # 6. Enterprise: Origin/Referer bypass testing
             for endpoint in endpoints:
@@ -552,11 +647,32 @@ class CSRFScanner:
             
             # 10. Enterprise: WebSocket CSRF
             await self._test_websocket_csrf(client, base_url)
-        
+
+            # 11. Enterprise: Multi-step workflow CSRF
+            await self._test_multistep_csrf(client, base_url, forms)
+
         # Count high-impact findings
         high_impact_count = sum(1 for f in self.result.findings if f.severity == "CRITICAL")
         logger.info(f"✅ CSRF Enterprise scan complete: {len(self.result.findings)} findings ({high_impact_count} CRITICAL)")
-        
+
+        # FIX: CROSS-MODULE SHARING - Add findings to SharedFindingsStore
+        # This enables other modules to target CSRF-vulnerable endpoints
+        if self.result.findings:
+            try:
+                store = SharedFindingsStore.get_instance()
+                for finding in self.result.findings:
+                    store.add_finding(
+                        vuln_type=StoreVulnType.CSRF,
+                        module="csrf_scanner",
+                        endpoint=finding.endpoint,
+                        parameter=None,  # CSRF is form-level, not param-level
+                        severity=finding.severity,
+                        confidence=finding.confidence,
+                    )
+                logger.debug(f"[CSRF] Shared {len(self.result.findings)} findings with cross-module store")
+            except Exception as e:
+                logger.debug(f"[CSRF] Could not share findings: {e}")
+
         return {
             "findings": [f.to_dict() for f in self.result.findings],
             "endpoints_tested": self.result.endpoints_tested,
@@ -626,12 +742,12 @@ class CSRFScanner:
             "/profile/delete",
             "/api/user/deactivate",
             
-            # Juice Shop specific endpoints
+            # REST API patterns (Express/Node.js apps)
             "/rest/user/change-password",
-            "/api/Users",  # POST for change
+            "/api/users",  # POST for user changes
             "/rest/user/data-export",
-            "/api/SecurityQuestions",
-            "/api/SecurityAnswers",
+            "/api/security-questions",
+            "/api/security-answers",
             
             # Financial/Transfer endpoints
             "/api/transfer",
@@ -724,29 +840,81 @@ class CSRFScanner:
                 if response.status_code in [200, 201, 202, 204, 302]:
                     # Check if it actually processed or just returned an auth error
                     is_vulnerable = False
+                    side_effect_confirmed = False
+                    is_spa_response = False
                     try:
                         body = response.text.lower()
+
                         # Not vulnerable if auth error
                         if any(x in body for x in ["unauthorized", "unauthenticated", "login required", "401"]):
                             continue
                         # Not vulnerable if CSRF error
                         if any(x in body for x in ["csrf", "token", "invalid token", "missing token"]):
                             continue
-                        # Likely vulnerable if processed
-                        is_vulnerable = True
-                    except Exception:
-                        is_vulnerable = True
+
+                        # SPA detection: SPAs return 200 for all routes because
+                        # the client-side router handles routing. A 200 from an
+                        # SPA homepage does NOT mean the action was processed.
+                        content_type = response.headers.get("content-type", "").lower()
+                        is_json_response = "application/json" in content_type
+
+                        is_spa_response = self._is_spa_shell(body, content_type, url)
+
+                        if is_spa_response:
+                            # SPA returned its shell page — the server did NOT process
+                            # the action, the client-side router caught the route.
+                            # This is NOT evidence of CSRF. Skip entirely.
+                            logger.debug(f"[CSRF] SPA shell detected for {url}, skipping (not a real CSRF)")
+                            continue
+                        elif is_json_response:
+                            # JSON response — more likely the endpoint processed it
+                            # Check for success indicators
+                            if any(x in body for x in ['"success"', '"ok"', '"updated"',
+                                                        '"deleted"', '"created"', '"done"']):
+                                is_vulnerable = True
+                                side_effect_confirmed = True
+                            elif any(x in body for x in ['"error"', '"fail"', '"denied"',
+                                                          '"forbidden"', '"not found"']):
+                                continue  # Action was rejected
+                            else:
+                                # Generic JSON response — accept but not confirmed
+                                is_vulnerable = True
+                        elif response.status_code in [201, 204]:
+                            # 201 Created or 204 No Content = strong side-effect signal
+                            is_vulnerable = True
+                            side_effect_confirmed = True
+                        else:
+                            # Generic 200 HTML — could be SPA or real processing
+                            is_vulnerable = True
+
+                    except (AttributeError, TypeError) as e:
+                        # Response parsing failed - don't assume vulnerable
+                        logger.debug(f"[CSRF] Response parse error: {e}")
+                        is_vulnerable = False
                     
                     if is_vulnerable:
+                        # Confidence based on side-effect verification:
+                        # - Side-effect confirmed (JSON success, 201/204): 90%
+                        # - Generic 200 (no JSON confirmation): 75%
+                        # NOTE: SPA shell responses are skipped entirely above (continue)
+                        if side_effect_confirmed:
+                            csrf_confidence = 90.0
+                            verification_note = "Side-effect confirmed (server returned action-specific response)"
+                        else:
+                            csrf_confidence = 75.0
+                            verification_note = "Cross-origin request accepted without CSRF token"
+
                         self.result.findings.append(CSRFFinding(
                             url=url,
                             method=method,
                             severity=severity,
+                            confidence=csrf_confidence,
                             title=f"🔴 CRITICAL CSRF: {impact_type.replace('_', ' ').title()}",
                             description=(
-                                f"**CONFIRMED HIGH-IMPACT CSRF VULNERABILITY**\n\n"
+                                f"**HIGH-IMPACT CSRF VULNERABILITY**\n\n"
                                 f"The endpoint `{endpoint}` accepts {method} requests from any origin "
                                 f"without CSRF token validation.\n\n"
+                                f"**Verification:** {verification_note}\n\n"
                                 f"**Impact Classification:** {impact_type.upper()}\n"
                                 f"**CVSS Score:** {cvss_score}\n"
                                 f"**Severity:** {severity}\n\n"
@@ -760,6 +928,7 @@ class CSRFScanner:
                                 f"Request: {method} {url}\n"
                                 f"Origin: https://evil-attacker.com\n"
                                 f"Response: {response.status_code}\n"
+                                f"Side-effect verified: {side_effect_confirmed}\n"
                                 f"Body (truncated): {response.text[:300]}"
                             ),
                             remediation=(
@@ -774,8 +943,7 @@ class CSRFScanner:
                         
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in [401, 403]:
-                    # Auth required - can't test without credentials
-                    pass
+                    pass  # Auth required - can't test without credentials
             except Exception as e:
                 logger.debug(f"High-impact CSRF test error for {endpoint}: {e}")
     
@@ -838,26 +1006,38 @@ class CSRFScanner:
                 if not is_session_cookie:
                     continue
                 
-                # Get SameSite value from Set-Cookie header
-                set_cookie_header = response.headers.get("set-cookie", "")
-                
-                # Parse SameSite from header
+                # Get SameSite value from Set-Cookie headers
+                # CRITICAL: response.headers.get() only returns FIRST header
+                # We need to check ALL Set-Cookie headers for this specific cookie
                 samesite = "not set"
-                if f"{cookie.name}=" in set_cookie_header:
-                    cookie_part = set_cookie_header[set_cookie_header.index(f"{cookie.name}="):]
-                    if "SameSite=Strict" in cookie_part:
-                        samesite = "Strict"
-                    elif "SameSite=Lax" in cookie_part:
-                        samesite = "Lax"
-                    elif "SameSite=None" in cookie_part:
-                        samesite = "None"
+                secure_flag = False
+
+                # Access raw headers to get ALL Set-Cookie values
+                raw_headers = response.headers.raw
+                for name, value in raw_headers:
+                    if name.lower() == b"set-cookie":
+                        header_str = value.decode("utf-8", errors="replace")
+                        # Check if this header sets our cookie
+                        if header_str.startswith(f"{cookie.name}=") or f"; {cookie.name}=" in header_str:
+                            # Parse SameSite (case-insensitive)
+                            header_lower = header_str.lower()
+                            if "samesite=strict" in header_lower:
+                                samesite = "Strict"
+                            elif "samesite=lax" in header_lower:
+                                samesite = "Lax"
+                            elif "samesite=none" in header_lower:
+                                samesite = "None"
+                            # Check Secure flag
+                            if "; secure" in header_lower or header_lower.endswith("; secure"):
+                                secure_flag = True
+                            break  # Found the matching cookie header
                 
                 # Evaluate security
                 if samesite == "not set":
                     self.result.findings.append(CSRFFinding(
                         url=base_url,
                         method="GET",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         title=f"Session cookie '{cookie.name}' missing SameSite",
                         description=f"The cookie '{cookie.name}' does not have SameSite attribute. "
                                    "Modern browsers default to Lax, but older browsers send it cross-site.",
@@ -866,11 +1046,11 @@ class CSRFScanner:
                     ))
                 elif samesite == "None":
                     # SameSite=None requires Secure flag
-                    if "Secure" not in set_cookie_header:
+                    if not secure_flag:
                         self.result.findings.append(CSRFFinding(
                             url=base_url,
                             method="GET",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             title=f"Cookie '{cookie.name}' has SameSite=None without Secure",
                             description="SameSite=None cookies must have Secure flag. "
                                        "Without it, the cookie is vulnerable to CSRF.",
@@ -881,7 +1061,7 @@ class CSRFScanner:
                         self.result.findings.append(CSRFFinding(
                             url=base_url,
                             method="GET",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             title=f"Cookie '{cookie.name}' uses SameSite=None",
                             description="SameSite=None allows cross-site cookie sending. "
                                        "Ensure additional CSRF protections are in place.",
@@ -907,8 +1087,9 @@ class CSRFScanner:
         impact_description = self._get_impact_description(impact_type)
         
         # Check if form has CSRF token field
-        fields = form.get("fields", [])
-        field_names = [f.get("name", "").lower() for f in fields]
+        # FIX: Crawler uses "inputs", not "fields"
+        fields = form.get("inputs", form.get("fields", []))
+        field_names = [f.get("name", "").lower() for f in fields if f.get("name")]
         
         has_csrf_token = any(
             csrf_name.lower() in name 
@@ -971,6 +1152,12 @@ class CSRFScanner:
             
             # If request succeeds with foreign origin, potential CSRF
             if response.status_code in [200, 201, 202, 204]:
+                # SPA detection: skip if the response is an SPA shell
+                ct = response.headers.get("content-type", "")
+                if self._is_spa_shell(response.text, ct, url):
+                    logger.debug(f"[CSRF] SPA shell at {url}, skipping endpoint CSRF test")
+                    return
+
                 # Check if response indicates the action was performed
                 # vs just returning an error in JSON
                 try:
@@ -1021,7 +1208,7 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=url,
                     method="POST",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     title=f"Endpoint accepts null Origin",
                     description=f"The endpoint '{endpoint}' accepts Origin: null but blocks other origins. "
                                "Attackers can exploit this with sandboxed iframes.",
@@ -1044,7 +1231,7 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=url,
                     method="POST",
-                    severity="MEDIUM",
+                    severity=Severity.MEDIUM,
                     title=f"X-Requested-With header bypass",
                     description=f"The endpoint '{endpoint}' can be accessed with X-Requested-With header "
                                "from any origin. This header can be set via CORS.",
@@ -1088,7 +1275,9 @@ class CSRFScanner:
     def _analyze_token(self, token: str) -> TokenAnalysis:
         """Perform comprehensive token analysis."""
         entropy_bits = self._calculate_entropy(token)
-        is_predictable = entropy_bits < 64  # Minimum recommended is 128 bits
+        # OWASP recommends 128 bits minimum for CSRF tokens
+        # 64 bits is weak against brute-force with modern hardware
+        is_predictable = entropy_bits < 128
         matched, framework = self._detect_token_pattern(token)
         
         return TokenAnalysis(
@@ -1141,16 +1330,16 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=base_url,
                         method="GET",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         title="CSRF Token with Low Entropy",
                         description=f"CSRF token has only {analysis.entropy_bits:.1f} bits of entropy. "
                                    "Recommended minimum is 128 bits for cryptographic security.",
                         evidence=f"Token: {analysis.token_value}, Entropy: {analysis.entropy_bits:.1f} bits",
                         remediation="Use cryptographically secure random token generation. "
                                    "Ensure at least 128 bits of entropy.",
-                        cwe="CWE-330",
+                        cwe_id="CWE-330",
                         vuln_type=CSRFVulnType.WEAK_TOKEN,
-                        confidence="HIGH",
+                        confidence=85.0,
                         cvss_score=6.5,
                     ))
                 
@@ -1159,14 +1348,14 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=base_url,
                         method="GET",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         title="Timestamp-Based CSRF Token",
                         description="CSRF token appears to be timestamp-based, making it predictable.",
                         evidence=f"Token starts with timestamp pattern: {token[:15]}",
                         remediation="Use cryptographically secure random tokens, not timestamps.",
-                        cwe="CWE-330",
+                        cwe_id="CWE-330",
                         vuln_type=CSRFVulnType.WEAK_TOKEN,
-                        confidence="HIGH",
+                        confidence=85.0,
                         cvss_score=7.5,
                     ))
                     
@@ -1210,7 +1399,7 @@ class CSRFScanner:
                                 self.result.findings.append(CSRFFinding(
                                     url=url,
                                     method="POST",
-                                    severity="HIGH",
+                                    severity=Severity.HIGH,
                                     title="JSON CSRF Vulnerability",
                                     description=f"Endpoint accepts JSON POST from cross-origin "
                                                f"with Content-Type: {content_type}",
@@ -1218,9 +1407,9 @@ class CSRFScanner:
                                             f"Response: {response.status_code}",
                                     remediation="Validate CSRF token for all JSON endpoints. "
                                                "Check Origin header strictly.",
-                                    cwe="CWE-352",
+                                    cwe_id="CWE-352",
                                     vuln_type=CSRFVulnType.JSON_CSRF,
-                                    confidence="HIGH",
+                                    confidence=85.0,
                                     cvss_score=8.0,
                                 ))
                                 return  # Found vulnerability, no need to continue
@@ -1242,16 +1431,16 @@ class CSRFScanner:
                             self.result.findings.append(CSRFFinding(
                                 url=url,
                                 method="POST",
-                                severity="MEDIUM",
+                                severity=Severity.MEDIUM,
                                 title="JSON via text/plain CSRF",
                                 description="Endpoint accepts text/plain with JSON body. "
                                            "Forms can send text/plain without CORS preflight.",
                                 evidence=f"text/plain accepted: {response2.status_code}",
                                 remediation="Reject requests with Content-Type: text/plain "
                                            "for JSON endpoints.",
-                                cwe="CWE-352",
+                                cwe_id="CWE-352",
                                 vuln_type=CSRFVulnType.CONTENT_TYPE_CONFUSION,
-                                confidence="MEDIUM",
+                                confidence=65.0,
                                 cvss_score=6.0,
                             ))
                             
@@ -1305,30 +1494,30 @@ class CSRFScanner:
                         self.result.findings.append(CSRFFinding(
                             url=url,
                             method="POST",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             title="Null Origin Bypass",
                             description="Endpoint accepts requests with Origin: null. "
                                        "Attackers can exploit via sandboxed iframes.",
                             evidence=f"null origin accepted: {response.status_code}",
                             remediation="Explicitly reject null origin in CORS config.",
-                            cwe="CWE-346",
+                            cwe_id="CWE-346",
                             vuln_type=CSRFVulnType.ORIGIN_BYPASS,
-                            confidence="HIGH",
+                            confidence=85.0,
                             cvss_score=7.5,
                         ))
                     elif "evil.com" in payload:
                         self.result.findings.append(CSRFFinding(
                             url=url,
                             method="POST",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             title="Origin Header Validation Bypass",
                             description=f"Endpoint accepts malicious origin: {payload}",
                             evidence=f"Origin: {payload}, Response: {response.status_code}",
                             remediation="Implement strict origin whitelist validation. "
                                        "Use exact domain matching, not substring.",
-                            cwe="CWE-346",
+                            cwe_id="CWE-346",
                             vuln_type=CSRFVulnType.ORIGIN_BYPASS,
-                            confidence="HIGH",
+                            confidence=85.0,
                             cvss_score=9.0,
                         ))
             
@@ -1348,15 +1537,15 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=url,
                         method="POST",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         title="Referer Header Validation Bypass",
                         description="Endpoint doesn't properly validate Referer header.",
                         evidence=f"Referer: {referer[:50]}, Response: {response.status_code}",
                         remediation="Implement Referer validation as defense-in-depth, "
                                    "but rely primarily on CSRF tokens.",
-                        cwe="CWE-346",
+                        cwe_id="CWE-346",
                         vuln_type=CSRFVulnType.REFERER_BYPASS,
-                        confidence="MEDIUM",
+                        confidence=65.0,
                         cvss_score=5.0,
                     ))
                     break
@@ -1386,31 +1575,31 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=base_url,
                     method="GET",
-                    severity="MEDIUM",
+                    severity=Severity.MEDIUM,
                     title="Missing Clickjacking Protection",
                     description="Page lacks X-Frame-Options and CSP frame-ancestors. "
                                "Combined with CSRF, enables UI redressing attacks.",
                     evidence=f"X-Frame-Options: {xfo or 'missing'}, "
                             f"CSP frame-ancestors: {'present' if has_csp_frame else 'missing'}",
                     remediation="Add 'X-Frame-Options: DENY' or CSP 'frame-ancestors: self'.",
-                    cwe="CWE-1021",
+                    cwe_id="CWE-1021",
                     vuln_type=CSRFVulnType.CLICKJACKING,
-                    confidence="HIGH",
+                    confidence=85.0,
                     cvss_score=4.3,
                 ))
             elif xfo == "ALLOWFROM" or "ALLOW-FROM" in xfo:
                 self.result.findings.append(CSRFFinding(
                     url=base_url,
                     method="GET",
-                    severity="LOW",
+                    severity=Severity.LOW,
                     title="Deprecated X-Frame-Options ALLOW-FROM",
                     description="X-Frame-Options uses deprecated ALLOW-FROM directive. "
                                "Use CSP frame-ancestors instead.",
                     evidence=f"X-Frame-Options: {xfo}",
                     remediation="Replace with CSP frame-ancestors directive.",
-                    cwe="CWE-16",
+                    cwe_id="CWE-16",
                     vuln_type=CSRFVulnType.CLICKJACKING,
-                    confidence="HIGH",
+                    confidence=85.0,
                     cvss_score=3.0,
                 ))
                 
@@ -1449,16 +1638,16 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=base_url,
                         method="GET",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         title="CSRF Token Not Rotated Per Request",
                         description="CSRF token remains the same across requests. "
                                    "Should rotate per-request for maximum security.",
                         evidence=f"Same token in consecutive requests: {token[:20]}...",
                         remediation="Implement per-request token rotation. "
                                    "At minimum, rotate tokens per session.",
-                        cwe="CWE-352",
+                        cwe_id="CWE-352",
                         vuln_type=CSRFVulnType.TOKEN_REUSE,
-                        confidence="MEDIUM",
+                        confidence=65.0,
                         cvss_score=4.0,
                     ))
                     break
@@ -1479,15 +1668,15 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=form_url,
                         method="POST",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         title="CSRF Token Reusable After Submission",
                         description="CSRF token accepted multiple times. "
                                    "Tokens should be single-use.",
                         evidence="Same token accepted in consecutive submissions",
                         remediation="Invalidate tokens after use. Implement single-use tokens.",
-                        cwe="CWE-352",
+                        cwe_id="CWE-352",
                         vuln_type=CSRFVulnType.TOKEN_REUSE,
-                        confidence="MEDIUM",
+                        confidence=65.0,
                         cvss_score=5.0,
                     ))
                     
@@ -1549,16 +1738,16 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=base_url,
                     method="POST",
-                    severity="MEDIUM",
+                    severity=Severity.MEDIUM,
                     title="Double-Submit Cookie Without HMAC",
                     description="Double-submit cookie pattern used without cryptographic binding. "
                                "Attacker with XSS can set both cookie and header values.",
                     evidence=f"Cookie: {csrf_cookie_name}, Can set matching header",
                     remediation="Use HMAC to bind CSRF token to session. "
                                "Or use synchronizer token pattern.",
-                    cwe="CWE-352",
+                    cwe_id="CWE-352",
                     vuln_type=CSRFVulnType.DOUBLE_SUBMIT_WEAK,
-                    confidence="MEDIUM",
+                    confidence=65.0,
                     cvss_score=5.5,
                 ))
             
@@ -1579,16 +1768,16 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=base_url,
                     method="POST",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     title="Double-Submit Cookie Accepts Arbitrary Values",
                     description="Server accepts any matching cookie/header values. "
                                "Token not cryptographically bound to session.",
                     evidence="Arbitrary token value accepted when cookie matches header",
                     remediation="Validate CSRF token against server-side stored value. "
                                "Use signed tokens with session binding.",
-                    cwe="CWE-352",
+                    cwe_id="CWE-352",
                     vuln_type=CSRFVulnType.DOUBLE_SUBMIT_WEAK,
-                    confidence="HIGH",
+                    confidence=85.0,
                     cvss_score=7.0,
                 ))
                 
@@ -1637,16 +1826,16 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=ws_url,
                         method="GET",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         title="Cross-Site WebSocket Hijacking (CSWSH)",
                         description="WebSocket endpoint accepts connections from any origin. "
                                    "Attacker can hijack authenticated WebSocket sessions.",
                         evidence=f"WebSocket upgrade accepted with Origin: evil.com",
                         remediation="Validate Origin header on WebSocket upgrade. "
                                    "Require CSRF token in WebSocket handshake.",
-                        cwe="CWE-352",
+                        cwe_id="CWE-352",
                         vuln_type=CSRFVulnType.WEBSOCKET_CSRF,
-                        confidence="HIGH",
+                        confidence=85.0,
                         cvss_score=8.0,
                     ))
                     break
@@ -1658,14 +1847,14 @@ class CSRFScanner:
                         self.result.findings.append(CSRFFinding(
                             url=ws_url,
                             method="GET",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             title="WebSocket Endpoint Found - Origin Check Unknown",
                             description="WebSocket endpoint found. Cannot verify origin validation.",
                             evidence=f"WebSocket endpoint: {ws_url}",
                             remediation="Ensure Origin header validation on WebSocket upgrade.",
-                            cwe="CWE-352",
+                            cwe_id="CWE-352",
                             vuln_type=CSRFVulnType.WEBSOCKET_CSRF,
-                            confidence="LOW",
+                            confidence=40.0,
                             cvss_score=5.0,
                         ))
                         break
@@ -1697,16 +1886,16 @@ class CSRFScanner:
                     self.result.findings.append(CSRFFinding(
                         url=base_url,
                         method="GET",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         title="CSRF Token in URL",
                         description=f"CSRF token '{param_name}' exposed in URL. "
                                    "Tokens in URLs leak via Referer header and browser history.",
                         evidence=f"Parameter: {param_name}={values[0][:20]}...",
                         remediation="Never include CSRF tokens in URLs. "
                                    "Use hidden form fields or custom headers.",
-                        cwe="CWE-598",
+                        cwe_id="CWE-598",
                         vuln_type=CSRFVulnType.TOKEN_LEAKAGE,
-                        confidence="HIGH",
+                        confidence=85.0,
                         cvss_score=6.5,
                     ))
             
@@ -1721,20 +1910,202 @@ class CSRFScanner:
                 self.result.findings.append(CSRFFinding(
                     url=base_url,
                     method="GET",
-                    severity="HIGH",
+                    severity=Severity.HIGH,
                     title="CSRF Token in HTML Links",
                     description="CSRF tokens found embedded in hyperlinks. "
                                "Will leak via Referer when clicking links.",
                     evidence=f"Found {len(link_matches)} links with tokens",
                     remediation="Remove tokens from URLs. Use POST forms or JavaScript.",
-                    cwe="CWE-598",
+                    cwe_id="CWE-598",
                     vuln_type=CSRFVulnType.TOKEN_LEAKAGE,
-                    confidence="HIGH",
+                    confidence=85.0,
                     cvss_score=6.5,
                 ))
                 
         except Exception as e:
             logger.debug(f"Token leakage check error: {e}")
+
+    # ========================================================================
+    # MULTI-STEP CSRF WORKFLOW TESTING
+    # ========================================================================
+
+    async def _test_multistep_csrf(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        forms: list[dict],
+    ) -> None:
+        """
+        Test multi-step workflows for CSRF vulnerabilities.
+
+        Many applications require multiple steps (e.g., confirm page before action).
+        Attackers can bypass CSRF protection if intermediate steps don't validate tokens.
+
+        Workflow patterns tested:
+        1. Password change: settings → confirm → change
+        2. Transfer: form → confirm → execute
+        3. Delete: action → confirm → delete
+        """
+        logger.info("🔄 Testing multi-step CSRF workflows...")
+
+        # Identify potential multi-step workflows
+        workflows = self._identify_workflows(forms)
+
+        for workflow in workflows:
+            try:
+                await self._test_workflow_csrf(client, base_url, workflow)
+            except Exception as e:
+                logger.debug(f"Workflow CSRF test error: {e}")
+
+    def _identify_workflows(self, forms: list[dict]) -> list[dict]:
+        """Identify potential multi-step workflows from forms and endpoints."""
+        workflows = []
+
+        # Pattern 1: Password change workflow
+        password_forms = [f for f in forms if any(
+            kw in f.get("action", "").lower()
+            for kw in ["password", "passwd", "pw"]
+        )]
+        if password_forms:
+            workflows.append({
+                "name": "Password Change",
+                "type": "password_change",
+                "steps": [
+                    {"action": "settings", "paths": ["/settings", "/account", "/profile"]},
+                    {"action": "confirm", "paths": ["/confirm", "/verify"]},
+                    {"action": "execute", "forms": password_forms},
+                ],
+                "impact": "CRITICAL",
+            })
+
+        # Pattern 2: Money transfer workflow
+        transfer_indicators = ["transfer", "send", "pay", "withdraw", "deposit"]
+        transfer_forms = [f for f in forms if any(
+            kw in f.get("action", "").lower()
+            for kw in transfer_indicators
+        )]
+        if transfer_forms:
+            workflows.append({
+                "name": "Money Transfer",
+                "type": "financial",
+                "steps": [
+                    {"action": "form", "forms": transfer_forms},
+                    {"action": "confirm", "paths": ["/confirm", "/review"]},
+                    {"action": "execute", "paths": ["/execute", "/submit"]},
+                ],
+                "impact": "CRITICAL",
+            })
+
+        # Pattern 3: Delete/deactivate workflow
+        delete_forms = [f for f in forms if any(
+            kw in f.get("action", "").lower()
+            for kw in ["delete", "remove", "deactivate", "close"]
+        )]
+        if delete_forms:
+            workflows.append({
+                "name": "Account Deletion",
+                "type": "destructive",
+                "steps": [
+                    {"action": "initiate", "forms": delete_forms},
+                    {"action": "confirm", "paths": ["/confirm", "/verify"]},
+                ],
+                "impact": "HIGH",
+            })
+
+        return workflows
+
+    async def _test_workflow_csrf(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        workflow: dict,
+    ) -> None:
+        """Test a multi-step workflow for CSRF vulnerabilities."""
+        workflow_name = workflow["name"]
+        steps = workflow["steps"]
+
+        # Track tokens across steps
+        tokens_per_step: list[str | None] = []
+        vulnerable_steps: list[int] = []
+
+        for i, step in enumerate(steps):
+            step_action = step.get("action", "")
+
+            # Try to get a page/form for this step
+            if "forms" in step and step["forms"]:
+                # Use the first form for testing
+                form = step["forms"][0]
+                form_url = form.get("action", "")
+                if not form_url.startswith("http"):
+                    form_url = f"{base_url}{form_url}"
+
+                # Check if this step requires a CSRF token
+                fields = form.get("fields", [])
+                csrf_field = None
+                for field in fields:
+                    if any(name in field.get("name", "").lower() for name in self.CSRF_TOKEN_NAMES):
+                        csrf_field = field
+                        break
+
+                if csrf_field:
+                    tokens_per_step.append(csrf_field.get("value", ""))
+                else:
+                    # No CSRF token in this step - potentially vulnerable
+                    tokens_per_step.append(None)
+                    if step_action in ("execute", "confirm"):
+                        vulnerable_steps.append(i)
+
+            elif "paths" in step:
+                # Probe paths to find the step
+                for path in step["paths"]:
+                    try:
+                        resp = await client.get(f"{base_url}{path}")
+                        if resp.status_code == 200:
+                            # Check for CSRF token in response
+                            html = resp.text
+                            has_token = any(
+                                name in html.lower()
+                                for name in self.CSRF_TOKEN_NAMES
+                            )
+                            tokens_per_step.append("found" if has_token else None)
+                            if not has_token and step_action in ("execute", "confirm"):
+                                vulnerable_steps.append(i)
+                            break
+                    except Exception:
+                        pass
+                else:
+                    tokens_per_step.append(None)
+
+        # Report if intermediate steps lack CSRF protection
+        if vulnerable_steps:
+            vulnerable_step_names = [steps[i].get("action", f"step {i}") for i in vulnerable_steps]
+            self.result.findings.append(CSRFFinding(
+                url=base_url,
+                method="POST",
+                severity=workflow.get("impact", "HIGH"),
+                title=f"Multi-Step {workflow_name} Workflow Missing CSRF Protection",
+                description=(
+                    f"The {workflow_name} workflow has {len(steps)} steps, but "
+                    f"step(s) {vulnerable_step_names} lack CSRF token validation. "
+                    "An attacker can skip directly to the vulnerable step, bypassing "
+                    "any CSRF protection on earlier steps."
+                ),
+                evidence=(
+                    f"Workflow: {workflow_name}\n"
+                    f"Steps: {len(steps)}\n"
+                    f"Vulnerable steps: {vulnerable_step_names}\n"
+                    f"Token presence: {tokens_per_step}"
+                ),
+                remediation=(
+                    "Validate CSRF tokens on EVERY step of multi-step workflows. "
+                    "Bind workflow state to the session to prevent step-skipping. "
+                    "Use unique tokens per step for sensitive operations."
+                ),
+                cwe_id="CWE-352",
+                vuln_type=CSRFVulnType.WORKFLOW_BYPASS,
+                confidence=80.0,
+                cvss_score=8.0 if workflow.get("impact") == "CRITICAL" else 6.5,
+            ))
 
 
 async def scan_csrf(

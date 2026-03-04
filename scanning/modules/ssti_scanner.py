@@ -45,7 +45,6 @@ Version: 2.0.0-enterprise
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 import time
 from dataclasses import dataclass, field
@@ -55,8 +54,12 @@ from urllib.parse import urljoin, quote, urlencode, parse_qs, urlparse
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, VulnCategory, Severity
+from scanning.vuln_scanner import ScanModule
+from scanning.scan_context import ScanContext
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
+from utils.network_utils import resolve_base_url
 from utils.rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
@@ -690,15 +693,144 @@ class SSTIScanner(ScanModule):
         "pebble": ["pebble", "PebbleException"],
     }
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    # G-09 FIX: Priority payloads for fast template engine fingerprinting
+    FINGERPRINT_PAYLOADS = [
+        # Ultra-fast math payloads - test ONE from each engine family
+        ("{{1337*997}}", "1333189", ["jinja2", "twig", "nunjucks", "pebble"]),
+        ("${1337*997}", "1333189", ["freemarker", "velocity", "mako", "thymeleaf"]),
+        ("<%= 1337*997 %>", "1333189", ["erb", "ejs"]),
+        ("{math equation=\"1337*997\"}", "1333189", ["smarty"]),
+        # String multiplication for Jinja2 confirmation
+        ("{{7*'7'}}", "7777777", ["jinja2"]),
+    ]
+
+    # G-09 FIX: Known SSTI-vulnerable endpoints for proactive discovery
+    KNOWN_SSTI_PATHS = [
+        # bWAPP SSTI
+        "/bWAPP/ssti.php",
+        "/ssti.php",
+        # Flask/Jinja2 common patterns
+        "/render",
+        "/template",
+        "/preview",
+        "/api/render",
+        "/api/template",
+        # Generic
+        "/page",
+        "/view",
+        "/display",
+    ]
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         # Track partial findings for timeout recovery
         self._partial_findings: list[dict[str, Any]] = []
+
+        # G-09 FIX: Overall scan timeout (was defined but never used!)
+        self.MAX_SCAN_DURATION = 120.0  # 2 minutes max for entire module
+        self._scan_start_time: float = 0.0
+
+        # TIMEOUT-FIX 2026-02-12: Per-endpoint timeout and early exit
+        self.endpoint_timeout = 30.0       # Max 30s per endpoint (SSTI tests are relatively fast)
+        self._endpoints_without_findings: int = 0
+        self._max_no_progress_endpoints = 20  # Reduce thoroughness after 20 endpoints with no findings
+
+        # G-09 FIX: Detected template engine (set during fingerprinting)
+        self._detected_engine: Optional[TemplateEngine] = None
     
     def get_partial_findings(self) -> list[dict[str, Any]]:
         """Return partial findings collected so far (for timeout recovery)."""
         return self._partial_findings.copy()
+
+    async def _discover_ssti_endpoints(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        rate_limiter: RateLimiter,
+    ) -> list[str]:
+        """G-09 FIX: Proactively discover SSTI-vulnerable endpoints."""
+        discovered = []
+
+        for path in self.KNOWN_SSTI_PATHS:
+            await rate_limiter.acquire()
+            url = urljoin(base_url, path)
+
+            try:
+                response = await client.get(url, follow_redirects=True)
+                if response.status_code != 404 and len(response.text) > 100:
+                    # Check for template indicators
+                    text_lower = response.text.lower()
+                    ssti_indicators = [
+                        "template", "render", "jinja", "twig", "freemarker",
+                        "{{", "${", "<%", "name=", "content=", "message=",
+                    ]
+                    if any(ind in text_lower for ind in ssti_indicators):
+                        discovered.append(url)
+                        logger.debug(f"[SSTI] Discovered endpoint: {url}")
+            except Exception:
+                pass
+
+        return discovered
+
+    async def _fingerprint_template_engine(
+        self,
+        client: httpx.AsyncClient,
+        urls: list[str],
+        rate_limiter: RateLimiter,
+    ) -> Optional[TemplateEngine]:
+        """
+        G-09 FIX: Quick fingerprinting to detect template engine BEFORE full testing.
+
+        Tests priority payloads on a few endpoints to identify the engine early.
+        This allows focused testing with engine-specific payloads.
+        """
+        engine_hits: dict[str, int] = {}
+        test_params = ["name", "template", "page", "test", "q"]
+
+        for url in urls[:3]:  # Only test first 3 URLs for fingerprinting
+            for param in test_params[:2]:  # Only test 2 params per URL
+                for payload, expected, engines in self.FINGERPRINT_PAYLOADS:
+                    await rate_limiter.acquire()
+
+                    try:
+                        test_url = self._build_test_url(url, param, payload)
+                        response = await client.get(test_url)
+
+                        if expected in response.text and payload not in response.text:
+                            # Template evaluation detected!
+                            for engine in engines:
+                                engine_hits[engine] = engine_hits.get(engine, 0) + 1
+                            logger.debug(f"[SSTI] Fingerprint hit: {engines} via {payload}")
+
+                    except Exception:
+                        pass
+
+        # Return the most likely engine
+        if engine_hits:
+            best_engine = max(engine_hits, key=engine_hits.get)
+            engine_map = {
+                "jinja2": TemplateEngine.JINJA2,
+                "twig": TemplateEngine.TWIG,
+                "freemarker": TemplateEngine.FREEMARKER,
+                "velocity": TemplateEngine.VELOCITY,
+                "mako": TemplateEngine.MAKO,
+                "thymeleaf": TemplateEngine.THYMELEAF,
+                "erb": TemplateEngine.ERB,
+                "ejs": TemplateEngine.EJS,
+                "smarty": TemplateEngine.SMARTY,
+                "nunjucks": TemplateEngine.NUNJUCKS,
+                "pebble": TemplateEngine.PEBBLE,
+            }
+            return engine_map.get(best_engine)
+
+        return None
     
     async def scan(
         self,
@@ -708,20 +840,119 @@ class SSTIScanner(ScanModule):
     ) -> dict[str, Any]:
         """
         Enterprise: Comprehensive SSTI vulnerability scan.
+
+        G-09 FIX: Uses fingerprinting-first approach:
+        1. Phase 0: Discover SSTI endpoints
+        2. Phase 1: Quick fingerprint to detect template engine
+        3. Phase 2: Focused testing with engine-specific payloads
+        4. Phase 3: WAF bypass and blind testing (only if promising)
         """
         findings: list[dict[str, Any]] = []
         self._partial_findings = []  # Reset partial findings
-        
+        self._scan_start_time = time.time()  # G-09 FIX: Track overall scan time
+        self._detected_engine = None
+
         # Helper to extend findings and track for partial recovery
         def extend_findings(new_findings: list[dict[str, Any]]) -> None:
             findings.extend(new_findings)
             self._partial_findings.extend(new_findings)
-        
-        base_url = f"https://{host}" if not host.startswith("http") else host
-        endpoints = asset_data.get("endpoints", [])
-        urls = asset_data.get("urls", [base_url])
-        forms = asset_data.get("forms", [])
-        
+
+        # G-09 FIX: Check overall timeout
+        def check_timeout() -> bool:
+            return (time.time() - self._scan_start_time) >= self.MAX_SCAN_DURATION
+
+        base_url = resolve_base_url(host)
+        if isinstance(asset_data, dict):
+            endpoints = asset_data.get("endpoints", [])
+        if isinstance(asset_data, dict):
+            urls = asset_data.get("urls", [base_url])
+        if isinstance(asset_data, dict):
+            forms = asset_data.get("forms", [])
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+        self._auth_headers = self._ctx.auth_headers
+        # PERF-FIX 2026-02-20: Store asset_data for intelligent payload selection
+        self._asset_data = asset_data
+        if self._ctx.has_auth:
+            logger.info(f"[SSTI] Using authenticated session ({self._ctx.auth_method})")
+
+        # STACK PROFILE: Use template-engine-specific payloads when available
+        if isinstance(asset_data, dict):
+            runtime_engine = asset_data.get("runtime_engine")
+        if isinstance(asset_data, dict):
+            stack_profile = asset_data.get("stack_profile")
+        self._stack_specific_payloads: list[str] = []
+        if runtime_engine and stack_profile:
+            try:
+                ssti_payloads = runtime_engine.get_ssti_payloads(stack_profile)
+                if ssti_payloads:
+                    self._stack_specific_payloads = ssti_payloads
+                    tpl_type = stack_profile.get("template_engine", "unknown") if isinstance(stack_profile, dict) else getattr(stack_profile, "template_engine", "unknown")
+                    logger.info(f"[SSTI] Using {len(ssti_payloads)} stack-specific payloads for {tpl_type}")
+            except Exception as e:
+                logger.debug(f"[SSTI] Could not get stack-specific payloads: {e}")
+
+        # TOOL DISCOVERED PARAMS: Test parameters found by arjun
+        if isinstance(asset_data, dict):
+            tool_discovered_params = asset_data.get("tool_discovered_params") or {}
+        if tool_discovered_params:
+            logger.info(f"[SSTI] Using {len(tool_discovered_params)} parameter sets discovered by arjun")
+            # Add discovered params to endpoints for testing
+            for endpoint_url, params in tool_discovered_params.items():
+                if params and endpoint_url not in endpoints:
+                    for param in params[:5]:  # Test up to 5 params per endpoint
+                        test_url = f"{endpoint_url}?{param}=test"
+                        endpoints.append(test_url)
+
+        # ENHANCEMENT 2026-02-20: Get endpoint_params and vuln_type_hints from metadata discovery
+        # This enables testing of endpoints discovered from /scanner, /api-docs, etc.
+        endpoint_params: dict[str, list[str]] = {}
+        vuln_type_hints: dict[str, list[str]] = {}
+        if isinstance(asset_data, dict):
+            endpoint_params = asset_data.get("endpoint_params", {})
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+        if endpoint_params:
+            logger.info(f"[SSTI] Received {len(endpoint_params)} endpoints with params from metadata discovery")
+
+        # Add metadata-discovered endpoints with SSTI hints
+        ssti_hint_types = {"SSTI", "SERVER_SIDE_TEMPLATE_INJECTION", "TEMPLATE_INJECTION"}
+        for ep_url, hints in vuln_type_hints.items():
+            if not any(h in ssti_hint_types for h in hints):
+                continue
+            # Normalize URL
+            if ep_url.startswith("/"):
+                full_url = f"{base_url}{ep_url}"
+            elif not ep_url.startswith("http"):
+                full_url = f"{base_url}/{ep_url}"
+            else:
+                full_url = ep_url
+            # Add with parameters
+            params = endpoint_params.get(ep_url, ["template", "name", "input", "text", "content"])
+            for param in params[:3]:  # Limit to 3 params
+                test_url = f"{full_url}?{param}=test" if "?" not in full_url else f"{full_url}&{param}=test"
+                if test_url not in endpoints:
+                    endpoints.append(test_url)
+                    logger.debug(f"[SSTI] Adding metadata endpoint: {test_url}")
+        if vuln_type_hints:
+            ssti_hinted = sum(1 for hints in vuln_type_hints.values() if any(h in ssti_hint_types for h in hints))
+            if ssti_hinted > 0:
+                logger.info(f"[SSTI] Added {ssti_hinted} endpoints with SSTI hints")
+
+        # SHARED FINDINGS STORE: Cross-module targeting
+        if isinstance(asset_data, dict):
+            shared_store = asset_data.get("shared_findings_store")
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            existing = set(endpoints + urls)
+            # SSTI often works where XSS/reflection works
+            for vtype in [VulnType.XSS, VulnType.DOM_XSS]:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint and sf.endpoint not in existing:
+                        endpoints.append(sf.endpoint)
+                        logger.debug(f"[SSTI] Cross-module target from {sf.module}: {sf.endpoint}")
+
         # Combine all testable URLs and FILTER OUT static assets
         all_urls_raw = list(set(endpoints + urls))
 
@@ -740,44 +971,118 @@ class SSTIScanner(ScanModule):
 
         all_urls = all_urls[:50]
 
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        # TIMEOUT-FIX 2026-02-12: Initialize progress tracking
+        self._endpoints_without_findings = 0
+
+        async with get_scan_client(
+            timeout=self.timeout,
+            custom_headers=self._auth_headers if hasattr(self, "_auth_headers") else None,
+        ) as client:
+            # G-09 FIX: Phase 0 - Discover SSTI endpoints proactively
+            discovered_ssti = await self._discover_ssti_endpoints(client, base_url, rate_limiter)
+            if discovered_ssti:
+                logger.info(f"[SSTI] Discovered {len(discovered_ssti)} potential SSTI endpoints")
+                # Add discovered to front of list (higher priority)
+                all_urls = discovered_ssti + [u for u in all_urls if u not in discovered_ssti]
+
+            # G-09 FIX: Phase 1 - Quick fingerprint on first few endpoints
+            if not check_timeout():
+                engine = await self._fingerprint_template_engine(client, all_urls[:5], rate_limiter)
+                if engine:
+                    self._detected_engine = engine
+                    logger.info(f"[SSTI] Fingerprinted template engine: {engine.name}")
+
             for url in all_urls:
-                # Phase 1: Test URL parameters
-                param_findings = await self._test_url_params_enterprise(
-                    client, url, rate_limiter
-                )
-                extend_findings(param_findings)
-                
-                # Phase 2: Test form inputs
-                form_findings = await self._test_forms_enterprise(
-                    client, url, rate_limiter
-                )
-                extend_findings(form_findings)
-                
-                # Phase 3: Test path-based injection
-                path_findings = await self._test_path_injection_enterprise(
-                    client, url, rate_limiter
-                )
-                extend_findings(path_findings)
-                
-                # Phase 4: Test headers
-                header_findings = await self._test_headers_enterprise(
-                    client, url, rate_limiter
-                )
-                extend_findings(header_findings)
-                
-                # Phase 5: WAF bypass testing
-                waf_findings = await self._test_waf_bypass(
-                    client, url, rate_limiter
-                )
-                extend_findings(waf_findings)
-                
-                # Phase 6: Blind SSTI detection
-                blind_findings = await self._test_blind_ssti(
-                    client, url, rate_limiter
-                )
-                extend_findings(blind_findings)
-        
+                # G-09 FIX: Check overall timeout
+                if check_timeout():
+                    logger.info(f"[SSTI] Overall timeout ({self.MAX_SCAN_DURATION}s) - returning partial results")
+                    break
+
+                # TIMEOUT-FIX 2026-02-12: Early exit if no progress
+                if self._endpoints_without_findings >= self._max_no_progress_endpoints:
+                    logger.info(f"[SSTI] No findings after {self._endpoints_without_findings} endpoints, skipping remaining")
+                    break
+
+                try:
+                    # TIMEOUT-FIX 2026-02-12: Per-endpoint timeout
+                    async with asyncio.timeout(self.endpoint_timeout):
+                        # Phase 2: Test URL parameters (uses detected engine if available)
+                        param_findings = await self._test_url_params_enterprise(
+                            client, url, rate_limiter
+                        )
+                        extend_findings(param_findings)
+
+                        # G-09 FIX: Skip expensive tests if timeout approaching
+                        if check_timeout():
+                            break
+
+                        # Phase 3: Test form inputs
+                        form_findings = await self._test_forms_enterprise(
+                            client, url, rate_limiter
+                        )
+                        extend_findings(form_findings)
+
+                        # Phase 4: Test path-based injection
+                        path_findings = await self._test_path_injection_enterprise(
+                            client, url, rate_limiter
+                        )
+                        extend_findings(path_findings)
+
+                        # G-09 FIX: Headers/WAF/Blind only if we have time
+                        if (time.time() - self._scan_start_time) < self.MAX_SCAN_DURATION * 0.7:
+                            # Phase 5: Test headers
+                            header_findings = await self._test_headers_enterprise(
+                                client, url, rate_limiter
+                            )
+                            extend_findings(header_findings)
+
+                            # Phase 6: WAF bypass testing
+                            waf_findings = await self._test_waf_bypass(
+                                client, url, rate_limiter
+                            )
+                            extend_findings(waf_findings)
+
+                            # Phase 7: Blind SSTI detection (only if promising findings)
+                            if findings:
+                                blind_findings = await self._test_blind_ssti(
+                                    client, url, rate_limiter
+                                )
+                                extend_findings(blind_findings)
+
+                        # Track progress
+                        found_any = param_findings or form_findings or path_findings or header_findings or waf_findings or blind_findings
+                        if found_any:
+                            self._endpoints_without_findings = 0  # Reset on finding
+                        else:
+                            self._endpoints_without_findings += 1
+                except asyncio.TimeoutError:
+                    logger.warning(f"[SSTI] Endpoint timeout after {self.endpoint_timeout}s: {url}")
+                    self._endpoints_without_findings += 1
+                except Exception as e:
+                    logger.debug(f"[SSTI] Error testing URL {url}: {e}")
+
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        try:
+            from utils.shared_findings_store import SharedFindingsStore, VulnType
+            store = SharedFindingsStore.get_instance()
+            for f in findings:
+                if isinstance(f, dict):
+                    metadata = f.get("metadata", {})
+                    await store.add_finding(
+                        {
+                            "type": VulnType.SSTI,
+                            "endpoint": f.get("matched_at") or metadata.get("url", ""),
+                            "severity": f.get("severity", "HIGH"),
+                            "parameter": metadata.get("param") or metadata.get("vulnerable_param", ""),
+                            "template_engine": metadata.get("template_engine", ""),
+                        },
+                        module="ssti",
+                    )
+            if findings:
+                logger.debug(f"[SSTI] Shared {len(findings)} findings to cross-module store")
+        except Exception as e:
+            logger.debug(f"[SSTI] Could not share findings: {e}")
+
         return {"findings": findings}
     
     async def _test_url_params_enterprise(
@@ -808,12 +1113,42 @@ class SSTIScanner(ScanModule):
         all_params = list(set(test_params + list(existing_params.keys())))
         
         for param in all_params[:20]:  # Limit to avoid excessive testing
-            # First test with polyglot payloads
-            for detection in POLYGLOT_DETECTION_PAYLOADS[:10]:
+            # PERF-FIX 2026-02-20: Try intelligent payload selection first
+            intelligent_payloads = await self._get_intelligent_payloads(
+                category="ssti",
+                endpoint=url,
+                param_name=param,
+                max_payloads=30,
+                asset_data=getattr(self, '_asset_data', None),
+            )
+
+            # Build detection payloads list - prioritize intelligent if available
+            if intelligent_payloads:
+                # Convert intelligent payloads to detection format
+                # intelligent_payloads is list of (payload_str, metadata_dict)
+                detection_payloads = []
+                for payload_str, meta in intelligent_payloads:
+                    detection_payloads.append({
+                        "payload": payload_str,
+                        "expected": meta.get("expected", "1333189"),  # Default SSTI marker
+                        "engines": meta.get("engines", []),
+                    })
+                # Add remaining polyglot payloads (already seen payloads will naturally fail duplicate check)
+                existing_payload_strs = {d["payload"] for d in detection_payloads}
+                for poly in POLYGLOT_DETECTION_PAYLOADS:
+                    if poly["payload"] not in existing_payload_strs:
+                        detection_payloads.append(poly)
+                logger.debug(f"[SSTI] Using {len(intelligent_payloads)} intelligent + {len(POLYGLOT_DETECTION_PAYLOADS)} polyglot payloads for {param}")
+            else:
+                # Fallback to standard polyglot payloads
+                detection_payloads = POLYGLOT_DETECTION_PAYLOADS[:10]
+
+            # Test with selected payloads
+            for detection in detection_payloads[:30]:  # Cap at 30 payloads per param
                 await rate_limiter.acquire()
-                
+
                 payload = detection["payload"]
-                expected = detection["expected"]
+                expected = detection.get("expected", "1333189")
                 
                 try:
                     test_url = self._build_test_url(url, param, payload)
@@ -822,38 +1157,54 @@ class SSTIScanner(ScanModule):
                     result = self._analyze_ssti_response(
                         response.text, payload, expected
                     )
-                    
+
                     if result.vulnerable:
+                        # GAP-2 FIX 2026-02-13: Negative control check
+                        # Verify the expected result doesn't appear with benign input
+                        is_valid = await self.quick_negative_control(
+                            http_client=client,
+                            url=url,
+                            param=param,
+                            indicator=expected,
+                            vuln_vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
+                        )
+                        if not is_valid:
+                            logger.debug(f"[SSTI] Negative control failed for {param}: '{expected}' appears with benign input")
+                            continue  # Skip this FP
+
                         # Confirmed SSTI - identify engine
                         engine = await self._identify_engine_enterprise(
                             client, url, param, rate_limiter
                         )
-                        
+
                         finding = Finding(
-                            type="ssti",
+                            vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                             name=f"Server-Side Template Injection ({engine.name if engine else 'Unknown'})",
-                            severity="CRITICAL",
-                            confidence=result.confidence * 100,  # Convert 0-1 to 0-100
+                            severity=Severity.CRITICAL,
+                            confidence_score=result.confidence * 100,  # Convert 0-1 to 0-100
                             description=f"SSTI vulnerability detected in parameter '{param}'. "
                                        f"Template engine: {engine.name if engine else 'Unknown'}. "
                                        f"Template expressions are being evaluated server-side.",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Parameter: {param}",
                                 f"Payload: {payload}",
                                 f"Expected result: {expected}",
                                 f"Confidence: {result.confidence:.0%}",
                                 f"Engine indicators: {', '.join(result.evidence)}",
+                                "Note: Negative control passed (result absent with benign input)",
                             ],
                             cvss_score=9.8,
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             remediation="Never pass user input directly to template engines. "
                                        "Use logic-less templates (Mustache) or strict sandboxing. "
                                        "Implement input validation and output encoding. "
                                        "Consider using template engines with auto-escaping.",
                         ).to_dict()
-                        
+
                         findings.append(finding)
                         
                         # Test for RCE
@@ -863,8 +1214,9 @@ class SSTIScanner(ScanModule):
                             )
                             findings.extend(rce_findings)
                         
-                        break  # Found SSTI in this param
-                        
+                        # FN-C1 FIX: Removed break - test ALL params for SSTI
+                        # Multiple params may be vulnerable with different engines
+
                 except Exception as e:
                     logger.debug(f"SSTI test error: {e}")
         
@@ -931,7 +1283,8 @@ class SSTIScanner(ScanModule):
         engine_scores: dict[TemplateEngine, int] = {e: 0 for e in TemplateEngine}
         
         for engine, config in ENGINE_SPECIFIC_DETECTION.items():
-            for payload_config in config["payloads"][:5]:
+            # FN-C2 FIX: Test more payloads for engine detection (was [:5])
+            for payload_config in config["payloads"][:10]:
                 await rate_limiter.acquire()
                 
                 try:
@@ -948,10 +1301,12 @@ class SSTIScanner(ScanModule):
                     for sig in config.get("error_signatures", []):
                         if sig in response.text:
                             engine_scores[engine] += 2
-                            
-                except Exception:
+
+                except Exception as e:
+                    # FN-H5 FIX: Log exceptions
+                    logger.debug(f"SSTI engine detection failed for {engine}: {e}")
                     continue
-        
+
         # Return engine with highest score
         if max(engine_scores.values()) > 0:
             return max(engine_scores, key=engine_scores.get)
@@ -986,7 +1341,8 @@ class SSTIScanner(ScanModule):
             ("child_process", "Node.js"),
         ]
         
-        for payload in rce_payloads[:5]:  # Limit RCE tests
+        # FN-C2 FIX: Test more RCE payloads (was [:5])
+        for payload in rce_payloads[:15]:
             await rate_limiter.acquire()
             
             try:
@@ -1006,13 +1362,14 @@ class SSTIScanner(ScanModule):
                             rce_output = text[start:end].strip()
 
                         findings.append(Finding(
-                            type="ssti",
+                            vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                             name=f"SSTI Remote Code Execution Confirmed ({engine.name})",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description=f"Remote code execution confirmed via SSTI in {engine.name}. "
                                        f"Attacker can execute arbitrary commands on the server.",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Engine: {engine.name}",
                                 f"RCE payload: {payload[:100]}...",
@@ -1020,7 +1377,7 @@ class SSTIScanner(ScanModule):
                                 f"Command output captured: {rce_output[:300]}" if rce_output else "Output present but not extracted",
                             ],
                             cvss_score=10.0,
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             remediation="CRITICAL: Immediate action required. "
                                        "This vulnerability allows full server compromise. "
                                        "Patch the application immediately.",
@@ -1076,26 +1433,29 @@ class SSTIScanner(ScanModule):
                         if detection["expected"] in post_resp.text:
                             if detection["payload"] not in post_resp.text:
                                 findings.append(Finding(
-                                    type="ssti",
+                                    vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                                     name="SSTI in Form Input",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description=f"SSTI via form input '{input_name}'",
                                     host=urlparse(url).netloc,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"Input: {input_name}",
                                         f"Payload: {detection['payload']}",
                                         f"Result: {detection['expected']}",
                                     ],
                                     cvss_score=9.8,
-                                    cwe="CWE-94",
+                                    cwe_id="CWE-94",
                                     remediation="Sanitize all form inputs before template processing.",
                                 ).to_dict())
                                 break
-                                
-                    except Exception:
+
+                    except Exception as e:
+                        # FN-H5 FIX: Log exceptions
+                        logger.debug(f"SSTI form test failed for {input_name}: {e}")
                         continue
-                        
+
         except Exception as e:
             logger.debug(f"Form test error: {e}")
         
@@ -1145,19 +1505,20 @@ class SSTIScanner(ScanModule):
                     # Verify it's not just the payload reflected
                     if "{{1337*997}}" not in response.text and "${1337*997}" not in response.text:
                         findings.append(Finding(
-                            type="ssti",
+                            vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                             name="SSTI in URL Path",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description="URL path is processed by template engine. "
                                        "Route parameters are being evaluated.",
                             host=urlparse(base_url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Vulnerable path: {path}",
                                 "Template expression evaluated in URL path",
                             ],
                             cvss_score=9.8,
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             remediation="Do not use template engines to process URL paths. "
                                        "Use parameterized routes with strict validation.",
                         ).to_dict())
@@ -1208,18 +1569,19 @@ class SSTIScanner(ScanModule):
                     # Verify not reflected as-is
                     if payload not in response.text:
                         findings.append(Finding(
-                            type="ssti",
+                            vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                             name=f"SSTI via HTTP Header ({header_name})",
-                            severity="CRITICAL",
+                            severity=Severity.CRITICAL,
                             description=f"Header '{header_name}' is processed by template engine",
                             host=urlparse(url).netloc,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"Vulnerable header: {header_name}",
                                 f"Payload: {payload}",
                             ],
                             cvss_score=9.8,
-                            cwe="CWE-94",
+                            cwe_id="CWE-94",
                             remediation="Never process HTTP headers through template engines. "
                                        "Headers should be validated and sanitized separately.",
                         ).to_dict())
@@ -1268,20 +1630,21 @@ class SSTIScanner(ScanModule):
 
                 if "1333189" in response.text:
                     findings.append(Finding(
-                        type="ssti",
+                        vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                         name=f"SSTI WAF Bypass ({bypass['type']})",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description=f"WAF/filter bypass successful using {bypass['type']}. "
                                    "Input filtering can be circumvented.",
                         host=urlparse(url).netloc,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"Bypass type: {bypass['type']}",
                             f"Original: {bypass['original']}",
                             f"Bypass payload: {bypass_payload}",
                         ],
                         cvss_score=8.1,
-                        cwe="CWE-94",
+                        cwe_id="CWE-94",
                         remediation="Implement proper input sanitization at the application level. "
                                    "WAF rules are not sufficient for SSTI prevention.",
                     ).to_dict())
@@ -1320,14 +1683,15 @@ class SSTIScanner(ScanModule):
                 # Check if response was delayed
                 if elapsed >= expected_delay * 0.8:  # Allow 20% tolerance
                     findings.append(Finding(
-                        type="ssti",
+                        vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                         name=f"Blind SSTI Detected ({engine})",
-                        severity="HIGH",
+                        severity=Severity.HIGH,
                         description=f"Time-based blind SSTI detected. "
                                    f"Template engine appears to be {engine}. "
                                    f"Response delayed by ~{elapsed:.1f}s.",
                         host=urlparse(url).netloc,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"Engine: {engine}",
                             f"Expected delay: {expected_delay}s",
@@ -1335,7 +1699,7 @@ class SSTIScanner(ScanModule):
                             f"Payload: {payload[:100]}...",
                         ],
                         cvss_score=8.1,
-                        cwe="CWE-94",
+                        cwe_id="CWE-94",
                         remediation="Investigate and patch the blind SSTI vulnerability. "
                                    "Even without direct output, this can lead to RCE.",
                     ).to_dict())
@@ -1344,15 +1708,16 @@ class SSTIScanner(ScanModule):
             except asyncio.TimeoutError:
                 # Timeout might indicate successful sleep
                 findings.append(Finding(
-                    type="ssti",
+                    vuln_type=VulnType.SSTI,
+                        category=VulnCategory.INJECTION,
                     name=f"Potential Blind SSTI ({blind_test['engine']})",
-                    severity="MEDIUM",
-                    description="Request timeout may indicate blind SSTI. Manual verification needed.",
+                    severity=Severity.MEDIUM,
+                    description="Request timeout may indicate blind SSTI. Timing-based detection - timeout consistent with sleep payload.",
                     host=urlparse(url).netloc,
-                    matched_at=url,
+                    endpoint=url,
                     evidence=[f"Request timed out with sleep payload"],
                     cvss_score=6.5,
-                    cwe="CWE-94",
+                    cwe_id="CWE-94",
                     remediation="Investigate potential blind SSTI vulnerability.",
                 ).to_dict())
                 

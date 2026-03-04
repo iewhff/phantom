@@ -5,7 +5,6 @@ Tests for rate limiting bypass and brute force vulnerabilities.
 
 from __future__ import annotations
 
-import asyncio
 import secrets
 import time
 from typing import TYPE_CHECKING, Any
@@ -13,9 +12,12 @@ from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -55,9 +57,15 @@ class RateLimitScanner(ScanModule):
         {"X-ProxyUser-Ip": "127.0.0.1"},
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
@@ -66,11 +74,16 @@ class RateLimitScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Scan for rate limiting vulnerabilities."""
+        
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Test authentication endpoints
             auth_findings = await self._test_auth_rate_limit(
                 client, base_url, rate_limiter
@@ -156,14 +169,14 @@ class RateLimitScanner(ScanModule):
                         locked = True
                         findings.append(Finding(
                             name="Rate Limiting Present",
-                            severity="INFO",
-                            confidence="HIGH",
+                            severity=Severity.INFO,
+                            confidence_score=85.0,
                             description=f"Rate limiting active after {i} attempts",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 f"429 returned after {i} requests",
                             ],
-                            cwe="CWE-307",
+                            cwe_id="CWE-307",
                             remediation="Rate limiting is correctly configured.",
                         ))
                         break
@@ -177,15 +190,15 @@ class RateLimitScanner(ScanModule):
             if not locked and failed_count >= 15:
                 findings.append(Finding(
                     name="Missing Authentication Rate Limiting",
-                    severity="HIGH",
-                    confidence="HIGH",
+                    severity=Severity.HIGH,
+                    confidence_score=85.0,
                     description="No rate limiting on authentication endpoint",
-                    matched_at=url,
+                    endpoint=url,
                     evidence=[
                         f"{failed_count} failed attempts without lockout",
                         "Brute force attacks possible",
                     ],
-                    cwe="CWE-307",
+                    cwe_id="CWE-307",
                     cvss_score=7.5,
                     remediation="Implement rate limiting. Use progressive delays. "
                                "Lock accounts after N failures.",
@@ -247,17 +260,18 @@ class RateLimitScanner(ScanModule):
                     rps = success_count / elapsed if elapsed > 0 else 0
                     
                     findings.append(Finding(
+                        vuln_type=VulnType.RATE_LIMIT_BYPASS,
                         name="Missing API Rate Limiting",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description=f"No rate limiting on API endpoint ({rps:.1f} req/s)",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"{success_count} requests completed",
                             f"Time: {elapsed:.2f}s",
                             "DoS and abuse possible",
                         ],
-                        cwe="CWE-770",
+                        cwe_id="CWE-770",
                         cvss_score=5.3,
                         remediation="Implement API rate limiting. Use token bucket or sliding window.",
                     ))
@@ -333,15 +347,15 @@ class RateLimitScanner(ScanModule):
                     
                     findings.append(Finding(
                         name="Rate Limit Bypass via Header",
-                        severity="HIGH",
-                        confidence="HIGH",
+                        severity=Severity.HIGH,
+                        confidence_score=85.0,
                         description=f"Rate limiting bypassed using {header_name} header",
-                        matched_at=auth_url,
+                        endpoint=auth_url,
                         evidence=[
                             f"Bypass header: {header_name}",
                             "Rate limit not applied with spoofed IP",
                         ],
-                        cwe="CWE-307",
+                        cwe_id="CWE-307",
                         cvss_score=7.5,
                         remediation="Don't trust client IP headers for rate limiting. "
                                    "Use session/account-based rate limiting.",
@@ -375,15 +389,15 @@ class RateLimitScanner(ScanModule):
                 if response.status_code != 429:
                     findings.append(Finding(
                         name="Rate Limit Bypass via URL Variation",
-                        severity="HIGH",
-                        confidence="MEDIUM",
+                        severity=Severity.HIGH,
+                        confidence_score=65.0,
                         description="Rate limiting bypassed using URL case/path variation",
-                        matched_at=var_url,
+                        endpoint=var_url,
                         evidence=[
                             f"Original: {auth_url}",
                             f"Bypass: {var_url}",
                         ],
-                        cwe="CWE-307",
+                        cwe_id="CWE-307",
                         cvss_score=7.5,
                         remediation="Normalize URLs before rate limit checks.",
                     ))
@@ -436,15 +450,15 @@ class RateLimitScanner(ScanModule):
                 if success_count >= 8:
                     findings.append(Finding(
                         name="Missing Password Reset Rate Limiting",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="Password reset endpoint not rate limited",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"{success_count} resets without throttling",
                             "Email bombing/enumeration possible",
                         ],
-                        cwe="CWE-307",
+                        cwe_id="CWE-307",
                         cvss_score=5.3,
                         remediation="Implement rate limiting on password reset. "
                                    "Limit per email and per IP.",
@@ -503,15 +517,15 @@ class RateLimitScanner(ScanModule):
                 if success_count >= 10:
                     findings.append(Finding(
                         name="Missing Registration Rate Limiting",
-                        severity="MEDIUM",
-                        confidence="HIGH",
+                        severity=Severity.MEDIUM,
+                        confidence_score=85.0,
                         description="Registration endpoint not rate limited",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[
                             f"{success_count} registrations without throttling",
                             "Spam account creation possible",
                         ],
-                        cwe="CWE-770",
+                        cwe_id="CWE-770",
                         cvss_score=5.3,
                         remediation="Implement registration rate limiting. "
                                    "Use CAPTCHA and email verification.",

@@ -40,18 +40,18 @@ Version: 1.0.0
 
 from __future__ import annotations
 
-import asyncio
 import socket
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 from utils.http_client import create_protected_client, get_configured_ssl_verify
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -507,9 +507,15 @@ class SubdomainTakeoverScanner(ScanModule):
     name = "subdomain_takeover_scanner"
     version = TAKEOVER_SCANNER_VERSION
 
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.findings: list[dict[str, Any]] = []
         self.candidates: list[TakeoverCandidate] = []
         self._ssl_verify = get_configured_ssl_verify()
@@ -521,11 +527,17 @@ class SubdomainTakeoverScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> dict[str, Any]:
         """Execute subdomain takeover scan."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         self.findings = []
         self.candidates = []
 
         # Get subdomains from asset data
-        subdomains = asset_data.get("subdomains", [])
+        if isinstance(asset_data, dict):
+            subdomains = asset_data.get("subdomains", [])
 
         # Also include the main host
         if host not in subdomains:
@@ -536,10 +548,12 @@ class SubdomainTakeoverScanner(ScanModule):
             f"on {len(subdomains)} subdomains"
         )
 
+        # FIX: Pass auth headers for authenticated subdomain testing
         client = create_protected_client(
             timeout=self.timeout,
             verify_ssl=self._ssl_verify,
             follow_redirects=False,
+            custom_headers=self._auth_headers,
         )
 
         async with client:
@@ -583,7 +597,7 @@ class SubdomainTakeoverScanner(ScanModule):
                             subdomain=subdomain,
                             cname=cname,
                             service=service,
-                            confidence=30,
+                            confidence_score=30,
                             evidence=[f"CNAME points to {service} service: {cname}"],
                         )
                         self.candidates.append(candidate)
@@ -688,7 +702,7 @@ class SubdomainTakeoverScanner(ScanModule):
         service_display = candidate.service.replace("_", " ").title()
 
         finding = Finding(
-            type="subdomain_takeover",
+            vuln_type=VulnType.SUBDOMAIN_TAKEOVER,
             name=f"Subdomain Takeover - {service_display}",
             severity=severity,
             description=(
@@ -699,7 +713,7 @@ class SubdomainTakeoverScanner(ScanModule):
                 f"target's domain, enabling phishing, cookie theft, and reputation damage."
             ),
             host=candidate.subdomain,
-            matched_at=candidate.subdomain,
+            endpoint=candidate.subdomain,
             evidence=candidate.evidence + [
                 f"Confidence: {candidate.confidence}%",
                 f"CNAME Target: {candidate.cname}",
@@ -708,7 +722,7 @@ class SubdomainTakeoverScanner(ScanModule):
                 f"Fingerprint Matched: {candidate.fingerprint_matched}",
             ],
             cvss_score=7.5 if severity == "HIGH" else 5.3,
-            cwe="CWE-284",
+            cwe_id="CWE-284",
             remediation=self._get_remediation(candidate),
             references=[
                 "https://github.com/EdOverflow/can-i-take-over-xyz",

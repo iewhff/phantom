@@ -15,11 +15,11 @@ import json
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 
 
 # =============================================================================
@@ -1020,9 +1020,9 @@ class AdaptivePayloadEngine:
 
             self.waf_effective = data.get("waf_effective", {})
 
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
             # Failed to load, start fresh
-            pass
+            logger.debug(f"Failed to load learned payload data: {e}")
 
     def _save_learned_data(self) -> None:
         """Save learned data to disk."""

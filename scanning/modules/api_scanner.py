@@ -33,11 +33,8 @@ Version: 2.0.0-enterprise
 
 from __future__ import annotations
 
-import base64
-import io
 import json
 import re
-import struct
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -46,8 +43,11 @@ from urllib.parse import urljoin, urlparse, parse_qs
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
-from utils.endpoint_map import EndpointMap, EndpointCategory, HTTPMethod
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
+from utils.endpoint_map import EndpointMap, EndpointCategory
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 from utils.exploitation_helper import ExploitationHelper
@@ -245,6 +245,171 @@ SSRF_PAYLOADS = [
 ]
 
 
+# =============================================================================
+# G-06 FIX: OpenAPI/Swagger Ingestion Support
+# =============================================================================
+
+@dataclass
+class OpenAPIEndpoint:
+    """Endpoint extracted from OpenAPI spec."""
+    path: str
+    method: str  # GET, POST, PUT, DELETE, PATCH
+    parameters: list[dict[str, Any]] = field(default_factory=list)
+    request_body: Optional[dict[str, Any]] = None
+    security: list[dict[str, Any]] = field(default_factory=list)
+    description: str = ""
+    operation_id: str = ""
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OpenAPISpec:
+    """Parsed OpenAPI specification."""
+    title: str = ""
+    version: str = ""
+    base_url: str = ""
+    endpoints: list[OpenAPIEndpoint] = field(default_factory=list)
+    security_schemes: dict[str, Any] = field(default_factory=dict)
+    servers: list[str] = field(default_factory=list)
+
+
+class OpenAPIParser:
+    """
+    G-06 FIX: Parse OpenAPI/Swagger specifications to extract endpoints.
+
+    Supports OpenAPI 2.0 (Swagger) and OpenAPI 3.0+.
+    """
+
+    @staticmethod
+    def parse(spec_content: str | dict) -> Optional[OpenAPISpec]:
+        """Parse OpenAPI spec from JSON/dict content."""
+        try:
+            if isinstance(spec_content, str):
+                spec = json.loads(spec_content)
+            else:
+                spec = spec_content
+
+            result = OpenAPISpec()
+
+            # Get title and version
+            info = spec.get("info", {})
+            result.title = info.get("title", "Unknown API")
+            result.version = info.get("version", "")
+
+            # Get servers/base URL
+            if "servers" in spec:  # OpenAPI 3.0+
+                result.servers = [s.get("url", "") for s in spec.get("servers", [])]
+                if result.servers:
+                    result.base_url = result.servers[0]
+            elif "host" in spec:  # OpenAPI 2.0 (Swagger)
+                scheme = spec.get("schemes", ["https"])[0]
+                base_path = spec.get("basePath", "")
+                result.base_url = f"{scheme}://{spec['host']}{base_path}"
+                result.servers = [result.base_url]
+
+            # Get security schemes
+            if "components" in spec and "securitySchemes" in spec["components"]:
+                result.security_schemes = spec["components"]["securitySchemes"]
+            elif "securityDefinitions" in spec:  # Swagger 2.0
+                result.security_schemes = spec["securityDefinitions"]
+
+            # Parse paths/endpoints
+            paths = spec.get("paths", {})
+            for path, path_item in paths.items():
+                for method in ["get", "post", "put", "delete", "patch", "options", "head"]:
+                    if method not in path_item:
+                        continue
+
+                    operation = path_item[method]
+
+                    # Extract parameters
+                    parameters = []
+                    for param in operation.get("parameters", []) + path_item.get("parameters", []):
+                        parameters.append({
+                            "name": param.get("name", ""),
+                            "in": param.get("in", "query"),  # path, query, header, cookie
+                            "required": param.get("required", False),
+                            "type": param.get("schema", {}).get("type", param.get("type", "string")),
+                        })
+
+                    # Extract request body (OpenAPI 3.0+)
+                    request_body = None
+                    if "requestBody" in operation:
+                        request_body = operation["requestBody"]
+                    elif "consumes" in operation or "consumes" in spec:
+                        # Swagger 2.0 style
+                        body_params = [p for p in parameters if p.get("in") == "body"]
+                        if body_params:
+                            request_body = {"parameters": body_params}
+
+                    # Extract security requirements
+                    security = operation.get("security", spec.get("security", []))
+
+                    endpoint = OpenAPIEndpoint(
+                        path=path,
+                        method=method.upper(),
+                        parameters=parameters,
+                        request_body=request_body,
+                        security=security,
+                        description=operation.get("summary", operation.get("description", "")),
+                        operation_id=operation.get("operationId", ""),
+                        tags=operation.get("tags", []),
+                    )
+                    result.endpoints.append(endpoint)
+
+            logger.info(f"[OpenAPI] Parsed spec: {result.title} v{result.version} - {len(result.endpoints)} endpoints")
+            return result
+
+        except Exception as e:
+            logger.debug(f"[OpenAPI] Failed to parse spec: {e}")
+            return None
+
+    @staticmethod
+    def to_asset_data(spec: OpenAPISpec, base_url: str) -> dict[str, Any]:
+        """Convert parsed OpenAPI spec to asset_data format for scanners."""
+        endpoints = []
+        forms = []
+        params_discovered = {}
+
+        for ep in spec.endpoints:
+            # Build full URL
+            path = ep.path
+            # Replace path parameters with placeholders
+            url = urljoin(base_url, path)
+            endpoints.append(url)
+
+            # Extract query/path parameters for each endpoint
+            param_names = [p["name"] for p in ep.parameters if p["in"] in ("query", "path")]
+            if param_names:
+                params_discovered[url] = param_names
+
+            # If endpoint has request body, add to forms
+            if ep.request_body or ep.method in ("POST", "PUT", "PATCH"):
+                body_params = [p for p in ep.parameters if p["in"] == "body"]
+                forms.append({
+                    "action": url,
+                    "method": ep.method,
+                    "inputs": [
+                        {"name": p["name"], "type": "text", "required": p.get("required", False)}
+                        for p in body_params
+                    ] if body_params else [{"name": "data", "type": "text"}],
+                })
+
+        return {
+            "endpoints": endpoints,
+            "urls": endpoints,
+            "forms": forms,
+            "tool_discovered_params": params_discovered,
+            "openapi_spec": {
+                "title": spec.title,
+                "version": spec.version,
+                "servers": spec.servers,
+                "security_schemes": list(spec.security_schemes.keys()),
+                "endpoint_count": len(spec.endpoints),
+            },
+        }
+
+
 class APIScanner(ScanModule):
     """
     API Security Scanner - ENTERPRISE EDITION v2.0
@@ -290,14 +455,77 @@ class APIScanner(ScanModule):
     ]
     
     # IDOR test paths (extended)
+    # FIX 2026-02-16: Comprehensive BOLA/IDOR patterns for modern APIs (crAPI-style)
     IDOR_PATTERNS = [
-        "/users/{id}", "/user/{id}", "/api/users/{id}",
-        "/profile/{id}", "/account/{id}", "/accounts/{id}",
-        "/orders/{id}", "/order/{id}", "/api/orders/{id}",
-        "/documents/{id}", "/files/{id}", "/file/{id}",
-        "/invoices/{id}", "/payments/{id}", "/transactions/{id}",
-        "/messages/{id}", "/conversations/{id}",
-        "/reports/{id}", "/exports/{id}",
+        # User/Account resources
+        "/users/{id}", "/user/{id}", "/api/users/{id}", "/api/v1/users/{id}",
+        "/profile/{id}", "/profiles/{id}", "/api/profile/{id}",
+        "/account/{id}", "/accounts/{id}", "/api/accounts/{id}",
+        "/me", "/api/me", "/api/v1/me",  # Current user (test auth bypass)
+
+        # Transactional resources
+        "/orders/{id}", "/order/{id}", "/api/orders/{id}", "/api/v1/orders/{id}",
+        "/invoices/{id}", "/invoice/{id}", "/api/invoices/{id}",
+        "/payments/{id}", "/payment/{id}", "/api/payments/{id}",
+        "/transactions/{id}", "/transaction/{id}", "/api/transactions/{id}",
+        "/purchases/{id}", "/purchase/{id}",
+
+        # Documents/Files
+        "/documents/{id}", "/document/{id}", "/api/documents/{id}",
+        "/files/{id}", "/file/{id}", "/api/files/{id}",
+        "/attachments/{id}", "/attachment/{id}",
+        "/reports/{id}", "/report/{id}", "/api/reports/{id}",
+        "/exports/{id}", "/export/{id}",
+
+        # Communication
+        "/messages/{id}", "/message/{id}", "/api/messages/{id}",
+        "/conversations/{id}", "/conversation/{id}",
+        "/comments/{id}", "/comment/{id}", "/api/comments/{id}",
+        "/notifications/{id}", "/notification/{id}",
+
+        # crAPI-style patterns (automotive/IoT APIs)
+        "/vehicles/{id}", "/vehicle/{id}", "/api/vehicles/{id}",
+        "/api/v1/vehicle/{id}/location",  # Vehicle tracking
+        "/api/v1/vehicle/{id}/owner",
+        "/api/v1/mechanic/reports/{id}",  # Mechanic reports
+        "/api/v1/mechanic/service/{id}",
+        "/community/api/v2/posts/{id}",  # Social features
+        "/community/api/v2/comments/{id}",
+        "/shop/orders/{id}",  # E-commerce
+        "/shop/products/{id}",
+        "/shop/return/{id}",
+
+        # Admin endpoints (BFLA testing)
+        "/admin/users/{id}", "/admin/user/{id}",
+        "/admin/orders/{id}", "/admin/order/{id}",
+        "/api/admin/users/{id}", "/api/admin/config/{id}",
+        "/internal/users/{id}", "/internal/config/{id}",
+        "/management/users/{id}", "/management/settings/{id}",
+
+        # Nested resources (common BOLA vectors)
+        "/users/{id}/orders", "/users/{id}/payments",
+        "/users/{id}/documents", "/users/{id}/profile",
+        "/users/{id}/settings", "/users/{id}/notifications",
+        "/accounts/{id}/transactions", "/accounts/{id}/statements",
+        "/orders/{id}/items", "/orders/{id}/tracking",
+        "/vehicles/{id}/service-history",
+
+        # UUIDs and other ID formats (test with actual IDs found)
+        "/api/v1/resource/{id}",  # Generic pattern
+        "/api/v2/resource/{id}",
+    ]
+
+    # BFLA (Broken Function Level Authorization) patterns - admin/privileged endpoints
+    BFLA_PATTERNS = [
+        "/admin", "/admin/", "/api/admin",
+        "/admin/users", "/admin/config", "/admin/settings",
+        "/admin/dashboard", "/admin/reports", "/admin/audit",
+        "/management", "/management/users", "/management/config",
+        "/internal", "/internal/debug", "/internal/config",
+        "/api/internal", "/api/debug", "/api/config",
+        "/superuser", "/root", "/system",
+        "/api/v1/admin", "/api/v2/admin",
+        "/backoffice", "/operator", "/staff",
     ]
     
     # GraphQL introspection query
@@ -317,14 +545,22 @@ class APIScanner(ScanModule):
     }
     """
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.upload_results: list[UploadTestResult] = []
         self.discovered_uploads: list[str] = []
         self._orchestrator: Optional["LinuxToolsOrchestrator"] = None
         self._use_external_tools = getattr(settings, 'use_linux_tools', True)
         self.discovered_parameters: dict[str, list[str]] = {}  # URL -> [params]
+        # Configurable endpoint limit for parameter discovery (default 50)
+        self.max_endpoints_per_test = getattr(settings, 'api_scanner_max_endpoints', 50)
 
     def _get_orchestrator(self) -> Optional["LinuxToolsOrchestrator"]:
         """Get or create the Linux tools orchestrator."""
@@ -361,9 +597,9 @@ class APIScanner(ScanModule):
             logger.debug("[API] arjun not installed, skipping parameter discovery")
             return discovered
 
-        # Limit to first 10 endpoints to avoid timeout
-        endpoints_to_test = endpoints[:10]
-        logger.info(f"[API] Running arjun parameter discovery on {len(endpoints_to_test)} endpoints")
+        # Limit endpoints to configurable max (default 50)
+        endpoints_to_test = endpoints[:self.max_endpoints_per_test]
+        logger.info(f"[API] Running arjun parameter discovery on {len(endpoints_to_test)}/{len(endpoints)} endpoints")
 
         for endpoint in endpoints_to_test:
             try:
@@ -400,7 +636,7 @@ class APIScanner(ScanModule):
         sqli_payloads = ["'", "\"", "1' OR '1'='1", "1 AND 1=1"]
         xss_payloads = ["<script>", "\"onmouseover=", "javascript:"]
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for url, params in self.discovered_parameters.items():
                 for param in params[:5]:  # Limit params per endpoint
                     # Test SQLi
@@ -408,7 +644,7 @@ class APIScanner(ScanModule):
                         await rate_limiter.acquire()
                         try:
                             test_url = f"{url}?{param}={payload}"
-                            response = await client.get(test_url)
+                            response = await client.get(test_url, timeout=10.0)
                             content = response.text.lower()
 
                             # Check for SQL error indicators
@@ -432,15 +668,15 @@ class APIScanner(ScanModule):
                                 })
                                 break  # Found, move to next param
 
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[API] SQLi test error for param {param}: {e}")
 
                     # Test XSS reflection
                     for payload in xss_payloads:
                         await rate_limiter.acquire()
                         try:
                             test_url = f"{url}?{param}={payload}"
-                            response = await client.get(test_url)
+                            response = await client.get(test_url, timeout=10.0)
 
                             if payload in response.text:
                                 findings.append({
@@ -458,8 +694,8 @@ class APIScanner(ScanModule):
                                 })
                                 break
 
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[API] XSS test error for param {param}: {e}")
 
         return findings
     
@@ -486,19 +722,51 @@ class APIScanner(ScanModule):
         11. XXE vulnerability testing (ENTERPRISE)
         """
         findings: list[dict[str, Any]] = []
-        
+
         base_url = f"https://{host}" if not host.startswith("http") else host
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+        self._auth_headers = self._ctx.auth_headers
+        if self._ctx.has_auth:
+            logger.info(f"[API] Using authenticated session ({self._ctx.auth_method})")
+
+        # Get domain classification for API-specific testing strategies
+        domain_class = asset_data.get("domain_classification")
+        self._domain_type = "unknown"
+        if domain_class:
+            self._domain_type = getattr(domain_class, "primary", "unknown")
+            if hasattr(self._domain_type, "value"):
+                self._domain_type = self._domain_type.value
+            logger.info(f"[API] Domain type: {self._domain_type}")
+
         logger.info(f"🔍 API Scanner ENTERPRISE starting for {base_url}")
-        
+
+        # OPTIMIZATION: Track findings count for early termination
+        max_findings = 15  # Stop after finding 15 issues to prevent timeout
+        high_count = 0
+
+        def should_continue() -> bool:
+            nonlocal high_count
+            high_count = sum(1 for f in findings if f.get("severity") in ["HIGH", "CRITICAL"])
+            if len(findings) >= max_findings:
+                logger.info(f"[API] Reached {len(findings)} findings, limiting further tests")
+                return False
+            if high_count >= 5:
+                logger.info(f"[API] Found {high_count} HIGH+ findings, limiting further tests")
+                return False
+            return True
+
         # ====================================================================
-        # PHASE 1: Discovery
+        # PHASE 1: Discovery (ALWAYS RUN - needed for other phases)
         # ====================================================================
         api_endpoints = await self._discover_api_endpoints(base_url, rate_limiter)
 
         # ====================================================================
         # PHASE 1.5: Parameter Discovery with Arjun (External Tool)
         # ====================================================================
-        if api_endpoints:
+        if api_endpoints and should_continue():
             discovered_params = await self._run_arjun_parameter_discovery(api_endpoints)
             if discovered_params:
                 logger.info(f"[API] Arjun discovered params on {len(discovered_params)} endpoints")
@@ -507,19 +775,20 @@ class APIScanner(ScanModule):
                 findings.extend(param_findings)
 
         # ====================================================================
-        # PHASE 2: Documentation Exposure
+        # PHASE 2: Documentation Exposure (ALWAYS RUN - fast)
         # ====================================================================
         openapi_findings = await self._check_openapi_exposure(base_url, rate_limiter)
         findings.extend(openapi_findings)
-        
+
         # ====================================================================
-        # PHASE 3: GraphQL Security
+        # PHASE 3: GraphQL Security (SKIP IF ENOUGH FINDINGS)
         # ====================================================================
-        graphql_findings = await self._check_graphql(base_url, rate_limiter)
-        findings.extend(graphql_findings)
-        
+        if should_continue():
+            graphql_findings = await self._check_graphql(base_url, rate_limiter)
+            findings.extend(graphql_findings)
+
         # ====================================================================
-        # PHASE 4: IDOR/BOLA
+        # PHASE 4: IDOR/BOLA (HIGH VALUE - always run)
         # ====================================================================
         # Combine discovered endpoints with any passed from asset_data
         all_endpoints = list(api_endpoints)
@@ -532,62 +801,61 @@ class APIScanner(ScanModule):
 
         idor_findings = await self._check_idor(base_url, rate_limiter, all_endpoints)
         findings.extend(idor_findings)
-        
+
         # ====================================================================
-        # PHASE 5: Data Exposure
+        # PHASE 5-8: Secondary Tests (SKIP IF ENOUGH FINDINGS)
         # ====================================================================
-        data_exposure_findings = await self._check_data_exposure(
-            base_url, api_endpoints, rate_limiter
-        )
-        findings.extend(data_exposure_findings)
-        
+        if should_continue():
+            # PHASE 5: Data Exposure
+            data_exposure_findings = await self._check_data_exposure(
+                base_url, api_endpoints, rate_limiter
+            )
+            findings.extend(data_exposure_findings)
+
+        if should_continue():
+            # PHASE 6: Rate Limiting
+            rate_limit_findings = await self._check_rate_limiting(
+                base_url, api_endpoints, rate_limiter
+            )
+            findings.extend(rate_limit_findings)
+
+        if should_continue():
+            # PHASE 7: Mass Assignment
+            mass_assignment_findings = await self._check_mass_assignment(
+                base_url, api_endpoints, rate_limiter
+            )
+            findings.extend(mass_assignment_findings)
+
+        if should_continue():
+            # PHASE 8: API Key Exposure
+            api_key_findings = await self._check_api_key_exposure(
+                base_url, asset_data, rate_limiter
+            )
+            findings.extend(api_key_findings)
+
         # ====================================================================
-        # PHASE 6: Rate Limiting
+        # PHASE 9-11: ENTERPRISE Tests (SKIP IF ENOUGH FINDINGS)
         # ====================================================================
-        rate_limit_findings = await self._check_rate_limiting(
-            base_url, api_endpoints, rate_limiter
-        )
-        findings.extend(rate_limit_findings)
-        
-        # ====================================================================
-        # PHASE 7: Mass Assignment
-        # ====================================================================
-        mass_assignment_findings = await self._check_mass_assignment(
-            base_url, api_endpoints, rate_limiter
-        )
-        findings.extend(mass_assignment_findings)
-        
-        # ====================================================================
-        # PHASE 8: API Key Exposure
-        # ====================================================================
-        api_key_findings = await self._check_api_key_exposure(
-            base_url, asset_data, rate_limiter
-        )
-        findings.extend(api_key_findings)
-        
-        # ====================================================================
-        # PHASE 9: FILE UPLOAD SECURITY (ENTERPRISE)
-        # ====================================================================
-        upload_findings = await self._check_file_upload_security(
-            base_url, asset_data, rate_limiter
-        )
-        findings.extend(upload_findings)
-        
-        # ====================================================================
-        # PHASE 10: SSRF TESTING (ENTERPRISE)
-        # ====================================================================
-        ssrf_findings = await self._check_ssrf_vulnerabilities(
-            base_url, asset_data, rate_limiter
-        )
-        findings.extend(ssrf_findings)
-        
-        # ====================================================================
-        # PHASE 11: XXE TESTING (ENTERPRISE)
-        # ====================================================================
-        xxe_findings = await self._check_xxe_vulnerabilities(
-            base_url, asset_data, rate_limiter
-        )
-        findings.extend(xxe_findings)
+        if should_continue():
+            # PHASE 9: FILE UPLOAD SECURITY (ENTERPRISE)
+            upload_findings = await self._check_file_upload_security(
+                base_url, asset_data, rate_limiter
+            )
+            findings.extend(upload_findings)
+
+        if should_continue():
+            # PHASE 10: SSRF TESTING (ENTERPRISE)
+            ssrf_findings = await self._check_ssrf_vulnerabilities(
+                base_url, asset_data, rate_limiter
+            )
+            findings.extend(ssrf_findings)
+
+        if should_continue():
+            # PHASE 11: XXE TESTING (ENTERPRISE)
+            xxe_findings = await self._check_xxe_vulnerabilities(
+                base_url, asset_data, rate_limiter
+            )
+            findings.extend(xxe_findings)
         
         logger.info(f"✅ API Scanner ENTERPRISE complete: {len(findings)} findings")
         
@@ -621,13 +889,13 @@ class APIScanner(ScanModule):
         # If EndpointMap is empty, fall back to hardcoded paths (legacy behavior)
         if not endpoints:
             logger.info("[APIScanner] EndpointMap empty, falling back to hardcoded paths")
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
                 for path in self.API_PATHS:
                     await rate_limiter.acquire()
 
                     url = urljoin(base_url, path)
                     try:
-                        response = await client.get(url)
+                        response = await client.get(url, timeout=10.0)
 
                         if response.status_code in [200, 401, 403]:
                             endpoints.append(url)
@@ -650,7 +918,7 @@ class APIScanner(ScanModule):
     ) -> list[dict[str, Any]]:
         """Check for exposed OpenAPI/Swagger documentation."""
         findings = []
-        
+
         openapi_paths = [
             "/swagger.json",
             "/openapi.json",
@@ -662,32 +930,44 @@ class APIScanner(ScanModule):
             "/docs",
             "/redoc",
             "/.well-known/openapi.json",
+            # G-06 FIX: Additional OpenAPI paths
+            "/api/openapi.json",
+            "/api/v1/openapi.json",
+            "/api/v2/openapi.json",
+            "/v1/swagger.json",
+            "/v2/swagger.json",
+            "/openapi/v3/api-docs",  # Spring Boot
+            "/v3/api-docs",
         ]
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for path in openapi_paths:
                 await rate_limiter.acquire()
-                
+
                 url = urljoin(base_url, path)
                 try:
-                    response = await client.get(url)
-                    
+                    response = await client.get(url, timeout=10.0)
+
                     if response.status_code == 200:
                         content = response.text
-                        
-                        # Check if it's OpenAPI/Swagger
-                        is_openapi = any([
+
+                        # Check if it's OpenAPI/Swagger JSON
+                        is_openapi_json = any([
                             '"swagger"' in content.lower(),
                             '"openapi"' in content.lower(),
+                        ])
+
+                        # Check if it's Swagger UI HTML
+                        is_swagger_ui = any([
                             "swagger-ui" in content.lower(),
                             "api documentation" in content.lower(),
                         ])
-                        
-                        if is_openapi:
+
+                        if is_openapi_json or is_swagger_ui:
                             # Determine severity based on content
                             severity = "MEDIUM"
                             description = "OpenAPI/Swagger documentation is publicly accessible."
-                            
+
                             # Check for sensitive info
                             sensitive_patterns = [
                                 r'"password"',
@@ -697,44 +977,73 @@ class APIScanner(ScanModule):
                                 r'/admin',
                                 r'/internal',
                             ]
-                            
+
                             found_sensitive = []
                             for pattern in sensitive_patterns:
                                 if re.search(pattern, content, re.IGNORECASE):
                                     found_sensitive.append(pattern)
-                            
+
                             if found_sensitive:
                                 severity = "HIGH"
                                 description += " Contains sensitive endpoint information."
-                            
+
+                            # G-06 FIX: Parse the spec and store for other scanners
+                            parsed_spec = None
+                            extracted_endpoints = 0
+                            if is_openapi_json:
+                                parsed_spec = OpenAPIParser.parse(content)
+                                if parsed_spec:
+                                    extracted_endpoints = len(parsed_spec.endpoints)
+                                    # Store for later use
+                                    self._parsed_openapi_spec = parsed_spec
+                                    logger.info(f"[API] Extracted {extracted_endpoints} endpoints from OpenAPI spec")
+
+                            evidence = [
+                                f"Documentation URL: {url}",
+                                f"Sensitive patterns found: {found_sensitive}" if found_sensitive else "No sensitive patterns detected",
+                            ]
+                            if extracted_endpoints > 0:
+                                evidence.append(f"Extracted {extracted_endpoints} API endpoints for testing")
+
                             findings.append(Finding(
-                                type="api",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="Exposed API Documentation",
                                 severity=severity,
                                 description=description + " This reveals API structure and may expose "
                                            "internal endpoints, authentication methods, and data schemas.",
                                 host=base_url,
-                                matched_at=url,
-                                evidence=[
-                                    f"Documentation URL: {url}",
-                                    f"Sensitive patterns found: {found_sensitive}" if found_sensitive else "No sensitive patterns detected",
-                                ],
+                                endpoint=url,
+                                evidence=evidence,
                                 cvss_score=5.3 if severity == "MEDIUM" else 6.5,
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 remediation="Restrict access to API documentation in production. "
                                            "Implement authentication for documentation endpoints. "
                                            "Remove sensitive information from public docs.",
                                 references=[
                                     "https://owasp.org/API-Security/editions/2023/en/0xa9-improper-inventory-management/"
                                 ],
-                                confidence=85 if severity == "MEDIUM" else 90,
+                                confidence_score=85 if severity == "MEDIUM" else 90,
+                                metadata={
+                                    "openapi_parsed": parsed_spec is not None,
+                                    "endpoints_extracted": extracted_endpoints,
+                                },
                             ).to_dict())
                             break
-                            
+
                 except Exception as e:
                     logger.debug(f"Error checking {url}: {e}")
-        
+
         return findings
+
+    def get_openapi_endpoints(self, base_url: str) -> dict[str, Any]:
+        """
+        G-06 FIX: Get extracted endpoints from parsed OpenAPI spec.
+
+        Call this after scan() to get endpoints for other scanners.
+        """
+        if hasattr(self, "_parsed_openapi_spec") and self._parsed_openapi_spec:
+            return OpenAPIParser.to_asset_data(self._parsed_openapi_spec, base_url)
+        return {}
     
     async def _check_graphql(
         self,
@@ -756,7 +1065,7 @@ class APIScanner(ScanModule):
         graphql_paths = ["/graphql", "/graphiql", "/api/graphql", "/v1/graphql",
                         "/query", "/api/query", "/v2/graphql"]
 
-        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        async with get_scan_client(timeout=30.0, verify_ssl=False, http2=True) as client:
             for path in graphql_paths:
                 await rate_limiter.acquire()
 
@@ -769,38 +1078,39 @@ class APIScanner(ScanModule):
                         url,
                         json={"query": self.GRAPHQL_INTROSPECTION},
                         headers={"Content-Type": "application/json"},
+                        timeout=10.0,
                     )
 
                     if response.status_code == 200:
                         try:
                             data = response.json()
 
-                            if "data" in data and "__schema" in data.get("data", {}):
+                            if isinstance(data, dict) and "data" in data and "__schema" in data.get("data", {}):
                                 found_graphql = True
                                 # Introspection enabled
                                 schema = data["data"]["__schema"]
                                 types_count = len(schema.get("types", []))
 
                                 findings.append(Finding(
-                                    type="api",
+                                    vuln_type=VulnType.INFO_DISCLOSURE,
                                     name="GraphQL Introspection Enabled",
-                                    severity="MEDIUM",
+                                    severity=Severity.MEDIUM,
                                     description="GraphQL introspection is enabled, revealing the entire API schema. "
                                                "This exposes all types, queries, mutations, and their fields.",
                                     host=base_url,
-                                    matched_at=url,
+                                    endpoint=url,
                                     evidence=[
                                         f"GraphQL endpoint: {url}",
                                         f"Schema types exposed: {types_count}",
                                     ],
                                     cvss_score=5.3,
-                                    cwe="CWE-200",
+                                    cwe_id="CWE-200",
                                     remediation="Disable introspection in production environments. "
                                                "Use allowlists for queries. Implement depth limiting.",
                                     references=[
                                         "https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html"
                                     ],
-                                    confidence=85,
+                                    confidence_score=85,
                                 ).to_dict())
 
                                 # Check for dangerous mutations
@@ -830,19 +1140,19 @@ class APIScanner(ScanModule):
                     if depth_response.status_code == 200:
                         found_graphql = True
                         findings.append(Finding(
-                            type="api",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
                             name="GraphQL Missing Depth Limiting",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description="GraphQL endpoint accepts deeply nested queries, "
                                        "potentially allowing DoS attacks through complex queries.",
                             host=base_url,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["Deep nested query was accepted"],
                             cvss_score=5.3,
-                            cwe="CWE-400",
+                            cwe_id="CWE-400",
                             remediation="Implement query depth limiting. Set maximum query complexity. "
                                        "Use query cost analysis.",
-                            confidence=85,
+                            confidence_score=85,
                         ).to_dict())
 
                     # Test 2: Alias Abuse Attack (Query Multiplication)
@@ -865,7 +1175,7 @@ class APIScanner(ScanModule):
                             severity = "HIGH" if response_time > 3.0 else "MEDIUM"
 
                             findings.append(Finding(
-                                type="api",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="GraphQL Alias Abuse - Query Multiplication DoS",
                                 severity=severity,
                                 description=f"GraphQL endpoint accepts queries with many aliases, "
@@ -873,34 +1183,34 @@ class APIScanner(ScanModule):
                                            f"Response time: {response_time:.2f}s for 50 aliases. "
                                            f"An attacker could use 1000+ aliases to cause severe DoS.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "50 alias query accepted",
                                     f"Response time: {response_time:.2f}s",
                                     "Query multiplication attack possible",
                                 ],
                                 cvss_score=7.5 if severity == "HIGH" else 5.3,
-                                cwe="CWE-400",
+                                cwe_id="CWE-400",
                                 remediation="Implement alias limiting (max 10-20 per query). "
                                            "Add query cost analysis that counts aliases. "
                                            "Set per-query time limits.",
-                                confidence=90,
+                                confidence_score=90,
                             ).to_dict())
                     except httpx.TimeoutException:
                         # Timeout indicates DoS potential!
                         findings.append(Finding(
-                            type="api",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
                             name="GraphQL Alias Abuse DoS - Server Timeout",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description="GraphQL server timed out processing alias abuse query. "
                                        "This confirms DoS vulnerability via query multiplication.",
                             host=base_url,
-                            matched_at=url,
+                            endpoint=url,
                             evidence=["Server timed out on 50-alias query"],
                             cvss_score=7.5,
-                            cwe="CWE-400",
+                            cwe_id="CWE-400",
                             remediation="Implement query cost analysis and alias limiting.",
-                            confidence=95,
+                            confidence_score=95,
                         ).to_dict())
 
                     # Test 3: Batch Query Attack
@@ -923,26 +1233,26 @@ class APIScanner(ScanModule):
                                 # If response is array, batching is supported
                                 if isinstance(batch_data, list) and len(batch_data) > 1:
                                     findings.append(Finding(
-                                        type="api",
+                                        vuln_type=VulnType.INFO_DISCLOSURE,
                                         name="GraphQL Batch Query Attack",
-                                        severity="MEDIUM",
+                                        severity=Severity.MEDIUM,
                                         description=f"GraphQL endpoint accepts batch queries, "
                                                    f"allowing multiple operations per request. "
                                                    f"Attacker can bypass rate limiting and cause DoS. "
                                                    f"Executed {len(batch_data)} queries in {response_time:.2f}s.",
                                         host=base_url,
-                                        matched_at=url,
+                                        endpoint=url,
                                         evidence=[
                                             f"Batch of {len(batch_data)} queries accepted",
                                             f"Response time: {response_time:.2f}s",
                                         ],
                                         cvss_score=5.3,
-                                        cwe="CWE-400",
+                                        cwe_id="CWE-400",
                                         remediation="Limit batch query count (max 5-10). "
                                                    "Apply rate limiting per operation, not per request.",
-                                        confidence=90,
+                                        confidence_score=90,
                                     ).to_dict())
-                            except:
+                            except json.JSONDecodeError:
                                 pass
                     except Exception as e:
                         logger.debug(f"Batch query test error: {e}")
@@ -962,24 +1272,24 @@ class APIScanner(ScanModule):
 
                         if dup_response.status_code == 200 and response_time > 2.0:
                             findings.append(Finding(
-                                type="api",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="GraphQL Field Duplication DoS",
-                                severity="MEDIUM",
+                                severity=Severity.MEDIUM,
                                 description=f"GraphQL accepts queries with duplicated fields. "
                                            f"Response time: {response_time:.2f}s indicates processing overhead.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "100 duplicate fields accepted",
                                     f"Response time: {response_time:.2f}s",
                                 ],
                                 cvss_score=5.3,
-                                cwe="CWE-400",
+                                cwe_id="CWE-400",
                                 remediation="Deduplicate fields in query validation. "
                                            "Implement query complexity limits.",
-                                confidence=85,
+                                confidence_score=85,
                             ).to_dict())
-                    except:
+                    except Exception:
                         pass
 
                 except Exception as e:
@@ -1038,18 +1348,18 @@ class APIScanner(ScanModule):
             for pattern in dangerous_patterns:
                 if pattern in type_name:
                     findings.append(Finding(
-                        type="api",
+                        vuln_type=VulnType.INFO_DISCLOSURE,
                         name="Potentially Dangerous GraphQL Type Exposed",
-                        severity="LOW",
+                        severity=Severity.LOW,
                         description=f"GraphQL schema exposes type '{type_def.get('name')}' "
                                    f"which may be administrative or sensitive.",
                         host=base_url,
-                        matched_at=url,
+                        endpoint=url,
                         evidence=[f"Type name: {type_def.get('name')}"],
                         cvss_score=3.7,
-                        cwe="CWE-200",
+                        cwe_id="CWE-200",
                         remediation="Review exposed types and restrict access to sensitive operations.",
-                        confidence=80,
+                        confidence_score=80,
                     ).to_dict())
                     break
         
@@ -1134,7 +1444,7 @@ class APIScanner(ScanModule):
         else:
             logger.info(f"[IDOR] Testing {len(endpoints_to_test)} total endpoints")
 
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             # Track 404s to avoid wasting requests on non-existent patterns
             consecutive_404s = 0
             max_consecutive_404s = 5  # Skip remaining hardcoded patterns after 5 consecutive 404s
@@ -1146,7 +1456,7 @@ class APIScanner(ScanModule):
                 # Skip patterns that return 404 to avoid wasting requests
                 probe_url = endpoint_pattern.replace("{id}", "1")
                 try:
-                    probe_response = await client.get(probe_url)
+                    probe_response = await client.get(probe_url, timeout=10.0)
                     # Skip if endpoint doesn't exist (404) or bad request (400)
                     if probe_response.status_code in [404, 400]:
                         consecutive_404s += 1
@@ -1157,7 +1467,8 @@ class APIScanner(ScanModule):
                         continue
                     else:
                         consecutive_404s = 0  # Reset counter on success
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[IDOR] Endpoint check error for {endpoint_pattern}: {e}")
                     continue
 
                 # Test with different IDs (only for endpoints that exist)
@@ -1168,7 +1479,7 @@ class APIScanner(ScanModule):
                     url = endpoint_pattern.replace("{id}", test_id)
 
                     try:
-                        response = await client.get(url)
+                        response = await client.get(url, timeout=10.0)
                         response_data = None
 
                         # Try to parse JSON for better evidence
@@ -1185,7 +1496,8 @@ class APIScanner(ScanModule):
                             "has_data": response_data is not None and len(str(response_data)) > 10,
                             "sample": response.text[:200] if response.status_code == 200 else "",
                         })
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[IDOR] ID test error for {test_id}: {e}")
                         continue
 
                 # Analyze responses for IDOR
@@ -1231,10 +1543,15 @@ class APIScanner(ScanModule):
                                 http_method="GET",
                             )
 
+                            # Extract resource name from endpoint pattern
+                            # e.g. /api/Recycles/{id} → "Recycles", /users/{id} → "users"
+                            _path_parts = [p for p in endpoint_pattern.split("/") if p and p != "{id}"]
+                            _resource_name = _path_parts[-1] if _path_parts else "resource"
+
                             findings.append(Finding(
-                                type="idor",
-                                name=f"IDOR/BOLA in {endpoint_pattern.split('/')[-1].replace('{id}', '')}",
-                                severity="HIGH",
+                                vuln_type=VulnType.IDOR,
+                                name=f"IDOR/BOLA in {_resource_name}",
+                                severity=Severity.HIGH,
                                 description=(
                                     f"Insecure Direct Object Reference (IDOR) vulnerability found. "
                                     f"Accessing {endpoint_pattern} with different IDs returns different {data_type} "
@@ -1242,7 +1559,7 @@ class APIScanner(ScanModule):
                                     f"other users' data by changing the ID parameter."
                                 ),
                                 host=base_url,
-                                matched_at=endpoint_pattern,
+                                endpoint=endpoint_pattern,
                                 evidence=[
                                     f"Endpoint: {endpoint_pattern}",
                                     f"Test IDs: {successful_ids}",
@@ -1251,7 +1568,7 @@ class APIScanner(ScanModule):
                                     f"Sample responses: {len([r for r in responses if r['status'] == 200])} with 200 OK",
                                 ],
                                 cvss_score=7.5,
-                                cwe="CWE-639",
+                                cwe_id="CWE-639",
                                 remediation=(
                                     "1. Implement proper authorization checks - verify user owns the resource\n"
                                     "2. Use indirect references or UUIDs instead of sequential IDs\n"
@@ -1267,7 +1584,7 @@ class APIScanner(ScanModule):
                                     "data_type": data_type,
                                     "response_lengths": lengths,
                                 },
-                                confidence=90,
+                                confidence_score=90,
                             ).to_dict())
 
                             # Found IDOR on this endpoint, no need to test more IDs
@@ -1275,62 +1592,233 @@ class APIScanner(ScanModule):
 
         return findings
     
+    # PII detection patterns (OWASP API3:2023 - Excessive Data Exposure)
+    PII_PATTERNS = {
+        "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+        "phone": re.compile(r"(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"),
+        "ssn": re.compile(r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b"),
+        "credit_card": re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b"),
+        "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+        "jwt": re.compile(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+"),
+        "api_key": re.compile(r"(?:api[_-]?key|apikey|access[_-]?token)[\"']?\s*[:=]\s*[\"']?([a-zA-Z0-9_-]{20,})", re.I),
+        "aws_key": re.compile(r"AKIA[0-9A-Z]{16}"),
+        "private_key": re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"),
+    }
+
+    # Extended sensitive field names
+    SENSITIVE_FIELD_NAMES = [
+        # Credentials
+        "password", "passwd", "pwd", "secret", "credential", "auth_token",
+        "access_token", "refresh_token", "api_key", "apikey", "private_key",
+        "secret_key", "encryption_key", "signing_key",
+        # PII
+        "ssn", "social_security", "national_id", "passport", "driver_license",
+        "credit_card", "card_number", "cvv", "cvc", "expiry", "bank_account",
+        "routing_number", "iban", "swift",
+        # Internal/Debug
+        "internal", "debug", "trace", "stack_trace", "error_details",
+        "sql_query", "query", "connection_string", "database_url",
+        # Hashes/Salts
+        "hash", "salt", "digest", "checksum", "password_hash",
+        # Session/Auth
+        "session_id", "session_token", "csrf_token", "nonce",
+        # Admin/Privilege
+        "is_admin", "is_superuser", "role", "permissions", "privileges",
+        "admin_notes", "internal_notes", "staff_notes",
+        # Infrastructure
+        "server_ip", "internal_ip", "private_ip", "hostname", "server_name",
+        "aws_key", "aws_secret", "gcp_key", "azure_key",
+    ]
+
     async def _check_data_exposure(
         self,
         base_url: str,
         api_endpoints: list[str],
         rate_limiter: RateLimiter,
     ) -> list[dict[str, Any]]:
-        """Check for excessive data exposure."""
+        """Check for excessive data exposure (OWASP API3:2023).
+
+        Detects:
+        - Sensitive field names in responses
+        - PII patterns in response values (email, phone, SSN, credit card)
+        - Excessive response size (too many fields returned)
+        - Internal/debug information leakage
+        - Credential/secret exposure
+        """
         findings = []
-        
-        sensitive_fields = [
-            "password", "secret", "token", "api_key", "apikey", "private",
-            "ssn", "social_security", "credit_card", "cvv", "card_number",
-            "internal", "debug", "hash", "salt",
-        ]
-        
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            for endpoint in api_endpoints[:10]:  # Limit checks
+
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
+            for endpoint in api_endpoints[:self.max_endpoints_per_test]:
                 await rate_limiter.acquire()
-                
+
                 try:
-                    response = await client.get(endpoint)
-                    
+                    response = await client.get(endpoint, timeout=10.0)
+
                     if response.status_code == 200:
                         content_type = response.headers.get("content-type", "")
-                        
+
                         if "json" in content_type:
                             try:
                                 data = response.json()
-                                exposed = self._find_sensitive_fields(data, sensitive_fields)
-                                
-                                if exposed:
+
+                                # Check 1: Sensitive field names
+                                sensitive_fields = self._find_sensitive_fields(
+                                    data, self.SENSITIVE_FIELD_NAMES
+                                )
+
+                                # Check 2: PII patterns in values
+                                pii_findings = self._detect_pii_in_values(data)
+
+                                # Check 3: Excessive response size
+                                field_count = self._count_fields(data)
+                                excessive_fields = field_count > 50
+
+                                # Check 4: Debug/internal info leakage
+                                debug_info = self._detect_debug_info(data)
+
+                                # Determine severity based on findings
+                                severity = "LOW"
+                                evidence = []
+
+                                if sensitive_fields:
+                                    evidence.append(f"Sensitive fields exposed: {sensitive_fields[:10]}")
+                                    severity = "MEDIUM"
+
+                                if pii_findings:
+                                    evidence.append(f"PII detected: {list(pii_findings.keys())}")
+                                    severity = "HIGH"  # PII exposure is HIGH
+
+                                if excessive_fields:
+                                    evidence.append(f"Excessive fields: {field_count} fields returned")
+                                    if severity == "LOW":
+                                        severity = "MEDIUM"
+
+                                if debug_info:
+                                    evidence.append(f"Debug/internal info: {debug_info[:5]}")
+                                    severity = "HIGH"  # Debug info is HIGH risk
+
+                                if evidence:
+                                    # Calculate CVSS based on severity
+                                    cvss = {"LOW": 3.7, "MEDIUM": 5.3, "HIGH": 7.5}.get(severity, 5.3)
+
                                     findings.append(Finding(
-                                        type="api",
+                                        vuln_type=VulnType.EXCESSIVE_DATA_EXPOSURE,
                                         name="Excessive Data Exposure",
-                                        severity="MEDIUM",
-                                        description="API response contains potentially sensitive fields "
-                                                   "that may expose internal data or secrets.",
+                                        severity=severity,
+                                        description="API response exposes sensitive data that may "
+                                                   "leak PII, credentials, or internal information. "
+                                                   "This violates OWASP API3:2023.",
                                         host=base_url,
-                                        matched_at=endpoint,
-                                        evidence=[f"Sensitive fields: {exposed[:10]}"],
-                                        cvss_score=5.3,
-                                        cwe="CWE-200",
-                                        remediation="Review API responses and remove unnecessary fields. "
-                                                   "Implement response filtering based on user roles.",
+                                        endpoint=endpoint,
+                                        evidence=evidence,
+                                        cvss_score=cvss,
+                                        cwe_id="CWE-200",
+                                        remediation=(
+                                            "1. Implement response filtering to return only "
+                                            "necessary fields.\n"
+                                            "2. Use DTOs (Data Transfer Objects) to control "
+                                            "what data is serialized.\n"
+                                            "3. Apply field-level access control based on user roles.\n"
+                                            "4. Never expose internal/debug data in production.\n"
+                                            "5. Mask or redact PII in API responses."
+                                        ),
                                         references=[
                                             "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
                                         ],
-                                        confidence=85,
+                                        confidence_score=90.0 if pii_findings else 85.0,
+                                        metadata={
+                                            "sensitive_fields": sensitive_fields[:20],
+                                            "pii_types": list(pii_findings.keys()) if pii_findings else [],
+                                            "field_count": field_count,
+                                            "has_debug_info": bool(debug_info),
+                                        }
                                     ).to_dict())
+
                             except json.JSONDecodeError:
                                 pass
-                                
+
                 except Exception as e:
                     logger.debug(f"Data exposure check failed: {e}")
-        
+
         return findings
+
+    def _detect_pii_in_values(self, data: Any, path: str = "") -> dict[str, list[str]]:
+        """Detect PII patterns in JSON values."""
+        found = {}
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                # Recursively check nested objects
+                nested = self._detect_pii_in_values(value, current_path)
+                for pii_type, paths in nested.items():
+                    found.setdefault(pii_type, []).extend(paths)
+
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:10]):  # Limit list iteration
+                nested = self._detect_pii_in_values(item, f"{path}[{i}]")
+                for pii_type, paths in nested.items():
+                    found.setdefault(pii_type, []).extend(paths)
+
+        elif isinstance(data, str) and len(data) > 5:
+            # Check string values against PII patterns
+            for pii_type, pattern in self.PII_PATTERNS.items():
+                if pattern.search(data):
+                    found.setdefault(pii_type, []).append(path)
+
+        return found
+
+    def _count_fields(self, data: Any, max_depth: int = 10) -> int:
+        """Count total fields in JSON response."""
+        if max_depth <= 0:
+            return 0
+
+        if isinstance(data, dict):
+            count = len(data)
+            for value in data.values():
+                count += self._count_fields(value, max_depth - 1)
+            return count
+        elif isinstance(data, list) and data:
+            # Sample first item for lists
+            return self._count_fields(data[0], max_depth - 1) * min(len(data), 10)
+        return 0
+
+    def _detect_debug_info(self, data: Any, path: str = "") -> list[str]:
+        """Detect debug/internal information leakage."""
+        debug_indicators = []
+
+        debug_keywords = [
+            "stack_trace", "stacktrace", "traceback", "exception",
+            "debug", "internal_error", "sql_query", "query_log",
+            "server_info", "environment", "config", "settings",
+            "__debug__", "_internal", "_private", "development",
+        ]
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                key_lower = key.lower()
+
+                # Check key names
+                if any(kw in key_lower for kw in debug_keywords):
+                    debug_indicators.append(current_path)
+
+                # Check string values for stack traces
+                if isinstance(value, str):
+                    if "at line" in value.lower() or "traceback" in value.lower():
+                        debug_indicators.append(f"{current_path} (stack trace)")
+                    elif value.startswith("/") and "." in value:
+                        # Looks like a file path
+                        debug_indicators.append(f"{current_path} (file path)")
+
+                # Recurse
+                debug_indicators.extend(self._detect_debug_info(value, current_path))
+
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):
+                debug_indicators.extend(self._detect_debug_info(item, f"{path}[{i}]"))
+
+        return debug_indicators
     
     def _find_sensitive_fields(
         self,
@@ -1340,20 +1828,20 @@ class APIScanner(ScanModule):
     ) -> list[str]:
         """Recursively find sensitive fields in JSON data."""
         found = []
-        
-        if isinstance(data, dict):
+
+        if isinstance(data, dict):  # Fixed: was 'asset_data' (bug)
             for key, value in data.items():
                 current_path = f"{path}.{key}" if path else key
-                
+
                 if any(s in key.lower() for s in sensitive_fields):
                     found.append(current_path)
-                
+
                 found.extend(self._find_sensitive_fields(value, sensitive_fields, current_path))
-                
+
         elif isinstance(data, list):
-            for i, item in enumerate(data[:5]):  # Limit list iteration
+            for i, item in enumerate(data[:10]):  # Increased from 5 to 10
                 found.extend(self._find_sensitive_fields(item, sensitive_fields, f"{path}[{i}]"))
-        
+
         return found
     
     async def _check_rate_limiting(
@@ -1371,15 +1859,16 @@ class APIScanner(ScanModule):
         test_endpoint = api_endpoints[0]
         
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
                 # Send rapid requests
                 responses = []
                 
                 for i in range(20):
                     try:
-                        response = await client.get(test_endpoint)
+                        response = await client.get(test_endpoint, timeout=10.0)
                         responses.append(response.status_code)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[API] Rate limit test request {i} failed: {e}")
                         break
                 
                 # Check if we got rate limited
@@ -1387,26 +1876,26 @@ class APIScanner(ScanModule):
                 
                 if not rate_limited and len(responses) >= 20:
                     findings.append(Finding(
-                        type="api",
+                        vuln_type=VulnType.RATE_LIMIT_BYPASS,
                         name="Missing API Rate Limiting",
-                        severity="MEDIUM",
+                        severity=Severity.MEDIUM,
                         description="API endpoint does not implement rate limiting. "
                                    "This could allow denial of service or brute force attacks.",
                         host=base_url,
-                        matched_at=test_endpoint,
+                        endpoint=test_endpoint,
                         evidence=[
                             f"Sent {len(responses)} rapid requests",
                             "No 429 (Too Many Requests) responses received",
                         ],
                         cvss_score=5.3,
-                        cwe="CWE-770",
+                        cwe_id="CWE-770",
                         remediation="Implement rate limiting on all API endpoints. "
                                    "Use token bucket or sliding window algorithms. "
                                    "Return 429 status with Retry-After header.",
                         references=[
                             "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
                         ],
-                        confidence=85,
+                        confidence_score=85,
                     ).to_dict())
                     
         except Exception as e:
@@ -1435,7 +1924,7 @@ class APIScanner(ScanModule):
             "/api/me",
         ]
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for path in user_endpoints:
                 await rate_limiter.acquire()
 
@@ -1443,7 +1932,7 @@ class APIScanner(ScanModule):
 
                 try:
                     # OPTIMIZATION: First check if endpoint exists with GET
-                    probe_response = await client.get(url)
+                    probe_response = await client.get(url, timeout=10.0)
                     # Skip if endpoint doesn't exist (404/400/405 for GET is OK, but 404 means skip)
                     if probe_response.status_code == 404:
                         continue
@@ -1470,28 +1959,28 @@ class APIScanner(ScanModule):
                         # If we get 200/201, the endpoint accepts these fields
                         if response.status_code in [200, 201]:
                             findings.append(Finding(
-                                type="api",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name="Potential Mass Assignment Vulnerability",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"API endpoint {path} accepts PUT/PATCH requests with "
                                            f"potentially dangerous fields (role, is_admin, permissions). "
                                            f"This may allow privilege escalation.",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Endpoint: {url}",
                                     f"Method: {method.__name__.upper()}",
                                     f"Dangerous fields accepted: {list(test_data.keys())}",
                                 ],
                                 cvss_score=8.1,
-                                cwe="CWE-915",
+                                cwe_id="CWE-915",
                                 remediation="Implement allowlists for updatable fields. "
                                            "Use DTOs/schemas to control which properties can be modified. "
                                            "Never trust client-provided role or permission fields.",
                                 references=[
                                     "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
                                 ],
-                                confidence=85,
+                                confidence_score=85,
                             ).to_dict())
                             break
 
@@ -1524,8 +2013,8 @@ class APIScanner(ScanModule):
         
         # Check main page
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                response = await client.get(base_url)
+            async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
+                response = await client.get(base_url, timeout=10.0)
                 content = response.text
                 
                 for pattern, key_type in api_key_patterns:
@@ -1536,20 +2025,20 @@ class APIScanner(ScanModule):
                         masked = [m[:8] + "..." + m[-4:] if len(m) > 12 else "***" for m in matches[:3]]
                         
                         findings.append(Finding(
-                            type="api",
+                            vuln_type=VulnType.INFO_DISCLOSURE,
                             name=f"Exposed {key_type}",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description=f"{key_type} found exposed in page source. "
                                        f"This could allow unauthorized API access.",
                             host=base_url,
-                            matched_at=base_url,
+                            endpoint=base_url,
                             evidence=[f"Keys found (masked): {masked}"],
                             cvss_score=7.5,
-                            cwe="CWE-312",
+                            cwe_id="CWE-312",
                             remediation="Remove API keys from client-side code. "
                                        "Use environment variables and server-side proxies. "
                                        "Rotate exposed keys immediately.",
-                            confidence=90,
+                            confidence_score=90,
                         ).to_dict())
                         
         except Exception as e:
@@ -1562,24 +2051,24 @@ class APIScanner(ScanModule):
             await rate_limiter.acquire()
             
             try:
-                async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                    response = await client.get(js_url)
+                async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
+                    response = await client.get(js_url, timeout=10.0)
                     content = response.text
                     
                     for pattern, key_type in api_key_patterns:
                         if re.search(pattern, content):
                             findings.append(Finding(
-                                type="api",
+                                vuln_type=VulnType.INFO_DISCLOSURE,
                                 name=f"Exposed {key_type} in JavaScript",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"{key_type} found in JavaScript file.",
                                 host=base_url,
-                                matched_at=js_url,
+                                endpoint=js_url,
                                 evidence=[f"Found in: {js_url}"],
                                 cvss_score=7.5,
-                                cwe="CWE-312",
+                                cwe_id="CWE-312",
                                 remediation="Remove API keys from JavaScript files.",
-                                confidence=90,
+                                confidence_score=90,
                             ).to_dict())
                             break
                             
@@ -1674,14 +2163,14 @@ class APIScanner(ScanModule):
 
         # FALLBACK: Hardcoded paths (only if EndpointMap has none)
         logger.info("[Upload] EndpointMap has no upload endpoints, using hardcoded paths")
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for path in self.UPLOAD_PATHS:
                 await rate_limiter.acquire()
 
                 url = urljoin(base_url, path)
                 try:
                     # Try GET to see if endpoint exists
-                    response = await client.get(url)
+                    response = await client.get(url, timeout=10.0)
                     if response.status_code in [200, 401, 403, 405]:
                         endpoints.append(url)
 
@@ -1691,7 +2180,8 @@ class APIScanner(ScanModule):
                     if "POST" in allow or "PUT" in allow:
                         endpoints.append(url)
 
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[API] Upload endpoint discovery error for {url}: {e}")
                     continue
 
         return list(set(endpoints))
@@ -1707,7 +2197,7 @@ class APIScanner(ScanModule):
         # PHP shell content
         shell_content = b"<?php echo 'VULN_TEST_' . phpinfo(); ?>"
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for payload_template in EXTENSION_BYPASS_PAYLOADS[:10]:
                 await rate_limiter.acquire()
                 
@@ -1721,7 +2211,7 @@ class APIScanner(ScanModule):
                         "file": (filename, shell_content, "image/jpeg"),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         # Check if file was uploaded
@@ -1731,25 +2221,25 @@ class APIScanner(ScanModule):
                         success_indicators = ["success", "uploaded", "url", "path", "file"]
                         if any(ind in response_text for ind in success_indicators):
                             findings.append(Finding(
-                                type="file_upload",
+                                vuln_type=VulnType.FILE_UPLOAD,
                                 name="Extension Bypass Vulnerability",
-                                severity="CRITICAL",
+                                severity=Severity.CRITICAL,
                                 description=f"File upload accepts dangerous extension bypass: {display_name}. "
                                            f"This may allow execution of malicious code.",
                                 host=urlparse(upload_url).netloc,
-                                matched_at=upload_url,
+                                endpoint=upload_url,
                                 evidence=[
                                     f"Filename: {display_name}",
                                     f"Response: {response.status_code}",
                                     f"Content: {response_text[:200]}",
                                 ],
                                 cvss_score=9.8,
-                                cwe="CWE-434",
+                                cwe_id="CWE-434",
                                 remediation="Use allowlist of safe extensions. "
                                            "Strip/sanitize filenames. "
                                            "Store files outside web root. "
                                            "Use random filenames.",
-                                confidence=95,
+                                confidence_score=95,
                             ).to_dict())
                             break  # Found vulnerability, stop testing
                             
@@ -1768,7 +2258,7 @@ class APIScanner(ScanModule):
         
         shell_content = b"<?php system($_GET['c']); ?>"
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for content_type, filename in CONTENT_TYPE_BYPASS[:5]:
                 await rate_limiter.acquire()
                 
@@ -1777,31 +2267,31 @@ class APIScanner(ScanModule):
                         "file": (filename, shell_content, content_type),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         response_text = response.text.lower()
                         
                         if "error" not in response_text and "invalid" not in response_text:
                             findings.append(Finding(
-                                type="file_upload",
+                                vuln_type=VulnType.FILE_UPLOAD,
                                 name="Content-Type Bypass",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"File upload accepts mismatched Content-Type. "
                                            f"Uploaded {filename} with Content-Type: {content_type or 'empty'}",
                                 host=urlparse(upload_url).netloc,
-                                matched_at=upload_url,
+                                endpoint=upload_url,
                                 evidence=[
                                     f"Filename: {filename}",
                                     f"Content-Type: {content_type}",
                                     f"Response: {response.status_code}",
                                 ],
                                 cvss_score=8.1,
-                                cwe="CWE-436",
+                                cwe_id="CWE-436",
                                 remediation="Validate Content-Type server-side. "
                                            "Check file magic bytes. "
                                            "Don't trust client headers.",
-                                confidence=90,
+                                confidence_score=90,
                             ).to_dict())
                             break
                             
@@ -1818,7 +2308,7 @@ class APIScanner(ScanModule):
         """Test magic bytes validation bypass."""
         findings = []
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for sig_name, sig in FILE_SIGNATURES.items():
                 await rate_limiter.acquire()
                 
@@ -1831,30 +2321,30 @@ class APIScanner(ScanModule):
                         "file": (filename, malicious_content, sig.mime_type),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         response_text = response.text.lower()
                         
                         if "error" not in response_text:
                             findings.append(Finding(
-                                type="file_upload",
+                                vuln_type=VulnType.FILE_UPLOAD,
                                 name="Magic Bytes Bypass",
-                                severity="HIGH",
+                                severity=Severity.HIGH,
                                 description=f"File upload validates magic bytes but not extension. "
                                            f"File with {sig.description} header but .php extension accepted.",
                                 host=urlparse(upload_url).netloc,
-                                matched_at=upload_url,
+                                endpoint=upload_url,
                                 evidence=[
                                     f"Filename: {filename}",
                                     f"Magic bytes: {sig_name}",
                                     f"Response: {response.status_code}",
                                 ],
                                 cvss_score=8.1,
-                                cwe="CWE-434",
+                                cwe_id="CWE-434",
                                 remediation="Validate both magic bytes AND extension. "
                                            "Use file type libraries for proper detection.",
-                                confidence=90,
+                                confidence_score=90,
                             ).to_dict())
                             break
                             
@@ -1871,7 +2361,7 @@ class APIScanner(ScanModule):
         """Test polyglot file upload (valid image + code)."""
         findings = []
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for poly_name, poly_content in POLYGLOT_TEMPLATES.items():
                 await rate_limiter.acquire()
                 
@@ -1883,7 +2373,7 @@ class APIScanner(ScanModule):
                         "file": (filename, poly_content, f"image/{ext}"),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         # Try to extract uploaded URL
@@ -1894,24 +2384,24 @@ class APIScanner(ScanModule):
                             uploaded_url = ""
                         
                         findings.append(Finding(
-                            type="file_upload",
+                            vuln_type=VulnType.FILE_UPLOAD,
                             name="Polyglot File Accepted",
-                            severity="HIGH",
+                            severity=Severity.HIGH,
                             description=f"Server accepts polyglot file that is valid image AND contains code. "
                                        f"If server executes this, it leads to RCE.",
                             host=urlparse(upload_url).netloc,
-                            matched_at=upload_url,
+                            endpoint=upload_url,
                             evidence=[
                                 f"Polyglot type: {poly_name}",
                                 f"Filename: {filename}",
                                 f"Uploaded to: {uploaded_url}" if uploaded_url else "URL not exposed",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-434",
+                            cwe_id="CWE-434",
                             remediation="Re-encode uploaded images. "
                                        "Strip metadata and comments. "
                                        "Use image libraries to validate and rewrite files.",
-                            confidence=90,
+                            confidence_score=90,
                         ).to_dict())
                         break
                         
@@ -1928,7 +2418,7 @@ class APIScanner(ScanModule):
         """Test SVG file XSS vulnerabilities."""
         findings = []
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for svg_payload in SVG_XSS_PAYLOADS[:2]:
                 await rate_limiter.acquire()
                 
@@ -1937,27 +2427,27 @@ class APIScanner(ScanModule):
                         "file": ("test.svg", svg_payload.encode(), "image/svg+xml"),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         findings.append(Finding(
-                            type="file_upload",
+                            vuln_type=VulnType.FILE_UPLOAD,
                             name="SVG XSS Upload",
-                            severity="MEDIUM",
+                            severity=Severity.MEDIUM,
                             description="Server accepts SVG files with JavaScript. "
                                        "If served to users, this enables stored XSS attacks.",
                             host=urlparse(upload_url).netloc,
-                            matched_at=upload_url,
+                            endpoint=upload_url,
                             evidence=[
                                 "SVG with <script> or event handlers accepted",
                                 f"Response: {response.status_code}",
                             ],
                             cvss_score=6.1,
-                            cwe="CWE-79",
+                            cwe_id="CWE-79",
                             remediation="Sanitize SVG files to remove script tags and event handlers. "
                                        "Serve SVG with Content-Type: image/svg+xml and CSP headers. "
                                        "Consider converting SVG to raster images.",
-                            confidence=85,
+                            confidence_score=85,
                         ).to_dict())
                         break
                         
@@ -1982,7 +2472,7 @@ class APIScanner(ScanModule):
             "..%c0%af..%c0%af..%c0%afetc%c0%afpasswd",
         ]
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for traversal_name in traversal_names[:3]:
                 await rate_limiter.acquire()
                 
@@ -1991,7 +2481,7 @@ class APIScanner(ScanModule):
                         "file": (traversal_name, b"test content", "text/plain"),
                     }
                     
-                    response = await client.post(upload_url, files=files)
+                    response = await client.post(upload_url, files=files, timeout=15.0)
                     
                     if response.status_code in [200, 201]:
                         response_text = response.text.lower()
@@ -1999,23 +2489,23 @@ class APIScanner(ScanModule):
                         # Check for success without sanitization error
                         if "invalid" not in response_text and "error" not in response_text:
                             findings.append(Finding(
-                                type="file_upload",
+                                vuln_type=VulnType.FILE_UPLOAD,
                                 name="Path Traversal in Upload",
-                                severity="CRITICAL",
+                                severity=Severity.CRITICAL,
                                 description="File upload may allow path traversal via filename. "
                                            "Could allow writing files outside upload directory.",
                                 host=urlparse(upload_url).netloc,
-                                matched_at=upload_url,
+                                endpoint=upload_url,
                                 evidence=[
                                     f"Filename: {traversal_name}",
                                     f"Response: {response.status_code}",
                                 ],
                                 cvss_score=9.8,
-                                cwe="CWE-22",
+                                cwe_id="CWE-22",
                                 remediation="Sanitize filenames - remove path separators. "
                                            "Use basename only. "
                                            "Generate random filenames server-side.",
-                                confidence=95,
+                                confidence_score=95,
                             ).to_dict())
                             break
                             
@@ -2044,12 +2534,12 @@ class APIScanner(ScanModule):
         url_params = ["url", "uri", "path", "dest", "redirect", "site", "html",
                       "img", "image", "load", "fetch", "proxy", "link", "src"]
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            for endpoint in endpoints[:10]:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
+            for endpoint in endpoints[:self.max_endpoints_per_test]:
                 parsed = urlparse(endpoint)
                 params = parse_qs(parsed.query)
                 
-                for param_name in params:
+                for i_param_name, param_name in enumerate(params):
                     if any(up in param_name.lower() for up in url_params):
                         # Found URL-like parameter, test SSRF
                         for ssrf_payload in SSRF_PAYLOADS[:5]:
@@ -2057,7 +2547,7 @@ class APIScanner(ScanModule):
                             
                             # Build test URL
                             new_params = dict(params)
-                            new_params[param_name] = [ssrf_payload]
+                            new_params[i_param_name] = [ssrf_payload]
                             
                             test_query = "&".join(f"{k}={v[0]}" for k, v in new_params.items())
                             test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{test_query}"
@@ -2076,24 +2566,24 @@ class APIScanner(ScanModule):
                                 for indicator in ssrf_indicators:
                                     if indicator in response.text:
                                         findings.append(Finding(
-                                            type="ssrf",
+                                            vuln_type=VulnType.SSRF,
                                             name="Server-Side Request Forgery",
-                                            severity="CRITICAL",
+                                            severity=Severity.CRITICAL,
                                             description=f"SSRF vulnerability in parameter '{param_name}'. "
                                                        f"Server made request to internal resource.",
                                             host=urlparse(base_url).netloc,
-                                            matched_at=endpoint,
+                                            endpoint=endpoint,
                                             evidence=[
                                                 f"Parameter: {param_name}",
                                                 f"Payload: {ssrf_payload}",
                                                 f"Indicator: {indicator}",
                                             ],
                                             cvss_score=9.1,
-                                            cwe="CWE-918",
+                                            cwe_id="CWE-918",
                                             remediation="Whitelist allowed URLs/domains. "
                                                        "Block internal IP ranges. "
                                                        "Use URL parsers to validate.",
-                                            confidence=95,
+                                            confidence_score=95,
                                         ).to_dict())
                                         return findings  # Critical found
                                         
@@ -2131,7 +2621,7 @@ class APIScanner(ScanModule):
         for path in xml_paths:
             xml_endpoints.append(urljoin(base_url, path))
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False, http2=True) as client:
             for endpoint in xml_endpoints[:5]:
                 for xxe_payload in XXE_PAYLOADS[:2]:
                     await rate_limiter.acquire()
@@ -2141,6 +2631,7 @@ class APIScanner(ScanModule):
                             endpoint,
                             content=xxe_payload.encode(),
                             headers={"Content-Type": "application/xml"},
+                            timeout=10.0,
                         )
                         
                         # Check for XXE indicators
@@ -2152,24 +2643,24 @@ class APIScanner(ScanModule):
                         for indicator in xxe_indicators:
                             if indicator in response.text:
                                 findings.append(Finding(
-                                    type="xxe",
+                                    vuln_type=VulnType.XXE,
                                     name="XML External Entity (XXE)",
-                                    severity="CRITICAL",
+                                    severity=Severity.CRITICAL,
                                     description="XXE vulnerability detected. "
                                                "Server processes external entities in XML.",
                                     host=urlparse(base_url).netloc,
-                                    matched_at=endpoint,
+                                    endpoint=endpoint,
                                     evidence=[
                                         f"Endpoint: {endpoint}",
                                         f"Indicator: {indicator}",
                                         f"Response snippet: {response.text[:200]}",
                                     ],
                                     cvss_score=9.1,
-                                    cwe="CWE-611",
+                                    cwe_id="CWE-611",
                                     remediation="Disable external entity processing. "
                                                "Use safe XML parsers. "
                                                "Validate and sanitize XML input.",
-                                    confidence=95,
+                                    confidence_score=95,
                                 ).to_dict())
                                 return findings  # Critical found
                                 

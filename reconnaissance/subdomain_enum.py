@@ -187,7 +187,7 @@ class SubdomainEnumerator:
                 except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer,
                         dns.resolver.NoNameservers, dns.resolver.Timeout):
                     return None
-                except Exception:
+                except dns.exception.DNSException:
                     return None
         
         # Process in batches
@@ -272,9 +272,9 @@ class SubdomainEnumerator:
                         "A",
                     )
                     return subdomain
-                except Exception:
+                except dns.exception.DNSException:
                     return None
-        
+
         tasks = [validate(sub) for sub in subdomains]
         results = await asyncio.gather(*tasks)
         

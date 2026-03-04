@@ -6,16 +6,17 @@ Tests for vulnerabilities in MFA implementations.
 from __future__ import annotations
 
 import re
-import secrets
-import time
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity
+from scanning.vuln_scanner import ScanModule
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from utils.scan_client import get_scan_client
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -85,22 +86,38 @@ class MFABypassScanner(ScanModule):
         "/security/2fa/remove",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
     
     async def scan(
         self,
         host: str,
         asset_data: dict[str, Any],
         rate_limiter: RateLimiter,
-    ) -> list[Finding]:
+    ) -> dict[str, Any]:
         """Scan for MFA bypass vulnerabilities."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
-        base_url = f"https://{host}" if not host.startswith("http") else host
+        if not host.startswith("http"):
+            # Use http:// for localhost/local IPs, https:// for external
+            is_local = any(host.startswith(p) for p in ("localhost", "127.", "192.168.", "10.", "172."))
+            base_url = f"http://{host}" if is_local else f"https://{host}"
+        else:
+            base_url = host
         
-        async with httpx.AsyncClient(verify=False, timeout=self.timeout) as client:
+        async with get_scan_client(verify_ssl=False, timeout=self.timeout) as client:
             # Discover MFA endpoints
             mfa_endpoints = await self._discover_mfa_endpoints(
                 client, base_url, rate_limiter
@@ -151,9 +168,9 @@ class MFABypassScanner(ScanModule):
                 client, base_url, mfa_endpoints, rate_limiter
             )
             findings.extend(session_findings)
-        
-        return findings
-    
+
+        return {"findings": findings, "info": []}
+
     async def _discover_mfa_endpoints(
         self,
         client: httpx.AsyncClient,
@@ -162,22 +179,40 @@ class MFABypassScanner(ScanModule):
     ) -> list[str]:
         """Discover MFA-related endpoints."""
         endpoints = []
-        
+
+        # FIX 2026-02-18: Only accept status codes that indicate a real MFA endpoint
+        # 404 = not found, 302/303/307 = redirect (probably login), 304 = cached
+        # Valid: 200, 401, 403, 400 (means endpoint exists and processes requests)
+        VALID_MFA_STATUSES = {200, 401, 403, 400, 405, 422}
+
+        # MFA-related content indicators
+        MFA_INDICATORS = [
+            "2fa", "mfa", "otp", "totp", "verify", "code", "authenticator",
+            "two-factor", "second factor", "verification code", "one-time",
+        ]
+
         for path in self.MFA_ENDPOINTS:
             await rate_limiter.acquire()
-            
+
             try:
                 url = urljoin(base_url, path)
                 response = await client.get(url, follow_redirects=False)
-                
-                # Found if returns something other than 404
-                if response.status_code != 404:
-                    endpoints.append(url)
-                    logger.info(f"MFA endpoint found: {url}")
-                    
+
+                # FIX: Only accept statuses that indicate real endpoints
+                if response.status_code in VALID_MFA_STATUSES:
+                    # Additional check: verify content looks MFA-related
+                    content_lower = response.text.lower()
+                    if any(ind in content_lower for ind in MFA_INDICATORS):
+                        endpoints.append(url)
+                        logger.info(f"MFA endpoint found: {url} (status={response.status_code})")
+                    elif response.status_code in {401, 403}:
+                        # 401/403 without content check is still valid (auth required)
+                        endpoints.append(url)
+                        logger.info(f"MFA endpoint found (auth required): {url}")
+
             except Exception as e:
                 logger.debug(f"Error checking {path}: {e}")
-        
+
         return endpoints
     
     async def _test_direct_access_bypass(
@@ -228,15 +263,15 @@ class MFABypassScanner(ScanModule):
                     if any(ind in response.text.lower() for ind in protected_indicators):
                         findings.append(Finding(
                             name="2FA Bypass via Direct Endpoint Access",
-                            severity="CRITICAL",
-                            confidence="MEDIUM",
+                            severity=Severity.CRITICAL,
+                            confidence_score=65.0,
                             description=f"Protected endpoint {path} may be accessible without completing 2FA",
-                            matched_at=url,
+                            endpoint=url,
                             evidence=[
                                 "Endpoint returned 200 status",
                                 "Protected content indicators found",
                             ],
-                            cwe="CWE-287",
+                            cwe_id="CWE-287",
                             cvss_score=8.8,
                             remediation="Enforce 2FA verification state check on all protected endpoints. "
                                        "Use server-side session validation.",
@@ -256,57 +291,78 @@ class MFABypassScanner(ScanModule):
     ) -> list[Finding]:
         """Test for lack of rate limiting on 2FA code submission."""
         findings = []
-        
+
+        # FIX 2026-02-18: Status codes that indicate the endpoint doesn't exist or isn't MFA
+        INVALID_STATUSES = {404, 405, 500, 502, 503, 504, 301, 302, 303, 304, 307, 308}
+
+        # Status codes that indicate actual 2FA processing (valid test)
+        VALID_PROCESSING_STATUSES = {200, 400, 401, 422, 403}
+
         for endpoint in mfa_endpoints:
             if "verify" not in endpoint.lower():
                 continue
-            
+
             # Send multiple rapid requests
             responses = []
-            
+
             for i in range(10):
                 await rate_limiter.acquire()
-                
+
                 try:
                     # Common 2FA code formats
                     code = str(i).zfill(6)  # 000000 to 000009
-                    
+
                     data = {
                         "code": code,
                         "otp": code,
                         "token": code,
                         "totp": code,
                     }
-                    
+
                     response = await client.post(endpoint, data=data)
                     responses.append(response.status_code)
-                    
+
                 except Exception as e:
                     logger.debug(f"Error in rate limit test: {e}")
                     break
-            
-            # Check if all requests were processed (no rate limiting)
-            if len(responses) >= 10:
-                # If none returned 429 (rate limit) or similar
-                if 429 not in responses and all(r != 403 for r in responses[-5:]):
-                    findings.append(Finding(
-                        name="2FA Code Brute Force Possible",
-                        severity="HIGH",
-                        confidence="HIGH",
-                        description="No rate limiting detected on 2FA verification endpoint, "
-                                   "allowing brute force of 6-digit codes (1 million combinations)",
-                        matched_at=endpoint,
-                        evidence=[
-                            f"10 requests sent successfully",
-                            f"Response codes: {responses}",
-                            "No 429 (rate limit) responses",
-                        ],
-                        cwe="CWE-307",
-                        cvss_score=7.5,
-                        remediation="Implement strict rate limiting: max 3-5 attempts per code validity period. "
-                                   "Add exponential backoff and account lockout.",
-                    ))
-        
+
+            # FIX 2026-02-18: Validate that this is actually an MFA endpoint that processes codes
+            if len(responses) < 10:
+                continue
+
+            # If all/most responses are 404/302/304 → endpoint doesn't exist or redirects
+            invalid_count = sum(1 for r in responses if r in INVALID_STATUSES)
+            if invalid_count >= 8:  # 80%+ invalid = not a real MFA endpoint
+                logger.debug(f"Skipping {endpoint}: {invalid_count}/10 invalid responses ({responses})")
+                continue
+
+            # Require at least some responses that indicate actual processing
+            valid_count = sum(1 for r in responses if r in VALID_PROCESSING_STATUSES)
+            if valid_count < 5:  # Need at least 50% valid processing responses
+                logger.debug(f"Skipping {endpoint}: only {valid_count}/10 valid responses ({responses})")
+                continue
+
+            # If none returned 429 (rate limit) and no 403 in last 5 = no rate limiting
+            if 429 not in responses and all(r != 403 for r in responses[-5:]):
+                findings.append(Finding(
+                    name="2FA Code Brute Force Possible",
+                    severity=Severity.HIGH,
+                    confidence_score=85.0,
+                    description="No rate limiting detected on 2FA verification endpoint, "
+                               "allowing brute force of 6-digit codes (1 million combinations)",
+                    endpoint=endpoint,
+                    evidence=[
+                        f"10 requests sent successfully",
+                        f"Response codes: {responses}",
+                        f"Valid processing responses: {valid_count}/10",
+                        "No 429 (rate limit) responses",
+                    ],
+                    cwe_id="CWE-307",
+                    cvss_score=7.5,
+                    remediation="Implement strict rate limiting: max 3-5 attempts per code validity period. "
+                               "Add exponential backoff and account lockout.",
+                ))
+
         return findings
     
     async def _test_response_manipulation(
@@ -342,16 +398,16 @@ class MFABypassScanner(ScanModule):
                 if any(ind in response_text for ind in client_side_indicators):
                     findings.append(Finding(
                         name="Potential 2FA Response Manipulation",
-                        severity="HIGH",
-                        confidence="MEDIUM",
+                        severity=Severity.HIGH,
+                        confidence_score=65.0,
                         description="2FA verification appears to use client-checkable response. "
                                    "May be vulnerable to response tampering.",
-                        matched_at=endpoint,
+                        endpoint=endpoint,
                         evidence=[
                             "Response contains boolean verification status",
                             "Client-side validation indicators detected",
                         ],
-                        cwe="CWE-602",
+                        cwe_id="CWE-602",
                         cvss_score=7.5,
                         remediation="Never rely on client-side validation for 2FA. "
                                    "Use server-side session state exclusively.",
@@ -361,12 +417,12 @@ class MFABypassScanner(ScanModule):
                 if "eyj" in response_text.lower():  # JWT indicator
                     findings.append(Finding(
                         name="JWT Token in 2FA Response",
-                        severity="MEDIUM",
-                        confidence="MEDIUM",
+                        severity=Severity.MEDIUM,
+                        confidence_score=65.0,
                         description="JWT token returned in 2FA response - verify server-side validation",
-                        matched_at=endpoint,
+                        endpoint=endpoint,
                         evidence=["JWT token pattern found in response"],
-                        cwe="CWE-287",
+                        cwe_id="CWE-287",
                         remediation="Ensure JWT tokens are properly validated server-side.",
                     ))
                     
@@ -403,39 +459,54 @@ class MFABypassScanner(ScanModule):
                         if re.search(pattern, response.text):
                             findings.append(Finding(
                                 name="Backup Codes Exposure",
-                                severity="CRITICAL",
-                                confidence="HIGH",
+                                severity=Severity.CRITICAL,
+                                confidence_score=85.0,
                                 description="Backup recovery codes may be accessible without proper authentication",
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     "Endpoint returned 200",
                                     "Backup code patterns detected in response",
                                 ],
-                                cwe="CWE-200",
+                                cwe_id="CWE-200",
                                 cvss_score=8.8,
                                 remediation="Protect backup codes endpoint with full authentication. "
                                            "Never expose codes in API responses.",
                             ))
-                            break
+                            # AUDIT-FIX 2026-02-11: Removed break - continue testing other URLs
                 
                 # Test rate limiting on backup code usage
                 await rate_limiter.acquire()
-                
+
+                # FIX 2026-02-18: Track responses to validate this is a real backup code endpoint
+                backup_responses = []
+                rate_limited = False
+
                 for i in range(5):
                     data = {"code": f"BACKUP{i:04d}"}
-                    response = await client.post(url, data=data)
-                    
-                    if response.status_code == 429:
+                    resp = await client.post(url, data=data)
+                    backup_responses.append(resp.status_code)
+
+                    if resp.status_code == 429:
+                        rate_limited = True
                         break
-                else:
+
+                # FIX: Only report if endpoint actually processes backup codes
+                # (not 404/302/304/500)
+                valid_statuses = {200, 400, 401, 403, 422}
+                valid_count = sum(1 for r in backup_responses if r in valid_statuses)
+
+                if not rate_limited and valid_count >= 3:  # At least 3/5 valid responses
                     findings.append(Finding(
                         name="Backup Code Brute Force Possible",
-                        severity="HIGH",
-                        confidence="MEDIUM",
+                        severity=Severity.HIGH,
+                        confidence_score=65.0,
                         description="No rate limiting on backup code verification",
-                        matched_at=url,
-                        evidence=["Multiple backup code attempts accepted"],
-                        cwe="CWE-307",
+                        endpoint=url,
+                        evidence=[
+                            f"Multiple backup code attempts accepted",
+                            f"Response codes: {backup_responses}",
+                        ],
+                        cwe_id="CWE-307",
                         remediation="Limit backup code attempts. Invalidate used codes.",
                     ))
                     
@@ -464,13 +535,13 @@ class MFABypassScanner(ScanModule):
                 if response.status_code != 404:
                     findings.append(Finding(
                         name="2FA Disable Endpoint Found - Race Condition Check Required",
-                        severity="INFO",
-                        confidence="HIGH",
+                        severity=Severity.INFO,
+                        confidence_score=85.0,
                         description="2FA disable endpoint found. Manual testing required for race conditions: "
                                    "attacker may be able to disable 2FA during authentication window.",
-                        matched_at=url,
+                        endpoint=url,
                         evidence=["2FA disable endpoint accessible"],
-                        cwe="CWE-362",
+                        cwe_id="CWE-362",
                         remediation="Implement proper locking during 2FA operations. "
                                    "Require re-authentication for 2FA changes.",
                     ))
@@ -517,20 +588,20 @@ class MFABypassScanner(ScanModule):
                            "authenticated" in response.text.lower():
                             findings.append(Finding(
                                 name="2FA Parameter Tampering Bypass",
-                                severity="CRITICAL",
-                                confidence="MEDIUM",
+                                severity=Severity.CRITICAL,
+                                confidence_score=65.0,
                                 description=f"2FA may be bypassable via parameter: {params}",
-                                matched_at=endpoint,
+                                endpoint=endpoint,
                                 evidence=[
                                     f"Parameter: {params}",
                                     "Success indicators in response",
                                 ],
-                                cwe="CWE-639",
+                                cwe_id="CWE-639",
                                 cvss_score=9.1,
                                 remediation="Never trust client-supplied 2FA status parameters. "
                                            "Use server-side session state only.",
                             ))
-                            break
+                            # AUDIT-FIX 2026-02-11: Removed break - continue testing other params
                     
                     # Try POST with params
                     response = await client.post(endpoint, data=params)
@@ -539,16 +610,16 @@ class MFABypassScanner(ScanModule):
                        ("success" in response.text.lower() or "redirect" in response.headers.get("location", "")):
                         findings.append(Finding(
                             name="2FA Parameter Tampering (POST)",
-                            severity="CRITICAL",
-                            confidence="MEDIUM",
+                            severity=Severity.CRITICAL,
+                            confidence_score=65.0,
                             description=f"2FA bypassed via POST parameter: {params}",
-                            matched_at=endpoint,
+                            endpoint=endpoint,
                             evidence=[f"Parameter: {params}"],
-                            cwe="CWE-639",
+                            cwe_id="CWE-639",
                             cvss_score=9.1,
                             remediation="Validate 2FA status server-side.",
                         ))
-                        break
+                        # AUDIT-FIX 2026-02-11: Removed break - continue testing other params
                         
                 except Exception as e:
                     logger.debug(f"Error testing param tampering: {e}")
@@ -593,19 +664,19 @@ class MFABypassScanner(ScanModule):
                         if initial_cookies[name] == new_cookies[name]:
                             findings.append(Finding(
                                 name="Session Fixation in 2FA Flow",
-                                severity="HIGH",
-                                confidence="MEDIUM",
+                                severity=Severity.HIGH,
+                                confidence_score=65.0,
                                 description="Session ID does not change after 2FA verification attempt. "
                                            "May be vulnerable to session fixation.",
-                                matched_at=mfa_endpoints[0],
+                                endpoint=mfa_endpoints[0],
                                 evidence=[
                                     f"Session cookie '{name}' unchanged",
                                 ],
-                                cwe="CWE-384",
+                                cwe_id="CWE-384",
                                 cvss_score=7.5,
                                 remediation="Regenerate session ID after successful 2FA verification.",
                             ))
-                            break
+                            # AUDIT-FIX 2026-02-11: Removed break - check all session cookies
                             
         except Exception as e:
             logger.debug(f"Error testing session handling: {e}")

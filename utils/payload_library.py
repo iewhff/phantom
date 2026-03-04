@@ -18,7 +18,7 @@ Usage:
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Set
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 import html
 import base64
 

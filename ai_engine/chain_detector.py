@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ai_engine.model_manager import ModelManager
+from scanning.constants import normalize_vuln_type
 from utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -173,30 +174,37 @@ Respond with JSON array of chains.
     ) -> list[dict[str, Any]]:
         """Detect known chain patterns."""
         chains = []
-        
-        # Extract finding types and evidence
-        finding_types = set()
+
+        # Extract and normalize finding types
+        # Maps canonical type → list of findings with that type
+        findings_by_canonical: dict[str, list[dict]] = {}
         all_evidence = []
-        
+
         for f in findings:
-            finding_types.add(f.get("type", "").lower())
-            finding_types.add(f.get("name", "").lower())
+            # Normalize both type and name fields
+            raw_type = f.get("type", "")
+            raw_name = f.get("name", "")
+
+            canonical_type = normalize_vuln_type(raw_type)
+            canonical_name = normalize_vuln_type(raw_name)
+
+            # Add finding under its canonical type
+            findings_by_canonical.setdefault(canonical_type, []).append(f)
+            if canonical_name != canonical_type and canonical_name != "unknown":
+                findings_by_canonical.setdefault(canonical_name, []).append(f)
+
             all_evidence.extend(f.get("evidence", []))
-        
+
+        # Set of all canonical types present
+        canonical_types = set(findings_by_canonical.keys())
         evidence_text = " ".join(str(e) for e in all_evidence).lower()
-        
+
         for pattern in self.KNOWN_CHAINS:
-            # Check required types
+            # Check required types (pattern uses canonical names)
             required = pattern.get("required_types", set())
-            if not required.issubset(finding_types):
-                # Check if types appear in names
-                type_match = any(
-                    req in " ".join(finding_types)
-                    for req in required
-                )
-                if not type_match:
-                    continue
-            
+            if not required.issubset(canonical_types):
+                continue
+
             # Check required patterns in evidence
             required_patterns = pattern.get("required_patterns", [])
             if required_patterns:
@@ -206,16 +214,21 @@ Respond with JSON array of chains.
                 )
                 if not pattern_match:
                     continue
-            
-            # Build chain
-            chain_findings = [
-                f for f in findings
-                if (
-                    f.get("type", "").lower() in required or
-                    any(r in f.get("name", "").lower() for r in required)
-                )
-            ]
-            
+
+            # Build chain — collect findings matching required types
+            chain_findings_all = []
+            for req_type in required:
+                chain_findings_all.extend(findings_by_canonical.get(req_type, []))
+
+            # Keep only the highest-confidence finding per canonical type
+            best_by_type: dict[str, dict] = {}
+            for f in chain_findings_all:
+                canonical = normalize_vuln_type(f.get("type", "unknown"))
+                existing = best_by_type.get(canonical)
+                if not existing or (f.get("confidence", 0) or 0) > (existing.get("confidence", 0) or 0):
+                    best_by_type[canonical] = f
+            chain_findings = list(best_by_type.values())
+
             chains.append({
                 "chain_id": f"pattern_{len(chains)}",
                 "name": pattern["name"],

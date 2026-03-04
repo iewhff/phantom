@@ -30,7 +30,7 @@ from scanning.modules.supabase_scanner import SupabaseScanner, SupabaseScanResul
 from scanning.modules.firebase_scanner import FirebaseScanner, FirebaseScanResult
 from scanning.modules.third_party_scanner import ThirdPartyScanner, ThirdPartyScanResult
 from scanning.modules.csrf_scanner import CSRFScanner, CSRFScanResult
-from scanning.modules.mass_assignment_scanner import MassAssignmentScanner, MassAssignmentResult
+from scanning.modules.mass_assignment_scanner import MassAssignmentScanner
 from scanning.modules.advanced_rls_bypass_scanner import AdvancedRLSBypassScanner, RLSBypassResult
 from scanning.modules.linux_tools_wrapper import LinuxToolsWrapper, LinuxToolsResult
 
@@ -175,7 +175,7 @@ class ExternalTool:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-            return {"output": stdout.decode(), "error": stderr.decode()}
+            return {"output": stdout.decode("utf-8", errors="replace"), "error": stderr.decode("utf-8", errors="replace")}
         except asyncio.TimeoutError:
             return {"error": "nmap timeout"}
         except Exception as e:
@@ -196,7 +196,7 @@ class ExternalTool:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
             
             findings = []
-            for line in stdout.decode().split("\n"):
+            for line in stdout.decode("utf-8", errors="replace").split("\n"):
                 if line.strip():
                     try:
                         findings.append(json.loads(line))
@@ -226,7 +226,7 @@ class ExternalTool:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-            return {"output": stdout.decode(), "error": stderr.decode()}
+            return {"output": stdout.decode("utf-8", errors="replace"), "error": stderr.decode("utf-8", errors="replace")}
         except asyncio.TimeoutError:
             return {"error": "sqlmap timeout"}
         except Exception as e:
@@ -345,8 +345,16 @@ class SecureDevOrchestrator:
         backend_result = await self._run_phase("0", "Backend Detection", target)
         
         if not backend_result or not hasattr(backend_result, 'backend_type'):
-            logger.error("Backend detection failed, aborting scan")
-            return self.result
+            # FN-FIX: Don't abort - continue with generic backend type
+            logger.warning("Backend detection failed - continuing with GENERIC backend type")
+            from scanning.modules.backend_detector import BackendType
+            class GenericBackendResult:
+                backend_type = BackendType.GENERIC
+                supabase_config = None
+                firebase_config = None
+                def get_applicable_phases(self):
+                    return ["1", "2", "3", "4", "5", "6"]  # All phases
+            backend_result = GenericBackendResult()
         
         self.result.backend_type = backend_result.backend_type
         
@@ -760,9 +768,12 @@ class SecureDevOrchestrator:
         # Add Supabase-specific data if available
         if backend_result and backend_result.supabase_config:
             config = backend_result.supabase_config
-            asset_data["supabase_url"] = f"https://{config.project_ref}.supabase.co"
-            asset_data["supabase_key"] = config.anon_key or ""
-            asset_data["tables"] = ["users", "profiles", "data", "items", "orders", "payments"]
+            if isinstance(data, dict):
+                asset_data["supabase_url"] = f"https://{config.project_ref}.supabase.co"
+            if isinstance(data, dict):
+                asset_data["supabase_key"] = config.anon_key or ""
+            if isinstance(data, dict):
+                asset_data["tables"] = ["users", "profiles", "data", "items", "orders", "payments"]
         
         from urllib.parse import urlparse
         parsed = urlparse(target)

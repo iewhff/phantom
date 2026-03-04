@@ -22,13 +22,38 @@ from __future__ import annotations
 import html
 import json
 import logging
+import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# M1 FIX 2026-02-13: Module-level NetworkX import with fallback
+# =============================================================================
+
+try:
+    import networkx as nx
+    NETWORKX_AVAILABLE = True
+except ImportError:
+    nx = None  # type: ignore
+    NETWORKX_AVAILABLE = False
+    logger.warning("NetworkX not available - some layout features disabled")
+
+# =============================================================================
+# CONSTANTS (M3 FIX 2026-02-13)
+# =============================================================================
+
+LAYOUT_MARGIN = 100
+SPRING_K = 2
+SPRING_ITERATIONS = 50
+D3_LINK_DISTANCE = 150
+D3_CHARGE_STRENGTH = -400
+D3_COLLISION_RADIUS = 50
 
 
 # =============================================================================
@@ -329,16 +354,52 @@ class ChainVisualizationEngine:
         self.config = config or VisualizationConfig()
         self._networkx_available = self._check_networkx()
 
+        # H3 FIX 2026-02-13: Thread safety
+        self._lock = threading.Lock()
+
+        # H1 FIX 2026-02-13: Initialize metrics
+        self._init_metrics()
+
         logger.info(f"ChainVisualizationEngine v{self.VERSION} initialized")
 
+    def _init_metrics(self) -> None:
+        """Initialize metrics tracking. H1 FIX 2026-02-13."""
+        self._metrics = {
+            "graphs_created": 0,
+            "graphs_from_chains": 0,
+            "renders_performed": 0,
+            "by_format": defaultdict(int),
+            "by_layout": defaultdict(int),
+            "total_nodes": 0,
+            "total_edges": 0,
+        }
+
+    def get_metrics(self) -> dict:
+        """Get current metrics. H1 FIX 2026-02-13.
+
+        Returns:
+            Dictionary with all tracked metrics.
+        """
+        with self._lock:
+            metrics = dict(self._metrics)
+            metrics["by_format"] = dict(metrics["by_format"])
+            metrics["by_layout"] = dict(metrics["by_layout"])
+            return metrics
+
+    def reset_metrics(self) -> None:
+        """Reset all metrics to initial values. H1 FIX 2026-02-13."""
+        with self._lock:
+            self._init_metrics()
+
     def _check_networkx(self) -> bool:
-        """Check if NetworkX is available."""
-        try:
-            import networkx  # noqa: F401
-            return True
-        except ImportError:
-            logger.warning("NetworkX not available - some features disabled")
-            return False
+        """Check if NetworkX is available.
+
+        M1 FIX 2026-02-13: Uses module-level NETWORKX_AVAILABLE constant.
+
+        Returns:
+            True if NetworkX can be imported, False otherwise.
+        """
+        return NETWORKX_AVAILABLE
 
     def create_graph_from_chain(
         self,
@@ -354,7 +415,18 @@ class ChainVisualizationEngine:
 
         Returns:
             AttackGraph representation
+
+        Raises:
+            ValueError: If chain is not a dict or has invalid structure
         """
+        # M4 FIX 2026-02-13: Input validation
+        if not isinstance(chain, dict):
+            raise ValueError(f"chain must be a dictionary, got {type(chain).__name__}")
+
+        vulnerabilities = chain.get("vulnerabilities", [])
+        if not isinstance(vulnerabilities, list):
+            raise ValueError(f"chain.vulnerabilities must be a list, got {type(vulnerabilities).__name__}")
+
         graph = AttackGraph(
             name=chain.get("chain_id", "Unknown Chain"),
             description=chain.get("description", ""),
@@ -364,8 +436,7 @@ class ChainVisualizationEngine:
             },
         )
 
-        # Add vulnerability nodes
-        vulnerabilities = chain.get("vulnerabilities", [])
+        # Add vulnerability nodes (vulnerabilities already validated above)
         for idx, vuln in enumerate(vulnerabilities):
             node = GraphNode(
                 id=vuln.get("id", f"vuln_{idx}"),
@@ -399,7 +470,7 @@ class ChainVisualizationEngine:
                 id="goal",
                 label=chain["outcome"],
                 node_type=NodeType.GOAL,
-                severity="critical",
+                severity="CRITICAL",
                 description="Chain objective achieved",
             )
             graph.add_node(goal_node)
@@ -419,7 +490,7 @@ class ChainVisualizationEngine:
             id="entry",
             label="Attacker",
             node_type=NodeType.ENTRY_POINT,
-            severity="info",
+            severity="INFO",
             description="Attack entry point",
         )
         graph.add_node(entry_node)
@@ -432,6 +503,11 @@ class ChainVisualizationEngine:
                 edge_type=EdgeType.EXPLOITS,
                 label="Initial Access",
             ))
+
+        # H1 FIX: Track metrics
+        self._metrics["graphs_created"] += 1
+        self._metrics["total_nodes"] += graph.node_count
+        self._metrics["total_edges"] += graph.edge_count
 
         return graph
 
@@ -449,7 +525,18 @@ class ChainVisualizationEngine:
 
         Returns:
             Combined AttackGraph
+
+        Raises:
+            ValueError: If chains is not a list or contains invalid items
         """
+        # M4 FIX 2026-02-13: Input validation
+        if not isinstance(chains, list):
+            raise ValueError(f"chains must be a list, got {type(chains).__name__}")
+
+        for i, chain in enumerate(chains):
+            if not isinstance(chain, dict):
+                raise ValueError(f"chains[{i}] must be a dictionary, got {type(chain).__name__}")
+
         graph = AttackGraph(
             name=name,
             description=f"Combined attack graph from {len(chains)} chains",
@@ -506,7 +593,7 @@ class ChainVisualizationEngine:
             id="attacker",
             label="Attacker",
             node_type=NodeType.ENTRY_POINT,
-            severity="info",
+            severity="INFO",
         )
         graph.add_node(entry_node)
 
@@ -520,6 +607,12 @@ class ChainVisualizationEngine:
                     target=first_id,
                     edge_type=EdgeType.EXPLOITS,
                 ))
+
+        # H1 FIX: Track metrics
+        self._metrics["graphs_created"] += 1
+        self._metrics["graphs_from_chains"] += 1
+        self._metrics["total_nodes"] += graph.node_count
+        self._metrics["total_edges"] += graph.edge_count
 
         return graph
 
@@ -537,6 +630,9 @@ class ChainVisualizationEngine:
         """
         algorithm = algorithm or self.config.layout
 
+        # H1 FIX: Track layout usage
+        self._metrics["by_layout"][algorithm.value] += 1
+
         if self._networkx_available:
             self._apply_networkx_layout(graph, algorithm)
         else:
@@ -547,8 +643,7 @@ class ChainVisualizationEngine:
         graph: AttackGraph,
         algorithm: LayoutAlgorithm,
     ) -> None:
-        """Apply layout using NetworkX."""
-        import networkx as nx
+        """Apply layout using NetworkX. M1 FIX: Uses module-level nx."""
 
         # Create NetworkX graph
         G = nx.DiGraph()
@@ -559,15 +654,15 @@ class ChainVisualizationEngine:
         for edge in graph.edges:
             G.add_edge(edge.source, edge.target, weight=edge.weight)
 
-        # Apply layout algorithm
+        # Apply layout algorithm (M3 FIX: use constants)
         if algorithm == LayoutAlgorithm.HIERARCHICAL:
             # Use topological sort for DAG-like graphs
             try:
                 pos = self._hierarchical_layout(G)
             except nx.NetworkXError:
-                pos = nx.spring_layout(G, k=2, iterations=50)
+                pos = nx.spring_layout(G, k=SPRING_K, iterations=SPRING_ITERATIONS)
         elif algorithm == LayoutAlgorithm.SPRING:
-            pos = nx.spring_layout(G, k=2, iterations=50)
+            pos = nx.spring_layout(G, k=SPRING_K, iterations=SPRING_ITERATIONS)
         elif algorithm == LayoutAlgorithm.CIRCULAR:
             pos = nx.circular_layout(G)
         elif algorithm == LayoutAlgorithm.KAMADA_KAWAI:
@@ -585,9 +680,9 @@ class ChainVisualizationEngine:
         else:
             pos = nx.spring_layout(G)
 
-        # Scale positions to config dimensions
-        width = self.config.width - 100
-        height = self.config.height - 100
+        # Scale positions to config dimensions (M3 FIX: use constant)
+        width = self.config.width - LAYOUT_MARGIN
+        height = self.config.height - LAYOUT_MARGIN
 
         # Normalize and scale positions
         if pos:
@@ -607,8 +702,7 @@ class ChainVisualizationEngine:
                     node.y = 50 + ((raw_y - y_min) / y_range) * height
 
     def _hierarchical_layout(self, G) -> Dict[str, Tuple[float, float]]:
-        """Create hierarchical layout for DAG."""
-        import networkx as nx
+        """Create hierarchical layout for DAG. M1 FIX: Uses module-level nx."""
 
         # Find levels using BFS from sources
         sources = [n for n in G.nodes() if G.in_degree(n) == 0]
@@ -697,16 +791,17 @@ class ChainVisualizationEngine:
                     nodes_by_depth[depth] = []
                 nodes_by_depth[depth].append(node)
 
-        # Position nodes
+        # Position nodes (M3 FIX: use constant for margin)
         max_depth = max(nodes_by_depth.keys()) if nodes_by_depth else 0
-        width = self.config.width - 100
-        height = self.config.height - 100
+        width = self.config.width - LAYOUT_MARGIN
+        height = self.config.height - LAYOUT_MARGIN
+        half_margin = LAYOUT_MARGIN // 2
 
         for depth, nodes in nodes_by_depth.items():
-            y = 50 + (depth / (max_depth + 1)) * height if max_depth > 0 else height / 2
+            y = half_margin + (depth / (max_depth + 1)) * height if max_depth > 0 else height / 2
 
             for i, node in enumerate(nodes):
-                x = 50 + ((i + 1) / (len(nodes) + 1)) * width
+                x = half_margin + ((i + 1) / (len(nodes) + 1)) * width
                 node.x = x
                 node.y = y
 
@@ -1389,6 +1484,10 @@ class ChainVisualizationEngine:
         if not renderer:
             raise ValueError(f"Unsupported format: {format}")
 
+        # H1 FIX: Track metrics
+        self._metrics["renders_performed"] += 1
+        self._metrics["by_format"][format.value] += 1
+
         return renderer(graph, output_path)
 
     def get_graph_metrics(self, graph: AttackGraph) -> Dict[str, Any]:
@@ -1414,9 +1513,8 @@ class ChainVisualizationEngine:
             max_edges = graph.node_count * (graph.node_count - 1)
             metrics["density"] = graph.edge_count / max_edges if max_edges > 0 else 0
 
-        # Calculate depth using BFS
+        # Calculate depth using BFS (M1 FIX: uses module-level nx)
         if self._networkx_available and graph.nodes:
-            import networkx as nx
 
             G = nx.DiGraph()
             for node in graph.nodes:
@@ -1434,8 +1532,9 @@ class ChainVisualizationEngine:
                     try:
                         lengths = nx.single_source_shortest_path_length(G, source)
                         all_lengths.extend(lengths.values())
-                    except nx.NetworkXError:
-                        pass
+                    except nx.NetworkXError as e:
+                        # M2 FIX 2026-02-13: Log instead of silent pass
+                        logger.debug(f"[CHAIN-VIZ] NetworkX depth calculation error: {e}")
 
                 if all_lengths:
                     metrics["max_depth"] = max(all_lengths)
@@ -1454,8 +1553,9 @@ class ChainVisualizationEngine:
                         try:
                             path_length = nx.shortest_path_length(G, source, goal)
                             max_path = max(max_path, path_length)
-                        except (nx.NetworkXNoPath, nx.NodeNotFound):
-                            pass
+                        except (nx.NetworkXNoPath, nx.NodeNotFound) as e:
+                            # M2 FIX 2026-02-13: Log instead of silent pass
+                            logger.debug(f"[CHAIN-VIZ] Path not found {source}->{goal}: {e}")
                 metrics["critical_path_length"] = max_path
 
         return metrics

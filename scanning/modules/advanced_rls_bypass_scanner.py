@@ -13,15 +13,17 @@ Tests for sophisticated Row-Level Security bypass techniques:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import statistics
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin
 
 import httpx
 
 from utils.logger import get_logger
+from utils.scan_client import get_scan_client
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -165,10 +167,10 @@ class AdvancedRLSBypassScanner:
         supabase_key = asset_data.get("supabase_key", "")
         tables = asset_data.get("tables", ["users", "data", "items", "orders"])
         
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
+        async with get_scan_client(
+            timeout=self.timeout.connect,
             follow_redirects=True,
-            verify=False,
+            verify_ssl=False,
         ) as client:
             if is_supabase and supabase_url:
                 # Supabase-specific tests
@@ -229,7 +231,10 @@ class AdvancedRLSBypassScanner:
                     headers=headers,
                     params={"select": "*"}
                 )
-                normal_count = len(normal_response.json()) if normal_response.status_code == 200 else 0
+                try:
+                    normal_count = len(normal_response.json()) if normal_response.status_code == 200 else 0
+                except (json.JSONDecodeError, ValueError):
+                    normal_count = 0
                 
                 # JOIN query - might bypass RLS
                 for other_table in tables:
@@ -244,7 +249,10 @@ class AdvancedRLSBypassScanner:
                     )
                     
                     if join_response.status_code == 200:
-                        join_data = join_response.json()
+                        try:
+                            join_data = join_response.json()
+                        except (json.JSONDecodeError, ValueError):
+                            continue
                         join_count = len(join_data)
                         
                         # If JOIN returns more rows, possible bypass
@@ -312,8 +320,11 @@ class AdvancedRLSBypassScanner:
                 )
                 
                 if response.status_code == 200:
-                    data = response.json()
-                    
+                    try:
+                        data = response.json()
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
                     # Check if function returned data
                     if data and (isinstance(data, list) and len(data) > 0) or (isinstance(data, dict) and data):
                         self.result.findings.append(RLSBypassFinding(
@@ -357,8 +368,12 @@ class AdvancedRLSBypassScanner:
             # Get baseline
             try:
                 baseline = await client.get(url, headers=headers, params={"select": "*"})
-                baseline_count = len(baseline.json()) if baseline.status_code == 200 else 0
-            except Exception:
+                try:
+                    baseline_count = len(baseline.json()) if baseline.status_code == 200 else 0
+                except (json.JSONDecodeError, ValueError):
+                    baseline_count = 0
+            except Exception as e:
+                logger.debug(f"Filter bypass baseline fetch failed for {table}: {e}")
                 continue
             
             for bypass_params in self.FILTER_BYPASS_PAYLOADS:
@@ -372,9 +387,12 @@ class AdvancedRLSBypassScanner:
                     )
                     
                     if response.status_code == 200:
-                        data = response.json()
+                        try:
+                            data = response.json()
+                        except (json.JSONDecodeError, ValueError):
+                            continue
                         count = len(data)
-                        
+
                         # If filter returns more rows, possible bypass
                         if count > baseline_count:
                             self.result.findings.append(RLSBypassFinding(
@@ -492,9 +510,13 @@ class AdvancedRLSBypassScanner:
         # Get baseline
         try:
             baseline = await client.get(url)
-            baseline_data = baseline.json() if baseline.status_code == 200 else []
+            try:
+                baseline_data = baseline.json() if baseline.status_code == 200 else []
+            except (json.JSONDecodeError, ValueError):
+                baseline_data = []
             baseline_count = len(baseline_data) if isinstance(baseline_data, list) else 0
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Parameter bypass baseline fetch failed for {url}: {e}")
             return
         
         for payload in bypass_payloads:
@@ -502,9 +524,12 @@ class AdvancedRLSBypassScanner:
                 response = await client.get(url, params=payload)
                 
                 if response.status_code == 200:
-                    data = response.json()
+                    try:
+                        data = response.json()
+                    except (json.JSONDecodeError, ValueError):
+                        continue
                     count = len(data) if isinstance(data, list) else 0
-                    
+
                     if count > baseline_count:
                         self.result.findings.append(RLSBypassFinding(
                             url=url,
@@ -518,9 +543,10 @@ class AdvancedRLSBypassScanner:
                             remediation="Implement proper authorization checks on all queries.",
                         ))
                         return
-                        
-            except Exception:
-                pass
+
+            except Exception as e:
+                logger.debug(f"Parameter bypass test failed for {url}: {e}")
+                continue
 
 
 async def scan_rls_bypass(

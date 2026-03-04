@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from pathlib import Path
 from typing import Any
 
 import click
@@ -20,7 +19,7 @@ from core.orchestrator import PentestOrchestrator, ScanOptions
 from core.auth_manager import AuthManager
 from utils.logger import setup_logging, get_logger
 from utils.validators import validate_target, ValidationError
-from utils.http_client import set_required_headers, load_bug_bounty_preset
+from utils.http_client import load_bug_bounty_preset
 
 # Alias for compatibility
 load_settings = get_settings
@@ -110,9 +109,10 @@ def cli(ctx: click.Context, config: str | None, verbose: bool, debug: bool) -> N
     help="Additional targets in scope",
 )
 @click.option(
-    "--no-subdomain",
+    "--subdomains",
     is_flag=True,
-    help="Skip subdomain enumeration",
+    default=False,
+    help="Enable subdomain enumeration (default: OFF, requires explicit --subdomains)",
 )
 @click.option(
     "--no-port-scan",
@@ -159,7 +159,7 @@ async def scan(
     output: str | None,
     format: str,
     scope: tuple[str, ...],
-    no_subdomain: bool,
+    subdomains: bool,
     no_port_scan: bool,
     no_ai: bool,
     nuclei_templates: str | None,
@@ -267,7 +267,7 @@ async def scan(
     
     # Build options
     options = ScanOptions(
-        enum_subdomains=not no_subdomain,
+        enum_subdomains=subdomains,
         skip_ai=no_ai,
         report_formats=[format],
         aggressive=(safe_mode == "aggressive"),
@@ -412,8 +412,8 @@ def config(ctx: click.Context) -> None:
     
     table.add_row("AI Model", settings.ai.model_name)
     table.add_row("AI Provider", settings.ai.provider)
-    table.add_row("Rate Limit", f"{settings.rate_limits.requests_per_second} req/s")
-    table.add_row("Request Timeout", f"{settings.timeouts.request_timeout}s")
+    table.add_row("Rate Limit", f"{settings.rate_limit.requests_per_second} req/s")
+    table.add_row("Request Timeout", f"{settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30}s")
     table.add_row("Report Format", settings.reporting.default_format)
     table.add_row("Log Level", settings.logging.level)
     

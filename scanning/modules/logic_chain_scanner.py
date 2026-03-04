@@ -28,23 +28,23 @@ Version: 2.0.0
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
 import random
 import re
-import string
 import time
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin
 
 import httpx
 
-from scanning.vuln_scanner import Finding, ScanModule
+from scanning.findings import Finding, Severity, VulnType
+from scanning.vuln_scanner import ScanModule
+from utils.scan_client import get_scan_client
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
+from scanning.scan_context import ScanContext
 
 if TYPE_CHECKING:
     from core.config_manager import Settings
@@ -185,7 +185,7 @@ class ResponseAnalyzer:
                     diff["different"] = True
                     diff["new_data"] = True
                     diff["details"].append(f"New fields: {list(new_keys)}")
-        except:
+        except (json.JSONDecodeError, ValueError):
             pass
         
         return diff
@@ -195,7 +195,7 @@ class ResponseAnalyzer:
         """Safely extract JSON from response."""
         try:
             return response.json()
-        except:
+        except (json.JSONDecodeError, ValueError):
             return None
     
     @classmethod
@@ -301,10 +301,16 @@ class LogicChainScanner(ScanModule):
         ],
     }
     
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        findings_store: Any = None,
+        rate_limiter: Any = None,
+    ) -> None:
         """Initialize scanner."""
-        super().__init__(settings)
-        self.timeout = settings.timeouts.request_timeout
+        super().__init__(settings, findings_store=findings_store, rate_limiter=rate_limiter)
+        self.timeout = settings.timeouts.request_timeout if hasattr(settings, 'timeouts') else 30.0
         self._discovered_endpoints: dict[str, list[str]] = {}
         self._baselines: dict[str, httpx.Response] = {}
         
@@ -315,6 +321,11 @@ class LogicChainScanner(ScanModule):
         rate_limiter: RateLimiter,
     ) -> list[Finding]:
         """Execute logic chain scanning with VERIFIED IMPACT."""
+
+        # SCAN CONTEXT: Unified access to auth, response validation, training app awareness
+        self._ctx = ScanContext(asset_data)
+        self._auth_headers = self._ctx.auth_headers
+
         findings: list[Finding] = []
         
         base_url = f"https://{host}" if not host.startswith("http") else host
@@ -370,7 +381,7 @@ class LogicChainScanner(ScanModule):
         self._discovered_endpoints = {}
         self._baselines = {}
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for category, patterns in self.ENDPOINT_DISCOVERY.items():
                 discovered = []
                 
@@ -392,8 +403,9 @@ class LogicChainScanner(ScanModule):
                 self._discovered_endpoints[category] = discovered
         
         # Add endpoints from asset_data
-        for ep in asset_data.get("endpoints", []):
-            category = "custom"
+        if isinstance(asset_data, dict):
+            for ep in asset_data.get("endpoints", []):
+                category = "custom"
             if category not in self._discovered_endpoints:
                 self._discovered_endpoints[category] = []
             if ep not in self._discovered_endpoints[category]:
@@ -444,7 +456,7 @@ class LogicChainScanner(ScanModule):
             for test_id in [1, 2, 3]:
                 id_endpoints.append(pattern.replace("{id}", str(test_id)))
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             tested_hashes = set()
             
             for endpoint in id_endpoints[:50]:  # Limit to prevent too many requests
@@ -492,10 +504,10 @@ class LogicChainScanner(ScanModule):
                                         all_fields = list(set(user_fields + sensitive_fields))
                                         
                                         findings.append(Finding(
-                                            type="logic_chain",
+                                            vuln_type=VulnType.LOGIC_FLAW,
                                             name="IDOR Chain: ID Manipulation → Unauthorized Data Access",
-                                            severity="CRITICAL" if sensitive_fields else "HIGH",
-                                            confidence=95 if sensitive_fields else 90,
+                                            severity=Severity.CRITICAL if sensitive_fields else "HIGH",
+                                            confidence_score=95 if sensitive_fields else 90,
                                             description=f"""**{'CRITICAL' if sensitive_fields else 'HIGH'}: Insecure Direct Object Reference (IDOR)**
 
 **Attack Chain Verified:**
@@ -510,7 +522,7 @@ class LogicChainScanner(ScanModule):
 **Impact:** Any user can access other users' data by simply 
 changing the ID in the URL. This is a critical access control failure.""",
                                             host=base_url,
-                                            matched_at=url,
+                                            endpoint=url,
                                             evidence=[
                                                 f"Endpoint: {endpoint}",
                                                 f"Status: 200 OK without authentication",
@@ -518,7 +530,7 @@ changing the ID in the URL. This is a critical access control failure.""",
                                                 f"Different IDs return different data",
                                             ],
                                             cvss_score=9.1 if sensitive_fields else 7.5,
-                                            cwe="CWE-639",
+                                            cwe_id="CWE-639",
                                             remediation="""1. Implement proper authorization checks
 2. Verify user owns the requested resource
 3. Use UUIDs instead of sequential IDs
@@ -527,10 +539,10 @@ changing the ID in the URL. This is a critical access control failure.""",
                                         ).to_dict())
                                         
                                         logger.warning(f"🔴 IDOR Chain VERIFIED at {url}")
-                                        
-                            except:
+
+                            except (httpx.RequestError, httpx.HTTPStatusError):
                                 pass
-                                
+
                 except Exception as e:
                     logger.debug(f"IDOR test error: {e}")
         
@@ -567,7 +579,7 @@ changing the ID in the URL. This is a critical access control failure.""",
         if not reg_endpoints:
             reg_endpoints = ["/api/users", "/api/register", "/register", "/signup"]
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in reg_endpoints[:5]:
                 url = urljoin(base_url, endpoint)
                 
@@ -620,10 +632,10 @@ changing the ID in the URL. This is a critical access control failure.""",
                                         
                                         if privilege_found:
                                             findings.append(Finding(
-                                                type="logic_chain",
+                                                vuln_type=VulnType.LOGIC_FLAW,
                                                 name="Registration Mass Assignment → Admin Account Creation",
-                                                severity="CRITICAL",
-                                                confidence=95,
+                                                severity=Severity.CRITICAL,
+                                                confidence_score=95,
                                                 description=f"""**CRITICAL: Mass Assignment at Registration**
 
 **Attack Chain Verified:**
@@ -642,7 +654,7 @@ changing the ID in the URL. This is a critical access control failure.""",
 **Impact:** Anyone can create administrator accounts by injecting 
 role properties during registration. Complete authentication bypass.""",
                                                 host=base_url,
-                                                matched_at=url,
+                                                endpoint=url,
                                                 evidence=[
                                                     f"Endpoint: {endpoint}",
                                                     f"Injected: {list(priv_payload.keys())}",
@@ -650,7 +662,7 @@ role properties during registration. Complete authentication bypass.""",
                                                     f"User created successfully",
                                                 ],
                                                 cvss_score=9.8,
-                                                cwe="CWE-915",
+                                                cwe_id="CWE-915",
                                                 remediation="""1. Implement property allowlist for registration
 2. Never accept role/privilege from client
 3. Set default role server-side only
@@ -697,7 +709,7 @@ role properties during registration. Complete authentication bypass.""",
             if ep not in protected_endpoints:
                 protected_endpoints.append(ep)
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in protected_endpoints[:10]:
                 url = urljoin(base_url, endpoint)
                 
@@ -708,10 +720,10 @@ role properties during registration. Complete authentication bypass.""",
                     
                     if baseline.status_code not in [401, 403]:
                         continue
-                    
-                except:
+
+                except (httpx.RequestError, httpx.HTTPStatusError):
                     continue
-                
+
                 # Test header bypasses
                 for bypass_header in BYPASS_HEADERS:
                     await rate_limiter.acquire()
@@ -724,10 +736,10 @@ role properties during registration. Complete authentication bypass.""",
                             header_value = list(bypass_header.values())[0]
                             
                             findings.append(Finding(
-                                type="logic_chain",
+                                vuln_type=VulnType.LOGIC_FLAW,
                                 name="Forbidden Bypass Chain: Header Injection → Admin Access",
-                                severity="HIGH",
-                                confidence=90,
+                                severity=Severity.HIGH,
+                                confidence_score=90,
                                 description=f"""**HIGH: Authorization Bypass via Header Injection**
 
 **Attack Chain Verified:**
@@ -742,14 +754,14 @@ role properties during registration. Complete authentication bypass.""",
 **Impact:** Authorization controls can be bypassed using 
 header injection, allowing unauthorized access to protected resources.""",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Baseline status: {baseline.status_code}",
                                     f"Bypass header: {header_name}: {header_value}",
                                     f"Result: 200 OK",
                                 ],
                                 cvss_score=8.5,
-                                cwe="CWE-285",
+                                cwe_id="CWE-285",
                                 remediation="""1. Don't trust X-Forwarded-* headers blindly
 2. Implement authorization at application level
 3. Validate request origin properly
@@ -759,10 +771,10 @@ header injection, allowing unauthorized access to protected resources.""",
                             
                             logger.warning(f"🟠 Header Bypass VERIFIED at {url}")
                             return findings
-                            
-                    except:
+
+                    except (httpx.RequestError, httpx.HTTPStatusError):
                         pass
-                
+
                 # Test path bypasses
                 for suffix in PATH_BYPASS_SUFFIXES[:10]:
                     bypass_url = url.rstrip("/") + suffix
@@ -774,10 +786,10 @@ header injection, allowing unauthorized access to protected resources.""",
                         
                         if test_response.status_code == 200 and baseline.status_code in [401, 403]:
                             findings.append(Finding(
-                                type="logic_chain",
+                                vuln_type=VulnType.LOGIC_FLAW,
                                 name="Forbidden Bypass Chain: Path Manipulation → Admin Access",
-                                severity="HIGH",
-                                confidence=90,
+                                severity=Severity.HIGH,
+                                confidence_score=90,
                                 description=f"""**HIGH: Authorization Bypass via Path Manipulation**
 
 **Attack Chain Verified:**
@@ -792,14 +804,14 @@ header injection, allowing unauthorized access to protected resources.""",
 **Impact:** Authorization controls can be bypassed using 
 path manipulation, allowing unauthorized access.""",
                                 host=base_url,
-                                matched_at=bypass_url,
+                                endpoint=bypass_url,
                                 evidence=[
                                     f"Baseline: {baseline.status_code}",
                                     f"Suffix: {suffix}",
                                     f"Result: 200 OK",
                                 ],
                                 cvss_score=8.0,
-                                cwe="CWE-285",
+                                cwe_id="CWE-285",
                                 remediation="""1. Normalize paths before authorization checks
 2. Use consistent URL handling
 3. Block path traversal patterns
@@ -808,12 +820,12 @@ path manipulation, allowing unauthorized access.""",
                             
                             logger.warning(f"🟠 Path Bypass VERIFIED at {bypass_url}")
                             return findings
-                            
-                    except:
+
+                    except (httpx.RequestError, httpx.HTTPStatusError):
                         pass
-        
+
         return findings
-    
+
     async def _test_privilege_escalation(
         self,
         base_url: str,
@@ -845,7 +857,7 @@ path manipulation, allowing unauthorized access.""",
             logger.info("⚠️ SAFE MODE: Skipping mass assignment PUT/PATCH tests")
             return findings
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in update_endpoints[:5]:
                 url = urljoin(base_url, endpoint)
                 
@@ -854,7 +866,7 @@ path manipulation, allowing unauthorized access.""",
                 try:
                     baseline = await client.get(url)
                     baseline_data = ResponseAnalyzer.extract_json_data(baseline)
-                except:
+                except (httpx.RequestError, httpx.HTTPStatusError):
                     continue
                 
                 # Test privilege injection via PUT/PATCH
@@ -885,10 +897,10 @@ path manipulation, allowing unauthorized access.""",
                                     
                                     if privilege_found:
                                         findings.append(Finding(
-                                            type="logic_chain",
+                                            vuln_type=VulnType.LOGIC_FLAW,
                                             name="Privilege Escalation Chain: Profile Update → Admin Role",
-                                            severity="CRITICAL",
-                                            confidence=95,
+                                            severity=Severity.CRITICAL,
+                                            confidence_score=95,
                                             description=f"""**CRITICAL: Mass Assignment Privilege Escalation**
 
 **Attack Chain Verified:**
@@ -907,7 +919,7 @@ path manipulation, allowing unauthorized access.""",
 **Impact:** Any authenticated user can escalate to admin 
 by updating their profile with role properties.""",
                                             host=base_url,
-                                            matched_at=url,
+                                            endpoint=url,
                                             evidence=[
                                                 f"Method: {method}",
                                                 f"Endpoint: {endpoint}",
@@ -915,7 +927,7 @@ by updating their profile with role properties.""",
                                                 f"Indicators: {privilege_found}",
                                             ],
                                             cvss_score=9.8,
-                                            cwe="CWE-269",
+                                            cwe_id="CWE-269",
                                             remediation="""1. Implement property allowlist for updates
 2. Never accept role changes from client
 3. Use separate admin-only role endpoints
@@ -969,7 +981,7 @@ by updating their profile with role properties.""",
             if response.status_code in [401, 403]:
                 protected_endpoints.append(endpoint)
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with get_scan_client(timeout=self.timeout, verify_ssl=False) as client:
             for endpoint in protected_endpoints[:8]:
                 url = urljoin(base_url, endpoint)
                 
@@ -979,9 +991,9 @@ by updating their profile with role properties.""",
                     baseline = await client.get(url)
                     if baseline.status_code not in [401, 403]:
                         continue
-                except:
+                except (httpx.RequestError, httpx.HTTPStatusError):
                     continue
-                
+
                 # Test forged tokens
                 for auth_header in auth_headers_to_test:
                     await rate_limiter.acquire()
@@ -994,10 +1006,10 @@ by updating their profile with role properties.""",
                             header_value = list(auth_header.values())[0]
                             
                             findings.append(Finding(
-                                type="logic_chain",
+                                vuln_type=VulnType.LOGIC_FLAW,
                                 name="Token Manipulation Chain: Forged Auth → Admin Access",
-                                severity="CRITICAL",
-                                confidence=95,
+                                severity=Severity.CRITICAL,
+                                confidence_score=95,
                                 description=f"""**CRITICAL: Authentication Bypass via Token Manipulation**
 
 **Attack Chain Verified:**
@@ -1012,14 +1024,14 @@ by updating their profile with role properties.""",
 **Impact:** Authentication can be bypassed by forging tokens.
 This indicates the server doesn't properly validate authentication.""",
                                 host=base_url,
-                                matched_at=url,
+                                endpoint=url,
                                 evidence=[
                                     f"Baseline: {baseline.status_code}",
                                     f"Header: {header_name}",
                                     f"Result: 200 OK",
                                 ],
                                 cvss_score=9.8,
-                                cwe="CWE-287",
+                                cwe_id="CWE-287",
                                 remediation="""1. Always verify token signatures
 2. Reject 'alg: none' JWT tokens
 3. Validate all token claims server-side
@@ -1029,10 +1041,10 @@ This indicates the server doesn't properly validate authentication.""",
                             
                             logger.warning(f"🔴 Token Bypass VERIFIED at {url}")
                             return findings
-                            
-                    except:
+
+                    except (httpx.RequestError, httpx.HTTPStatusError):
                         pass
-        
+
         return findings
 
     async def _test_list_idor(
@@ -1064,7 +1076,7 @@ This indicates the server doesn't properly validate authentication.""",
                 items = None
                 if isinstance(data, list) and len(data) > 1:
                     items = data
-                elif isinstance(data, dict):
+                elif isinstance(asset_data, dict):
                     # Common patterns: data, items, results, records
                     for key in ['data', 'items', 'results', 'records', 'users', 'feedbacks']:
                         if key in data and isinstance(data[key], list) and len(data[key]) > 1:
@@ -1110,10 +1122,10 @@ This indicates the server doesn't properly validate authentication.""",
                         exposed_fields = list(set(found_user_fields + (['email'] if has_email_pattern else [])))
                         
                         findings.append(Finding(
-                            type="logic_chain",
+                            vuln_type=VulnType.LOGIC_FLAW,
                             name="List IDOR Chain: Unauthenticated Access → Multiple Users' Data",
-                            severity="HIGH",
-                            confidence=90,
+                            severity=Severity.HIGH,
+                            confidence_score=90,
                             description=f"""**HIGH: Insecure Direct Object Reference in List Endpoint**
 
 **Attack Chain Verified:**
@@ -1132,7 +1144,7 @@ This indicates the server doesn't properly validate authentication.""",
 **Impact:** Unauthenticated access to multiple users' data.
 This exposes user identifiers and associated information.""",
                             host=base_url,
-                            matched_at=urljoin(base_url, endpoint),
+                            endpoint=urljoin(base_url, endpoint),
                             evidence=[
                                 f"Endpoint: {endpoint}",
                                 f"Items in array: {len(items)}",
@@ -1141,7 +1153,7 @@ This exposes user identifiers and associated information.""",
                                 f"Sample IDs: {list(user_ids)[:5]}",
                             ],
                             cvss_score=7.5,
-                            cwe="CWE-639",
+                            cwe_id="CWE-639",
                             remediation="""1. Require authentication for list endpoints
 2. Filter data to only show current user's records
 3. Implement row-level security

@@ -28,14 +28,13 @@ Version: 3.0.0
 from __future__ import annotations
 
 import re
-import json
 import hashlib
 import asyncio
 import time
 import logging
-from enum import Enum, auto
+from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Any, Tuple, Callable, Type
+from typing import Dict, List, Optional, Any, Tuple
 from collections import defaultdict
 from abc import ABC, abstractmethod
 
@@ -1066,21 +1065,21 @@ if __name__ == "__main__":
                 title="SQL Injection in login",
                 url="https://example.com/login",
                 parameter="username",
-                severity="critical",
+                severity="CRITICAL",
             ),
             ChainVulnerability(
                 id="vuln-002",
                 category=VulnCategory.CREDENTIAL_LEAK,
                 title="Password hash disclosure",
                 url="https://example.com/api/users",
-                severity="critical",
+                severity="CRITICAL",
             ),
             ChainVulnerability(
                 id="vuln-003",
                 category=VulnCategory.AUTH_BYPASS,
                 title="Authentication bypass",
                 url="https://example.com/admin",
-                severity="critical",
+                severity="CRITICAL",
             ),
             ChainVulnerability(
                 id="vuln-004",
@@ -1088,14 +1087,14 @@ if __name__ == "__main__":
                 title="Stored XSS in comments",
                 url="https://example.com/comments",
                 parameter="body",
-                severity="high",
+                severity="HIGH",
             ),
             ChainVulnerability(
                 id="vuln-005",
                 category=VulnCategory.SESSION_ATTACK,
                 title="Session fixation",
                 url="https://example.com/login",
-                severity="high",
+                severity="HIGH",
             ),
         ]
 

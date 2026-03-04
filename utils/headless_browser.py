@@ -22,7 +22,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
 
 from utils.logger import get_logger
@@ -49,7 +49,7 @@ except ImportError:
     Playwright = Any
 
 if TYPE_CHECKING:
-    from core.config_manager import Settings
+    pass
 
 logger = get_logger(__name__)
 
@@ -84,6 +84,72 @@ DANGEROUS_JS_PATTERNS = [
     r"document\.writeln\s*\(",
     r"insertAdjacentHTML\s*\(",
     r"\.html\s*\(",  # jQuery
+]
+
+# CAPTCHA detection indicators
+CAPTCHA_INDICATORS = [
+    # reCAPTCHA v2/v3
+    "g-recaptcha",
+    "grecaptcha",
+    "recaptcha-token",
+    "www.google.com/recaptcha",
+    "www.gstatic.com/recaptcha",
+    "recaptcha.net",
+    # hCaptcha
+    "h-captcha",
+    "hcaptcha",
+    "hcaptcha.com",
+    "hcaptcha-response",
+    # Cloudflare Turnstile
+    "cf-turnstile",
+    "challenges.cloudflare.com/turnstile",
+    "cf-chl-widget",
+    # FunCaptcha/Arkose Labs
+    "funcaptcha",
+    "arkoselabs",
+    "arkose",
+    # GeeTest
+    "geetest",
+    "gt_captcha",
+    # Generic
+    "captcha",
+    "verify you are human",
+    "i'm not a robot",
+    "i am not a robot",
+    "security check",
+    "bot protection",
+    "human verification",
+    "prove you are human",
+]
+
+# MFA/2FA detection indicators
+MFA_INDICATORS = [
+    "two-factor",
+    "two factor",
+    "2fa",
+    "mfa",
+    "multi-factor",
+    "multifactor",
+    "authenticator",
+    "verification code",
+    "security code",
+    "one-time",
+    "one time",
+    "otp",
+    "enter code",
+    "6-digit",
+    "six digit",
+    "totp",
+    "google authenticator",
+    "authy",
+    "microsoft authenticator",
+    "sms code",
+    "text message code",
+    "email code",
+    "backup code",
+    "recovery code",
+    "verify your identity",
+    "additional verification",
 ]
 
 
@@ -359,7 +425,7 @@ class HeadlessBrowserEngine:
     # NAVIGATION
     # =========================================================================
 
-    async def navigate(self, url: str, wait_until: str = "networkidle") -> Response:
+    async def navigate(self, url: str, wait_until: str = "networkidle") -> Response | None:
         """
         Navigate to a URL.
 
@@ -368,14 +434,32 @@ class HeadlessBrowserEngine:
             wait_until: Wait condition (load, domcontentloaded, networkidle)
 
         Returns:
-            Response object
+            Response object or None if navigation failed
         """
         if not self._page:
             raise RuntimeError("Browser not started")
 
         logger.debug(f"[HeadlessBrowser] Navigating to {url}")
-        response = await self._page.goto(url, wait_until=wait_until)
-        return response
+
+        # FIX 2026-02-16: Handle navigation errors gracefully
+        # Prevents "Future exception was never retrieved" when browser/frame is closed
+        try:
+            response = await self._page.goto(url, wait_until=wait_until)
+            return response
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Recoverable errors that shouldn't crash the scanner
+            recoverable_errors = [
+                "target", "closed", "context", "browser",  # TargetClosedError
+                "aborted", "detached", "frame",  # ERR_ABORTED / frame detached
+                "net::", "err_",  # Network errors
+                "timeout", "navigation",  # Navigation errors
+            ]
+            if any(x in error_msg for x in recoverable_errors):
+                logger.debug(f"[HeadlessBrowser] Navigation error (recoverable): {url[:50]}...")
+                return None
+            # Re-raise non-recoverable errors
+            raise
 
     async def get_page_content(self) -> str:
         """Get current page HTML content."""
@@ -806,6 +890,16 @@ class HeadlessBrowserEngine:
         if not self._page:
             return {"success": False, "error": "Browser not started"}
 
+        # Validate credentials dict
+        if not credentials:
+            return {"success": False, "error": "No credentials provided"}
+
+        username = credentials.get("username") or credentials.get("email") or ""
+        password = credentials.get("password") or ""
+
+        if not username or not password:
+            return {"success": False, "error": "Missing username/email or password in credentials"}
+
         try:
             # Find username/email field
             username_selectors = [
@@ -832,9 +926,6 @@ class HeadlessBrowserEngine:
                 return {"success": False, "error": "Could not find login fields"}
 
             # Fill credentials
-            username = credentials.get("username") or credentials.get("email", "")
-            password = credentials.get("password", "")
-
             await username_field.fill(username)
             await password_field.fill(password)
 
@@ -853,8 +944,10 @@ class HeadlessBrowserEngine:
                 await asyncio.sleep(2)
                 return {"success": True, "final_url": self._page.url}
 
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            return {"success": False, "error": f"Timeout during login: {e}"}
+        except (AttributeError, TypeError) as e:
+            return {"success": False, "error": f"Element interaction failed: {e}"}
 
     def _analyze_token_security(
         self,
@@ -979,20 +1072,29 @@ class HeadlessBrowserEngine:
         start_url: str,
         max_pages: int = 50,
         wait_time: float = 1.0,
+        auth_cookies: Optional[dict[str, str]] = None,
     ) -> list[dict]:
         """
-        Crawl a Single Page Application.
+        Crawl a Single Page Application with optional authentication.
 
         Args:
             start_url: Starting URL
             max_pages: Maximum pages to crawl
             wait_time: Time to wait for dynamic content
+            auth_cookies: Optional dict of cookies from AuthContext for authenticated crawling
 
         Returns:
             List of discovered pages/endpoints
         """
         if not self._page:
             raise RuntimeError("Browser not started")
+
+        # Set auth cookies if provided — enables authenticated SPA crawling
+        if auth_cookies:
+            from urllib.parse import urlparse
+            domain = urlparse(start_url).netloc
+            await self.set_auth_cookies(auth_cookies, domain)
+            logger.info(f"[HeadlessBrowser] SPA crawl with authenticated session")
 
         discovered = []
         visited = set()
@@ -1118,6 +1220,52 @@ class HeadlessBrowserEngine:
         """Get captured console messages."""
         return self._console_messages.copy()
 
+    async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        """
+        Add cookies to the browser context for authenticated crawling.
+
+        Args:
+            cookies: List of cookie dicts with keys: name, value, domain, path, etc.
+                     Example: [{"name": "JSESSIONID", "value": "abc123", "domain": "localhost", "path": "/"}]
+        """
+        if not self._context:
+            raise RuntimeError("Browser not started")
+
+        # Playwright requires domain to be set
+        for cookie in cookies:
+            if "domain" not in cookie:
+                # Parse from current page URL if available
+                if self._page and self._page.url:
+                    from urllib.parse import urlparse
+                    cookie["domain"] = urlparse(self._page.url).netloc
+
+        await self._context.add_cookies(cookies)
+        logger.debug(f"[HeadlessBrowser] Added {len(cookies)} cookies to context")
+
+    async def set_auth_cookies(self, auth_cookies: dict[str, str], domain: str) -> None:
+        """
+        Set authentication cookies from an AuthContext.
+
+        Args:
+            auth_cookies: Dict of cookie name -> value from AuthContext
+            domain: Target domain for cookies
+        """
+        if not auth_cookies:
+            return
+
+        cookies = []
+        for name, value in auth_cookies.items():
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "httpOnly": True,
+            })
+
+        await self.add_cookies(cookies)
+        logger.info(f"[HeadlessBrowser] Set {len(cookies)} auth cookies for {domain}")
+
     def get_dialogs(self) -> list[str]:
         """Get captured dialogs."""
         return self._dialogs.copy()
@@ -1129,6 +1277,296 @@ class HeadlessBrowserEngine:
     def get_network_responses(self) -> list[dict]:
         """Get captured network responses."""
         return self._network_responses.copy()
+
+    # =========================================================================
+    # CAPTCHA & MFA DETECTION
+    # =========================================================================
+
+    async def detect_captcha(self) -> dict[str, Any]:
+        """
+        Detect CAPTCHA on current page.
+
+        Returns:
+            Dict with:
+                - detected: bool
+                - type: str (reCAPTCHA, hCaptcha, Turnstile, etc.)
+                - url: str (current page URL)
+                - confidence: float (0.0-1.0)
+                - indicators: list[str] (matched patterns)
+        """
+        if not self._page:
+            return {"detected": False, "error": "Browser not started"}
+
+        try:
+            content = await self._page.content()
+            content_lower = content.lower()
+            matched_indicators = []
+
+            # Check page content for CAPTCHA indicators
+            for indicator in CAPTCHA_INDICATORS:
+                if indicator in content_lower:
+                    matched_indicators.append(indicator)
+
+            # Check for iframe-based CAPTCHA (reCAPTCHA, hCaptcha, Turnstile)
+            frames = self._page.frames
+            for frame in frames:
+                frame_url = frame.url.lower()
+                for indicator in ["recaptcha", "hcaptcha", "turnstile", "funcaptcha", "arkoselabs"]:
+                    if indicator in frame_url:
+                        matched_indicators.append(f"iframe:{indicator}")
+
+            # Check for CAPTCHA-specific elements
+            captcha_selectors = [
+                'div.g-recaptcha',
+                'div.h-captcha',
+                'div.cf-turnstile',
+                'iframe[src*="recaptcha"]',
+                'iframe[src*="hcaptcha"]',
+                'iframe[src*="turnstile"]',
+            ]
+
+            for selector in captcha_selectors:
+                try:
+                    element = await self._page.query_selector(selector)
+                    if element:
+                        matched_indicators.append(f"selector:{selector}")
+                except Exception:
+                    pass
+
+            if matched_indicators:
+                captcha_type = self._classify_captcha(matched_indicators)
+                confidence = min(1.0, len(matched_indicators) * 0.3)
+
+                logger.info(
+                    f"[HeadlessBrowser] CAPTCHA detected: {captcha_type} "
+                    f"(confidence: {confidence:.0%}, indicators: {len(matched_indicators)})"
+                )
+
+                return {
+                    "detected": True,
+                    "type": captcha_type,
+                    "url": self._page.url,
+                    "confidence": confidence,
+                    "indicators": matched_indicators[:5],  # Limit for brevity
+                }
+
+            return {"detected": False, "url": self._page.url}
+
+        except Exception as e:
+            logger.debug(f"[HeadlessBrowser] CAPTCHA detection error: {e}")
+            return {"detected": False, "error": str(e)}
+
+    async def detect_mfa_challenge(self) -> dict[str, Any]:
+        """
+        Detect MFA/2FA challenge on current page.
+
+        Returns:
+            Dict with:
+                - detected: bool
+                - type: str (TOTP, SMS, Email, etc.)
+                - url: str (current page URL)
+                - confidence: float (0.0-1.0)
+                - indicators: list[str] (matched patterns)
+        """
+        if not self._page:
+            return {"detected": False, "error": "Browser not started"}
+
+        try:
+            content = await self._page.content()
+            content_lower = content.lower()
+            matched_indicators = []
+
+            # Check page content for MFA indicators
+            for indicator in MFA_INDICATORS:
+                if indicator in content_lower:
+                    matched_indicators.append(indicator)
+
+            # Check for OTP input fields
+            otp_selectors = [
+                'input[name="otp"]',
+                'input[name="code"]',
+                'input[name="totp"]',
+                'input[name="verification_code"]',
+                'input[name="mfa_code"]',
+                'input[id*="otp"]',
+                'input[id*="code"]',
+                'input[type="tel"][maxlength="6"]',
+                'input[maxlength="6"][inputmode="numeric"]',
+                'input[autocomplete="one-time-code"]',
+            ]
+
+            for selector in otp_selectors:
+                try:
+                    element = await self._page.query_selector(selector)
+                    if element:
+                        matched_indicators.append(f"input:{selector}")
+                except Exception:
+                    pass
+
+            # Check for MFA-related buttons/links
+            mfa_button_texts = [
+                "verify",
+                "confirm",
+                "submit code",
+                "resend code",
+                "use backup code",
+                "try another way",
+            ]
+
+            for text in mfa_button_texts:
+                if text in content_lower:
+                    matched_indicators.append(f"button:{text}")
+
+            if matched_indicators:
+                mfa_type = self._classify_mfa(matched_indicators, content_lower)
+                confidence = min(1.0, len(matched_indicators) * 0.25)
+
+                logger.info(
+                    f"[HeadlessBrowser] MFA challenge detected: {mfa_type} "
+                    f"(confidence: {confidence:.0%}, indicators: {len(matched_indicators)})"
+                )
+
+                return {
+                    "detected": True,
+                    "type": mfa_type,
+                    "url": self._page.url,
+                    "confidence": confidence,
+                    "indicators": matched_indicators[:5],
+                }
+
+            return {"detected": False, "url": self._page.url}
+
+        except Exception as e:
+            logger.debug(f"[HeadlessBrowser] MFA detection error: {e}")
+            return {"detected": False, "error": str(e)}
+
+    def _classify_captcha(self, indicators: list[str]) -> str:
+        """Classify CAPTCHA type based on matched indicators."""
+        indicators_str = " ".join(indicators).lower()
+
+        if any(x in indicators_str for x in ["recaptcha", "g-recaptcha", "grecaptcha"]):
+            return "reCAPTCHA"
+        elif any(x in indicators_str for x in ["hcaptcha", "h-captcha"]):
+            return "hCaptcha"
+        elif any(x in indicators_str for x in ["turnstile", "cf-turnstile"]):
+            return "Cloudflare Turnstile"
+        elif any(x in indicators_str for x in ["funcaptcha", "arkose"]):
+            return "FunCaptcha/Arkose"
+        elif "geetest" in indicators_str:
+            return "GeeTest"
+        else:
+            return "Unknown CAPTCHA"
+
+    def _classify_mfa(self, indicators: list[str], content: str) -> str:
+        """Classify MFA type based on matched indicators."""
+        indicators_str = " ".join(indicators).lower()
+
+        if any(x in indicators_str for x in ["authenticator", "totp", "google authenticator", "authy"]):
+            return "TOTP"
+        elif any(x in content for x in ["sms", "text message", "phone number"]):
+            return "SMS"
+        elif any(x in content for x in ["email", "sent to your email", "check your inbox"]):
+            return "Email"
+        elif any(x in indicators_str for x in ["backup code", "recovery code"]):
+            return "Backup Code"
+        elif "push" in content and "notification" in content:
+            return "Push Notification"
+        else:
+            return "Unknown 2FA"
+
+    async def wait_for_manual_login(
+        self,
+        timeout_seconds: int = 300,
+        check_interval: float = 1.0,
+        success_indicators: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Wait for user to complete manual login (for CAPTCHA/2FA).
+
+        This is used when automatic login cannot proceed due to CAPTCHA or 2FA.
+        The browser window should be visible (headless=False) for user interaction.
+
+        Args:
+            timeout_seconds: Maximum time to wait for login completion
+            check_interval: How often to check for success indicators
+            success_indicators: List of text/elements indicating successful login
+
+        Returns:
+            Dict with login result, tokens, and cookies
+        """
+        if not self._page:
+            return {"success": False, "error": "Browser not started"}
+
+        default_success_indicators = success_indicators or [
+            "logout",
+            "sign out",
+            "my account",
+            "dashboard",
+            "welcome",
+            "profile",
+        ]
+
+        start_time = time.time()
+        start_url = self._page.url
+
+        logger.info(
+            f"[HeadlessBrowser] Waiting for manual login completion "
+            f"(timeout: {timeout_seconds}s, start URL: {start_url})"
+        )
+
+        while True:
+            elapsed = time.time() - start_time
+
+            if elapsed > timeout_seconds:
+                logger.warning("[HeadlessBrowser] Manual login timeout")
+                return {
+                    "success": False,
+                    "error": "timeout",
+                    "elapsed": elapsed,
+                }
+
+            try:
+                current_url = self._page.url
+                content = await self._page.content()
+                content_lower = content.lower()
+
+                # Check 1: URL changed from login page
+                url_changed = current_url != start_url and "/login" not in current_url.lower()
+
+                # Check 2: Success indicators in page
+                has_success_indicator = any(
+                    ind in content_lower for ind in default_success_indicators
+                )
+
+                # Check 3: No longer on login/captcha page
+                still_on_challenge = any(
+                    x in content_lower
+                    for x in ["login", "sign in", "captcha", "verification", "2fa", "mfa"]
+                )
+
+                if (url_changed and has_success_indicator) or (url_changed and not still_on_challenge):
+                    logger.info("[HeadlessBrowser] Manual login completed successfully")
+
+                    # Extract tokens and cookies
+                    tokens = await self._find_tokens_in_page()
+                    cookies = await self._context.cookies()
+                    local_storage = await self._page.evaluate("() => Object.assign({}, localStorage)")
+                    session_storage = await self._page.evaluate("() => Object.assign({}, sessionStorage)")
+
+                    return {
+                        "success": True,
+                        "elapsed": elapsed,
+                        "final_url": current_url,
+                        "tokens": tokens,
+                        "cookies": [dict(c) for c in cookies],
+                        "local_storage": local_storage,
+                        "session_storage": session_storage,
+                    }
+
+            except Exception as e:
+                logger.debug(f"[HeadlessBrowser] Check error: {e}")
+
+            await asyncio.sleep(check_interval)
 
 
 # =============================================================================
@@ -1180,3 +1618,7 @@ async def quick_auth_analysis(login_url: str) -> AuthFlowResult:
 def is_playwright_available() -> bool:
     """Check if Playwright is available."""
     return PLAYWRIGHT_AVAILABLE
+
+
+# Alias for backwards compatibility
+HeadlessBrowser = HeadlessBrowserEngine

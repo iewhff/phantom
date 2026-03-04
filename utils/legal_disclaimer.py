@@ -13,7 +13,6 @@ Version: 1.0.0
 """
 
 import json
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -347,8 +346,11 @@ def verify_scope_programmatically(
         for allowed in allowed_domains:
             allowed = allowed.lower().strip()
 
-            # Exact match
-            if domain == allowed:
+            # Strip port from scope entry too (e.g., "localhost:3000" → "localhost")
+            allowed_domain = allowed.split(":")[0] if ":" in allowed and not allowed.startswith("*.") else allowed
+
+            # Exact match (with or without port in scope)
+            if domain == allowed or domain == allowed_domain:
                 return True, f"Exact match: {allowed}"
 
             # Wildcard match

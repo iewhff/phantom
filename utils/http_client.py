@@ -26,10 +26,8 @@ Version: 3.0.0
 from __future__ import annotations
 
 import os
-import asyncio
 from typing import TYPE_CHECKING, Any, Optional
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
 import httpx
 import yaml
@@ -39,7 +37,6 @@ from utils.network_protection import (
     NetworkProtection,
     ProxyConfig,
     ProxyType,
-    create_network_protection,
 )
 
 # Try to import elite OPSEC (optional but recommended)
@@ -55,7 +52,7 @@ except ImportError:
     ELITE_OPSEC_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from core.config_manager import Settings
+    pass
 
 logger = get_logger(__name__)
 
@@ -161,6 +158,23 @@ def get_ssl_verify_default() -> bool:
 # BUG BOUNTY REQUIRED HEADERS
 # =============================================================================
 
+# Headers that should have their values masked in logs
+_SENSITIVE_HEADER_NAMES = frozenset([
+    "authorization", "x-api-key", "api-key", "x-auth-token", "x-access-token",
+    "cookie", "set-cookie", "x-csrf-token", "x-xsrf-token", "bearer",
+    "x-session-token", "x-secret", "password", "apikey", "token",
+])
+
+
+def _mask_header_value(key: str, value: str) -> str:
+    """Mask sensitive header values for safe logging."""
+    if key.lower() in _SENSITIVE_HEADER_NAMES:
+        if len(value) <= 4:
+            return "****"
+        return f"{value[:2]}***{value[-2:]}"
+    return value
+
+
 def set_required_headers(headers: dict[str, str], preset_name: str = "") -> None:
     """
     Set required headers that will be included in ALL HTTP requests.
@@ -188,7 +202,7 @@ def set_required_headers(headers: dict[str, str], preset_name: str = "") -> None
         if preset_name:
             logger.info(f"   Active preset: {preset_name}")
         for key, value in headers.items():
-            logger.debug(f"   {key}: {value}")
+            logger.debug(f"   {key}: {_mask_header_value(key, value)}")
 
 
 def get_required_headers() -> dict[str, str]:
@@ -286,10 +300,45 @@ def get_available_presets() -> list[str]:
     return list(presets.keys())
 
 
+def _is_tor_running(socks_port: int = 9050) -> bool:
+    """
+    Check if Tor SOCKS proxy is accepting connections AND can route traffic.
+
+    Phase 1: TCP connect to SOCKS port (1s timeout)
+    Phase 2: SOCKS5 handshake to verify it's a real SOCKS proxy (2s timeout)
+    """
+    import socket as _sock
+
+    # BUG-FIX 2026-02-08: Use try/finally to ensure socket is always closed
+    s = None
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("127.0.0.1", socks_port))
+
+        # SOCKS5 greeting: version=5, 1 auth method, method=0 (no auth)
+        s.sendall(b"\x05\x01\x00")
+        resp = s.recv(2)
+
+        if len(resp) == 2 and resp[0] == 0x05 and resp[1] == 0x00:
+            # Valid SOCKS5 handshake — Tor is accepting connections
+            return True
+        logger.debug("Tor port %d responded but SOCKS5 handshake failed: %r", socks_port, resp)
+        return False
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass  # Ignore close errors
+
+
 def _create_protection_from_settings(settings: dict[str, Any]) -> NetworkProtection:
     """Create NetworkProtection from settings dict."""
     proxy_config = ProxyConfig(enabled=False)
-    
+
     # Check if network protection is enabled
     if not settings.get('enabled', False):
         logger.debug("Network protection disabled in config")
@@ -298,19 +347,39 @@ def _create_protection_from_settings(settings: dict[str, Any]) -> NetworkProtect
             rotate_user_agent=settings.get('user_agent', {}).get('rotate', True),
             randomize_headers=settings.get('headers', {}).get('randomize', True),
         )
-    
-    # Tor configuration (highest priority)
+
+    # Tor configuration (highest priority) — with auto-detection
+    # FIX 2026-02-12: Add environment variable to disable Tor (for localhost testing)
+    # Support both PATHFINDER_NO_TOR and legacy PHANTOM_NO_TOR
+    # FIX 2026-02-20: Also check PHANTOM_LOCALHOST_TARGET (set by full_scanner for localhost targets)
+    tor_disabled = (
+        os.environ.get("PATHFINDER_NO_TOR", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PHANTOM_NO_TOR", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PATHFINDER_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PHANTOM_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes")
+    )
     tor_settings = settings.get('tor', {})
-    if tor_settings.get('enabled', False):
-        proxy_config = ProxyConfig(
-            enabled=True,
-            proxy_type=ProxyType.TOR,
-            host="127.0.0.1",
-            port=tor_settings.get('socks_port', 9050),
-            tor_control_port=tor_settings.get('control_port', 9051),
-            tor_password=tor_settings.get('password'),
-        )
-        logger.info("🧅 Tor protection enabled")
+    if tor_settings.get('enabled', False) and not tor_disabled:
+        socks_port = tor_settings.get('socks_port', 9050)
+        if _is_tor_running(socks_port):
+            proxy_config = ProxyConfig(
+                enabled=True,
+                proxy_type=ProxyType.TOR,
+                host="127.0.0.1",
+                port=socks_port,
+                tor_control_port=tor_settings.get('control_port', 9051),
+                tor_password=tor_settings.get('password'),
+            )
+            logger.info("🧅 Tor detected and enabled — traffic routed through Tor network")
+        else:
+            logger.warning(
+                "⚠️  Tor enabled in config but NOT RUNNING on port %d. "
+                "Start with: sudo systemctl start tor  |  "
+                "Continuing WITHOUT Tor anonymity.", socks_port
+            )
+            # proxy_config stays disabled — no Tor, no hang
+    elif tor_disabled:
+        logger.info("🧅 Tor DISABLED via PATHFINDER_NO_TOR environment variable")
     
     # Proxy configuration (if Tor not enabled)
     elif settings.get('proxy', {}).get('enabled', False):
@@ -370,6 +439,26 @@ def get_network_protection() -> NetworkProtection:
             _ssl_verify_default = ssl_verify
 
         return _global_protection
+
+
+def reset_network_protection() -> None:
+    """
+    Reset the cached network protection instance.
+
+    Call this after setting PHANTOM_LOCALHOST_TARGET or PHANTOM_NO_TOR
+    environment variables to force re-evaluation of Tor/proxy settings.
+
+    FIX 2026-02-20: Needed because full_scanner sets PHANTOM_LOCALHOST_TARGET
+    AFTER the http_client module is imported, but the protection is cached
+    on first use. This allows the cache to be cleared and re-created with
+    the updated environment variables.
+    """
+    global _global_protection, _settings_loaded
+
+    with _state_lock:
+        _global_protection = None
+        _settings_loaded = False
+        logger.info("🔄 Network protection cache reset — will re-evaluate Tor/proxy settings")
 
 
 def get_elite_protection() -> Optional["EliteOPSEC"]:
@@ -510,6 +599,7 @@ def get_http_client_kwargs(
     verify_ssl: bool | None = None,
     follow_redirects: bool = True,
     custom_headers: dict[str, str] | None = None,
+    http2: bool = False,
 ) -> dict[str, Any]:
     """
     Get kwargs for httpx.AsyncClient with protection applied.
@@ -519,6 +609,7 @@ def get_http_client_kwargs(
         verify_ssl: Verify SSL certificates (None = use global default)
         follow_redirects: Follow redirects
         custom_headers: Additional headers to include
+        http2: Enable HTTP/2 support (requires h2 package)
 
     Returns:
         Dict of kwargs for httpx.AsyncClient
@@ -541,6 +632,24 @@ def get_http_client_kwargs(
     protection = get_network_protection()
     kwargs = protection.get_httpx_client_kwargs()
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DEFENSIVE PROXY BYPASS (2026-02-16)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Even if protection was cached with proxy enabled, remove it now if:
+    # 1. PATHFINDER_NO_TOR=1 is set (explicitly requested no Tor)
+    # 2. PATHFINDER_LOCALHOST_TARGET=1 is set (scanning localhost)
+    # This is a RUNTIME check that overrides any cached settings.
+    bypass_proxy = (
+        os.environ.get("PATHFINDER_NO_TOR", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PHANTOM_NO_TOR", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PATHFINDER_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes") or
+        os.environ.get("PHANTOM_LOCALHOST_TARGET", "").lower() in ("1", "true", "yes")
+    )
+    if bypass_proxy and "proxy" in kwargs:
+        logger.info("🔌 [HTTP-CLIENT] Proxy REMOVED (PATHFINDER_NO_TOR or localhost)")
+        del kwargs["proxy"]
+    # ═══════════════════════════════════════════════════════════════════════════
+
     # Override with provided values
     kwargs["timeout"] = timeout
     # Use provided value, or global default (True = secure)
@@ -549,16 +658,24 @@ def get_http_client_kwargs(
 
     # Start with required headers (bug bounty compliance - ALWAYS included)
     headers = kwargs.get("headers", {})
-    
+
     # Add global required headers FIRST (e.g., X-Bug-Bounty)
-    if _global_required_headers:
-        headers.update(_global_required_headers)
+    # THREAD-SAFE: Use getter which acquires lock and returns a copy
+    required = get_required_headers()
+    if required:
+        headers.update(required)
     
     # Then merge custom headers (can override if needed)
     if custom_headers:
         headers.update(custom_headers)
-    
+
     kwargs["headers"] = headers
+
+    # HTTP/2 support (requires h2 package: pip install httpx[http2])
+    # HTTP/2 provides: multiplexing, header compression, server push
+    # Useful for modern targets that require or prefer HTTP/2
+    if http2:
+        kwargs["http2"] = True
 
     return kwargs
 
@@ -570,6 +687,7 @@ async def get_http_client(
     follow_redirects: bool = True,
     custom_headers: dict[str, str] | None = None,
     target_url: str | None = None,
+    http2: bool = False,
 ):
     """
     Get a protected HTTP client as an async context manager.
@@ -578,12 +696,17 @@ async def get_http_client(
         async with get_http_client() as client:
             response = await client.get(url)
 
+        # With HTTP/2 support:
+        async with get_http_client(http2=True) as client:
+            response = await client.get(url)
+
     This automatically applies:
     - Kill switch check (blocks if active)
     - SSL verification (enabled by default)
     - Proxy/Tor if configured
     - User-Agent rotation
     - Header randomization
+    - HTTP/2 support (if enabled)
     - Elite OPSEC features (if enabled):
       - Browser fingerprint emulation
       - Natural navigation simulation
@@ -603,6 +726,7 @@ async def get_http_client(
         verify_ssl=verify_ssl,
         follow_redirects=follow_redirects,
         custom_headers=custom_headers,
+        http2=http2,
     )
 
     # Apply elite OPSEC headers if available
@@ -623,31 +747,37 @@ def create_protected_client(
     verify_ssl: bool | None = None,
     follow_redirects: bool = True,
     custom_headers: dict[str, str] | None = None,
+    http2: bool = False,
 ) -> httpx.AsyncClient:
     """
     Create a protected httpx.AsyncClient instance.
-    
+
     USE THIS instead of httpx.AsyncClient() directly in scanner modules!
-    
+
     This function creates a client with:
     - Kill switch protection
     - Bug bounty required headers (X-Bug-Bounty, etc.)
     - Proxy/Tor configuration
     - User-Agent rotation
     - SSL verification defaults
-    
+    - HTTP/2 support (if enabled)
+
     Example:
         # WRONG - Don't use this:
         async with httpx.AsyncClient(timeout=30.0) as client:
             ...
-            
+
         # CORRECT - Use this instead:
         async with create_protected_client(timeout=30.0) as client:
             ...
-    
+
+        # With HTTP/2:
+        async with create_protected_client(http2=True) as client:
+            ...
+
     Returns:
         httpx.AsyncClient instance configured with all protections
-        
+
     Raises:
         KillSwitchActive: If kill switch is active
     """
@@ -656,6 +786,7 @@ def create_protected_client(
         verify_ssl=verify_ssl,
         follow_redirects=follow_redirects,
         custom_headers=custom_headers,
+        http2=http2,
     )
     return httpx.AsyncClient(**kwargs)
 
@@ -669,12 +800,24 @@ async def protected_request(
     timeout: float = 30.0,
     follow_redirects: bool = True,
     verify_ssl: bool | None = None,
+    http2: bool = False,
 ) -> httpx.Response:
     """
     Make a single protected HTTP request.
 
     Convenience function for one-off requests.
     Includes elite OPSEC features like delays and decoys.
+
+    Args:
+        url: Target URL
+        method: HTTP method (GET, POST, etc.)
+        headers: Custom headers
+        data: Form data
+        json_data: JSON body
+        timeout: Request timeout
+        follow_redirects: Follow redirects
+        verify_ssl: Verify SSL certificates
+        http2: Enable HTTP/2 support
 
     Raises:
         KillSwitchActive: If kill switch is active
@@ -692,6 +835,7 @@ async def protected_request(
         follow_redirects=follow_redirects,
         custom_headers=headers,
         target_url=url,
+        http2=http2,
     ) as client:
         # Pre-request processing (delay, decoy injection)
         if elite:
@@ -757,10 +901,11 @@ def print_protection_banner():
             if preset_name:
                 print(f"│  Active Preset: {preset_name:<40} │")
             for key, value in required_headers.items():
-                display_value = value if len(value) <= 35 else value[:32] + "..."
+                masked = _mask_header_value(key, value)
+                display_value = masked if len(masked) <= 35 else masked[:32] + "..."
                 print(f"│  {key}: {display_value:<45} │")
             print("└──────────────────────────────────────────────────────────────┘\n")
-        
+
         # Show elite details if available
         if status.get("elite_opsec") and status.get("elite_details"):
             details = status["elite_details"]
@@ -791,7 +936,8 @@ def print_protection_banner():
             if preset_name:
                 print(f"│  Active Preset: {preset_name:<40} │")
             for key, value in required_headers.items():
-                display_value = value if len(value) <= 35 else value[:32] + "..."
+                masked = _mask_header_value(key, value)
+                display_value = masked if len(masked) <= 35 else masked[:32] + "..."
                 print(f"│  {key}: {display_value:<45} │")
             print("└──────────────────────────────────────────────────────────────┘\n")
 

@@ -113,6 +113,13 @@ class LinuxToolsOrchestrator:
             # Directory discovery can trigger parameter discovery and security scanning
             "admin": ["nikto"],  # Admin panels should be scanned for vulns
             "api": ["arjun"],  # API endpoints should trigger param discovery
+            "rest": ["arjun"],  # REST endpoints need param discovery
+            "v1": ["arjun"],   # Versioned API endpoints
+            "v2": ["arjun"],
+            "v3": ["arjun"],
+            "json": ["arjun"], # JSON endpoints likely accept params
+            "data": ["arjun"], # Data endpoints
+            "graphql": ["arjun"],  # GraphQL endpoints
             "backup": ["nuclei"],  # Backup files may have known vulns
             "config": ["nuclei"],  # Config files may expose sensitive data
         },
@@ -123,12 +130,18 @@ class LinuxToolsOrchestrator:
         },
         "arjun": {
             # Parameter discovery informs internal scanners via asset_data
-            # Not external tools - internal scanners pick up from asset_data["tool_discovered_params"]
             "parameters": [],
         },
         "ffuf": {
-            # Similar to gobuster
+            # Similar to gobuster - trigger param discovery for API endpoints
             "api": ["arjun"],
+            "rest": ["arjun"],
+            "v1": ["arjun"],
+            "v2": ["arjun"],
+            "v3": ["arjun"],
+            "json": ["arjun"],
+            "data": ["arjun"],
+            "graphql": ["arjun"],
         },
         "httpx": {
             # Tech detection can trigger appropriate tools
@@ -192,9 +205,9 @@ class LinuxToolsOrchestrator:
             timeout=300,
             parser="_parse_gobuster",
             wordlists={
-                "default": "/usr/share/wordlists/dirb/common.txt",
-                "big": "/usr/share/wordlists/dirb/big.txt",
-                "api": "/usr/share/wordlists/SecLists/Discovery/Web-Content/api-endpoints.txt",
+                "default": "/usr/share/dirb/wordlists/common.txt",
+                "big": "/usr/share/dirb/wordlists/big.txt",
+                "api": "/usr/share/seclists/Discovery/Web-Content/api-endpoints.txt",
             },
         ),
         "ffuf": ToolConfig(
@@ -203,8 +216,8 @@ class LinuxToolsOrchestrator:
             timeout=300,
             parser="_parse_ffuf_json",
             wordlists={
-                "default": "/usr/share/wordlists/dirb/common.txt",
-                "api": "/usr/share/wordlists/SecLists/Discovery/Web-Content/api-endpoints.txt",
+                "default": "/usr/share/dirb/wordlists/common.txt",
+                "api": "/usr/share/seclists/Discovery/Web-Content/api-endpoints.txt",
             },
         ),
         # SECURITY: sqlmap commands are SAFE by default
@@ -252,7 +265,7 @@ class LinuxToolsOrchestrator:
             timeout=300,
             parser="_parse_wfuzz_json",
             wordlists={
-                "default": "/usr/share/wordlists/dirb/common.txt",
+                "default": "/usr/share/dirb/wordlists/common.txt",
             },
         ),
         "whatweb": ToolConfig(
@@ -264,13 +277,13 @@ class LinuxToolsOrchestrator:
         "sslscan": ToolConfig(
             name="sslscan",
             command_template="sslscan --xml={output} {target}",
-            timeout=120,
+            timeout=60,  # Reduced from 120 to prevent module timeout
             parser="_parse_sslscan_xml",
         ),
         "testssl": ToolConfig(
             name="testssl",
             command_template="testssl.sh --jsonfile={output} {target}",
-            timeout=300,
+            timeout=120,  # Reduced from 300 to prevent module timeout (was matching module limit)
             parser="_parse_testssl_json",
         ),
         "httpx": ToolConfig(
@@ -331,10 +344,47 @@ class LinuxToolsOrchestrator:
         self.temp_dir = Path(tempfile.mkdtemp(prefix="pentest_tools_"))
         self.available_tools: Set[str] = set()
         self._detect_available_tools()
+        self._validate_wordlists()
 
         # Track executed tools to avoid duplicates
         self.executed_tools: Set[str] = set()
         self.all_findings: List[Dict[str, Any]] = []
+
+    def _validate_wordlists(self) -> None:
+        """Validate wordlist paths exist, with fallback alternatives."""
+        fallback_paths = [
+            Path("/usr/share/dirb/wordlists"),  # Debian/Ubuntu default for dirb
+            Path("/usr/share/wordlists"),
+            Path("/usr/share/seclists"),
+            Path.home() / "wordlists",
+            Path("/opt/seclists"),
+            Path("/opt/wordlists"),
+        ]
+
+        for tool_name, config in self.TOOL_CONFIGS.items():
+            if not config.wordlists:
+                continue
+
+            for wl_type, wl_path in list(config.wordlists.items()):
+                if Path(wl_path).exists():
+                    continue
+
+                # Try to find alternative
+                wl_filename = Path(wl_path).name
+                found = False
+                for fallback in fallback_paths:
+                    # Search for the filename in fallback directories
+                    for alt_path in fallback.rglob(wl_filename):
+                        if alt_path.exists() and alt_path.is_file():
+                            config.wordlists[wl_type] = str(alt_path)
+                            logger.info(f"[Orchestrator] Wordlist fallback: {tool_name}.{wl_type} → {alt_path}")
+                            found = True
+                            break
+                    if found:
+                        break
+
+                if not found:
+                    logger.warning(f"[Orchestrator] Wordlist not found: {tool_name}.{wl_type} = {wl_path}")
 
     def _detect_available_tools(self) -> None:
         """Detect which tools are installed on the system."""
@@ -537,9 +587,9 @@ class LinuxToolsOrchestrator:
             if wordlist:
                 wl = wordlist
             else:
-                wl = config.wordlists.get("default", "/usr/share/wordlists/dirb/common.txt")
+                wl = config.wordlists.get("default", "/usr/share/dirb/wordlists/common.txt")
             if not Path(wl).exists():
-                wl = "/usr/share/wordlists/dirb/common.txt"  # Fallback
+                wl = "/usr/share/dirb/wordlists/common.txt"  # Fallback
 
         # Build command
         command = config.command_template.format(
@@ -574,7 +624,7 @@ class LinuxToolsOrchestrator:
                 tool=tool,
                 status=ToolStatus.SUCCESS,
                 findings=findings,
-                raw_output=stdout.decode() if stdout else "",
+                raw_output=stdout.decode("utf-8", errors="replace") if stdout else "",
                 triggers_for=triggers,
                 execution_time=execution_time,
             )
@@ -925,31 +975,32 @@ class LinuxToolsOrchestrator:
             with open(output_file, 'r') as f:
                 data = json.load(f)
 
-            for result in data.get("results", []):
-                url = result.get("url", "")
-                status = result.get("status", 0)
-                length = result.get("length", 0)
-                input_val = result.get("input", {}).get("FUZZ", "")
+            if isinstance(data, dict):
+                for result in data.get("results", []):
+                    url = result.get("url", "")
+                    status = result.get("status", 0)
+                    length = result.get("length", 0)
+                    input_val = result.get("input", {}).get("FUZZ", "")
 
-                severity = "INFO"
-                if status in [200, 301, 302]:
-                    severity = "LOW"
-                if self._is_interesting_path(input_val):
-                    severity = "MEDIUM"
+                    severity = "INFO"
+                    if status in [200, 301, 302]:
+                        severity = "LOW"
+                    if self._is_interesting_path(input_val):
+                        severity = "MEDIUM"
 
-                findings.append({
-                    "type": "ffuf_finding",
-                    "name": f"Found: /{input_val}",
-                    "severity": severity,
-                    "confidence": 80,
-                    "matched_at": url,
-                    "metadata": {
-                        "status_code": status,
-                        "content_length": length,
-                        "input": input_val,
-                        "tool": "ffuf",
-                    },
-                })
+                    findings.append({
+                        "type": "ffuf_finding",
+                        "name": f"Found: /{input_val}",
+                        "severity": severity,
+                        "confidence": 80,
+                        "matched_at": url,
+                        "metadata": {
+                            "status_code": status,
+                            "content_length": length,
+                            "input": input_val,
+                            "tool": "ffuf",
+                        },
+                    })
 
         except Exception as e:
             logger.warning(f"Error parsing ffuf output: {e}")
@@ -1035,7 +1086,8 @@ class LinuxToolsOrchestrator:
                         # Check for database type
                         db_match = re.search(r"back-end DBMS: (.+)", content)
                         if db_match:
-                            findings[-1]["metadata"]["database"] = db_match.group(1)
+                            if findings and isinstance(findings[-1], dict) and "metadata" in findings[-1] and isinstance(findings[-1]["metadata"], dict):
+                                findings[-1]["metadata"]["database"] = db_match.group(1)
 
         except Exception as e:
             logger.warning(f"Error parsing sqlmap output: {e}")
@@ -1104,7 +1156,10 @@ class LinuxToolsOrchestrator:
                 plugins = entry.get("plugins", {})
 
                 for plugin_name, plugin_data in plugins.items():
-                    version = plugin_data.get("version", [""])[0] if plugin_data.get("version") else ""
+                    # BUG-FIX: Initialize version to avoid UnboundLocalError
+                    version = ""
+                    if isinstance(plugin_data, dict):
+                        version = plugin_data.get("version", [""])[0] if plugin_data.get("version") else ""
 
                     findings.append({
                         "type": "technology_detected",
@@ -1201,20 +1256,21 @@ class LinuxToolsOrchestrator:
             with open(output_file, 'r') as f:
                 data = json.load(f)
 
-            for finding in data.get("findings", []):
-                severity = finding.get("severity", "INFO")
-                if severity in ["CRITICAL", "HIGH", "MEDIUM"]:
-                    findings.append({
-                        "type": "ssl_vulnerability",
-                        "name": finding.get("id", "SSL Issue"),
-                        "severity": severity,
-                        "confidence": 85,
-                        "matched_at": target,
-                        "description": finding.get("finding", ""),
-                        "metadata": {
-                            "tool": "testssl",
-                        },
-                    })
+            if isinstance(data, dict):
+                for finding in data.get("findings", []):
+                    severity = finding.get("severity", "INFO")
+                    if severity in ["CRITICAL", "HIGH", "MEDIUM"]:
+                        findings.append({
+                            "type": "ssl_vulnerability",
+                            "name": finding.get("id", "SSL Issue"),
+                            "severity": severity,
+                            "confidence": 85,
+                            "matched_at": target,
+                            "description": finding.get("finding", ""),
+                            "metadata": {
+                                "tool": "testssl",
+                            },
+                        })
 
         except Exception as e:
             logger.warning(f"Error parsing testssl output: {e}")
@@ -1241,11 +1297,16 @@ class LinuxToolsOrchestrator:
                         continue
                     data = json.loads(line)
 
-                    url = data.get("url", "")
-                    status_code = data.get("status_code", 0)
-                    title = data.get("title", "")
-                    tech = data.get("tech", [])
-                    webserver = data.get("webserver", "")
+                    if isinstance(data, dict):
+                        url = data.get("url", "")
+                    if isinstance(data, dict):
+                        status_code = data.get("status_code", 0)
+                    if isinstance(data, dict):
+                        title = data.get("title", "")
+                    if isinstance(data, dict):
+                        tech = data.get("tech", [])
+                    if isinstance(data, dict):
+                        webserver = data.get("webserver", "")
 
                     findings.append({
                         "type": "http_probe",
@@ -1355,7 +1416,8 @@ class LinuxToolsOrchestrator:
                 return findings, triggers
 
             data = json.loads(content)
-            exploits = data.get("RESULTS_EXPLOIT", [])
+            if isinstance(data, dict):
+                exploits = data.get("RESULTS_EXPLOIT", [])
 
             for exploit in exploits:
                 exploit_id = exploit.get("EDB-ID", "unknown")
