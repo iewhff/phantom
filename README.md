@@ -5,21 +5,21 @@ Autonomous Security Assessment & Attack-Chain Analysis
 "Python 3.11+" (https://img.shields.io/badge/python-3.11+-blue.svg)
 "License" (https://img.shields.io/badge/license-MIT-green.svg)
 "Status" (https://img.shields.io/badge/status-paused-orange.svg)
-"Modules" (https://img.shields.io/badge/security%20modules-77%2B-purple.svg)
+"Security Modules" (https://img.shields.io/badge/security%20modules-77%2B-purple.svg)
 
-PHANTOM AI is an autonomous security assessment framework designed to move beyond traditional vulnerability scanning.
+PHANTOM AI is an autonomous security assessment framework designed to go beyond traditional vulnerability scanning.
 
-The project combines automated reconnaissance, 77+ specialized security modules, contextual analysis, evidence-based validation, exploitation proof, attack-chain analysis, attacker-intent reasoning, and multi-layer safety controls.
+It combines automated reconnaissance, 77+ specialized security modules, contextual analysis, evidence-based validation, exploitation proof, attack-chain analysis, attacker-intent reasoning, and multi-layer safety controls.
 
-PHANTOM was developed as a solo engineering project and eventually grew from a vulnerability scanner into a broader security platform. Development is currently paused because the scope became too large to responsibly complete and maintain alone.
+PHANTOM was developed as a solo engineering project and eventually evolved from a vulnerability scanner into a broader security platform. Development is currently paused because the scope became too large to responsibly complete and maintain alone.
 
 The repository is public for technical review, research, experimentation, learning, and potential collaboration.
 
 ---
 
-What PHANTOM Tries to Solve
+Overview
 
-Traditional scanners tend to follow a relatively simple model:
+Traditional vulnerability scanners typically follow:
 
 Target
   ↓
@@ -29,7 +29,7 @@ Payloads
   ↓
 Findings
 
-PHANTOM was designed around a different model:
+PHANTOM was designed around a broader security reasoning loop:
 
 Target
   ↓
@@ -51,27 +51,27 @@ Attack Chains
   ↓
 Impact / Attacker Intent
   ↓
-Report
+Reporting
   ↺
 
 The objective is not simply to find more vulnerabilities.
 
-It is to determine:
+PHANTOM attempts to determine:
 
-- what is exposed
-- what is actually vulnerable
-- what can be proven
-- what impact can be demonstrated
-- what vulnerabilities can be combined
-- what attack path should be investigated next
-- what actions are authorized and safe
+- What is exposed?
+- What is actually vulnerable?
+- What can be proven?
+- What impact can be demonstrated?
+- What vulnerabilities can be combined?
+- What should be tested next?
+- What actions are authorized and safe?
 
 ---
 
 Architecture
 
 ┌──────────────────────────────────────────────────────────────────────┐
-│                          PHANTOM AI CORE                              │
+│                           PHANTOM AI CORE                             │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │   CLI          API          Web UI          SDK                       │
@@ -108,7 +108,7 @@ Architecture
 │                         ▼                                             │
 │              ┌──────────────────────┐                                 │
 │              │ VALIDATION PIPELINE  │                                 │
-│              │     6 STAGES         │                                 │
+│              │      6 STAGES        │                                 │
 │              └──────────┬───────────┘                                 │
 │                         ▼                                             │
 │              ┌──────────────────────┐                                 │
@@ -125,10 +125,10 @@ Architecture
 │                         ▼                                             │
 │              ┌──────────────────────┐                                 │
 │              │ ATTACKER INTENT      │                                 │
-│              │     ENGINE            │                                 │
+│              │ ENGINE               │                                 │
 │              └──────────┬───────────┘                                 │
 │                         ▼                                             │
-│                     REPORTING                                         │
+│                      REPORTING                                        │
 │                                                                      │
 ├──────────────────────────────────────────────────────────────────────┤
 │                       SHARED INFRASTRUCTURE                           │
@@ -144,28 +144,28 @@ Core Capabilities
 
 1. Smart Reconnaissance
 
-PHANTOM starts by building an understanding of the target.
+PHANTOM starts by building an understanding of the target before security testing.
 
-Discovery can include:
+Discovery includes:
 
 - URL normalization
-- endpoint discovery
-- parameter extraction
+- Endpoint discovery
+- Parameter extraction
 - HTML and JavaScript analysis
 - robots.txt and sitemap discovery
 - API endpoint discovery
-- technology fingerprinting
-- server identification
-- authentication surface identification
-- business-domain classification
+- Technology fingerprinting
+- Server identification
+- Authentication surface discovery
+- Business-domain classification
 
-The result is centralized in an attack-surface model rather than being discarded by individual scanners.
+The resulting information feeds a centralized attack-surface model used by subsequent testing stages.
 
 ---
 
 2. Technology Intelligence
 
-The intelligence layer identifies technologies and application characteristics using observable behavior such as:
+The intelligence layer identifies frameworks, servers, databases and application characteristics using observable behavior such as:
 
 - HTTP headers
 - response characteristics
@@ -174,53 +174,21 @@ The intelligence layer identifies technologies and application characteristics u
 - JavaScript
 - application behavior
 
-Technology intelligence can be used to:
+Technology intelligence is used to:
 
 - prioritize relevant modules
 - adapt testing strategies
+- improve payload selection
 - identify likely database technologies
 - infer application architecture
-- improve payload selection
 
-Critical vulnerability classes can still be forced through the pipeline using a NEVER_SKIP_MODULES safeguard.
-
----
-
-3. Authentication Context
-
-PHANTOM can acquire and maintain authentication context so that security testing is not limited to anonymous functionality.
-
-The authentication layer can work with:
-
-- registration flows
-- session cookies
-- JWTs
-- authenticated API requests
-- controlled credential testing
-
-Authentication state can then propagate into subsequent scanners.
-
-A conceptual feedback loop is:
-
-SQL Injection
-      ↓
-Credential Exposure
-      ↓
-Authentication Attempt
-      ↓
-Authenticated Context
-      ↓
-Restricted Endpoint Discovery
-      ↓
-Authorization Testing
-
-This allows authentication to become part of attack-path reasoning rather than a separate feature.
+Critical vulnerability classes can be preserved through the "NEVER_SKIP_MODULES" safeguard.
 
 ---
 
-4. 77+ Specialized Security Modules
+3. 77+ Security Modules
 
-PHANTOM contains a broad set of security testing modules.
+PHANTOM contains specialized modules covering a broad range of offensive security techniques.
 
 Injection
 
@@ -254,9 +222,10 @@ Authorization
 
 - IDOR
 - BOLA
-- RBAC/authorization testing
+- RBAC / authorization testing
 - ABAC context testing
-- vertical/horizontal privilege escalation
+- Horizontal privilege escalation
+- Vertical privilege escalation
 
 Business Logic
 
@@ -264,22 +233,22 @@ Business Logic
 - Race conditions
 - Rate-limit bypass
 - Mass assignment
-- Workflow/state-machine abuse
+- Workflow and state-machine abuse
 
 API Security
 
-- REST API testing
-- GraphQL testing
-- WebSocket testing
-- gRPC testing
-- API gateway testing
-- Webhook security
+- REST APIs
+- GraphQL
+- WebSockets
+- gRPC
+- API gateways
+- Webhooks
 
 Infrastructure
 
-- HTTP security headers
+- Security headers
 - CORS
-- TLS/SSL
+- SSL/TLS
 - DNS
 - Port scanning
 - Directory discovery
@@ -289,64 +258,26 @@ Infrastructure
 Information Disclosure
 
 - Secrets
-- exposed configuration
-- stack traces
-- database errors
-- version disclosure
+- Exposed configuration
+- Stack traces
+- Database errors
+- Version disclosure
 
-Specialized Security Testing
+Specialized Testing
 
-- token binding
-- session fixation
-- client-side hardening
-- concurrency testing
-- resource exhaustion patterns
-
----
-
-5. Creative / Adversarial Testing
-
-PHANTOM also includes a higher-risk Creative Exploiter module designed to explore unexpected application behavior.
-
-It combines several approaches:
-
-Context Confusion
-
-Testing whether parameters or assumptions from one application context can be abused in another.
-
-Trust Boundary Probing
-
-Testing exposed administrative functionality, role confusion and internal API boundaries.
-
-Flow Disruption
-
-Testing:
-
-- HTTP method overrides
-- content-type confusion
-- request ordering
-- malformed workflow transitions
-
-Chaos Composition
-
-Testing unusual combinations of parameters and malformed inputs.
-
-Lazy Developer Exploitation
-
-Testing predictable implementation mistakes such as:
-
-- debug endpoints
-- default credentials
-- verbose errors
-- undocumented functionality
+- Token binding
+- Session fixation
+- Client-side security
+- Concurrency testing
+- Resource exhaustion patterns
 
 ---
 
-6. Shared Attack Surface
+4. Shared Attack Surface
 
-A central Endpoint Map provides common application knowledge to modules.
+PHANTOM maintains a centralized Endpoint Map that allows modules to operate on shared application knowledge.
 
-Endpoints can be categorized as:
+Endpoints can be classified as:
 
 AUTH
 PAYMENT
@@ -359,17 +290,55 @@ API_GRAPHQL
 WEBHOOK
 ...
 
-This enables cross-module targeting.
+This allows discoveries from reconnaissance and other scanners to influence subsequent testing.
 
-A parameter discovered during reconnaissance, for example, can later become a target for multiple vulnerability classes instead of being lost between modules.
+For example:
+
+Parameter Discovery
+        ↓
+SQLi / XSS Testing
+        ↓
+Finding
+        ↓
+Authorization Testing
 
 ---
 
-7. Six-Stage Validation Pipeline
+5. Authentication Context
+
+Authentication is treated as part of the security assessment state.
+
+PHANTOM can work with:
+
+- registration flows
+- session cookies
+- JWTs
+- authenticated API requests
+- controlled credential testing
+
+Authentication context can propagate into other modules.
+
+A conceptual feedback loop:
+
+SQL Injection
+      ↓
+Credential Exposure
+      ↓
+Authentication
+      ↓
+Authenticated Context
+      ↓
+Restricted Endpoint Discovery
+      ↓
+Authorization Testing
+
+---
+
+6. Six-Stage Validation Pipeline
 
 A raw scanner result is not automatically considered a confirmed vulnerability.
 
-PHANTOM applies a six-stage validation process:
+PHANTOM applies:
 
 Raw Finding
      ↓
@@ -387,35 +356,13 @@ Raw Finding
      ↓
 Validated Finding
 
-Syntax Validation
-
-Checks structural integrity and required fields.
-
-Duplicate Detection
-
-Removes exact and near-duplicate findings.
-
-Context Validation
-
-Evaluates whether observed behavior is actually meaningful in context.
-
-Safe Replay
-
-Attempts to reproduce the original behavior.
-
-Negative Control
-
-Sends benign input to determine whether the same behavior occurs without the triggering condition.
-
-Confidence Gate
-
-Findings below the configured confidence threshold are discarded.
+This process is intended to reduce false positives and improve report reliability.
 
 ---
 
-8. Finding State Machine
+7. Finding State Machine
 
-PHANTOM distinguishes detection from proof:
+Findings are represented through explicit states:
 
 SUSPECTED
     ↓
@@ -427,29 +374,21 @@ EXPLOITABLE
     ↓
 EXPLOITED
 
-This allows reports to distinguish between:
-
-- a heuristic suspicion
-- a detected pattern
-- a reproduced vulnerability
-- demonstrated impact
-- authorized exploitation
+This separates heuristic detection from reproduced behavior and demonstrated impact.
 
 ---
 
-9. Evidence Engine
+8. Evidence Engine
 
-The Evidence Engine is designed to make security findings evidence-driven.
+The Evidence Engine provides structured evidence for findings, including:
 
-A finding can retain information such as:
-
-- HTTP request
-- HTTP response
-- payload
-- parameter
-- reflection point
-- reproduction result
-- negative control
+- HTTP requests
+- HTTP responses
+- payloads
+- parameters
+- reflection points
+- reproduction results
+- negative controls
 - authentication state
 - technology context
 - impact evidence
@@ -457,17 +396,17 @@ A finding can retain information such as:
 - chain relationships
 - authorization state
 
-The goal is to prevent conclusions from being based purely on scanner claims.
+The goal is to make security findings evidence-driven rather than scanner-driven.
 
 ---
 
-10. Exploitation Proof Engine
+9. Exploitation Proof Engine
 
-For significant findings, PHANTOM attempts to answer four questions:
+For significant findings, PHANTOM attempts to answer:
 
 Can it be reproduced?
 
-Does the same behavior occur again?
+Does the behavior occur again?
 
 Can it be mutated?
 
@@ -475,23 +414,21 @@ Do alternative payloads preserve the vulnerability?
 
 Can it escalate?
 
-Does the vulnerability provide additional privileges or capabilities?
+Can the finding provide additional privileges or capabilities?
 
 Can it chain?
 
-Does the finding unlock additional attacks elsewhere in the application?
+Does the finding unlock another attack path?
 
-Specialized proof logic exists for multiple vulnerability classes including SQL injection, XSS, IDOR, business logic, sessions and CORS.
+Specialized proof logic exists for multiple vulnerability classes including SQL Injection, XSS, IDOR, business logic, sessions and CORS.
 
 ---
 
-11. Attack Chain Analysis
+10. Attack Chain Analysis
 
-PHANTOM does not treat vulnerabilities as isolated events.
+PHANTOM analyzes relationships between individual findings.
 
-It can analyze relationships between findings and identify potential attack paths.
-
-Examples include:
+Examples:
 
 SQLi
  ↓
@@ -521,27 +458,23 @@ Cloud Metadata
  ↓
 Credential Exposure
 
-XXE
- ↓
-File Access / SSRF
-
-Chain findings can be categorized according to the strength of their evidence, separating demonstrated relationships from inferred or speculative paths.
+Chains can distinguish between demonstrated relationships and inferred or speculative paths.
 
 ---
 
-12. Attacker Intent Engine
+11. Attacker Intent Engine
 
-PHANTOM also models attacker objectives rather than only vulnerability categories.
+PHANTOM also models higher-level attacker objectives.
 
-Supported high-level objectives include:
+Current intent categories include:
 
-FINANCIAL_GAIN
-DATA_THEFT
-ACCOUNT_TAKEOVER
-ADMIN_ACCESS
-CODE_EXECUTION
+- Financial Gain
+- Data Theft
+- Account Takeover
+- Administrative Access
+- Code Execution
 
-The engine can reason over state transitions such as:
+The system can reason over state transitions such as:
 
 ANONYMOUS
     ↓
@@ -553,15 +486,15 @@ ADMIN
     ↓
 CODE EXECUTION
 
-This helps prioritize vulnerabilities according to what they enable, not simply how they are categorized.
+This allows prioritization based on what a vulnerability enables rather than only its vulnerability category.
 
 ---
 
-13. Decision Engine
+12. Decision Engine
 
-The long-term architectural direction of PHANTOM is a dedicated Decision Engine.
+The Decision Engine is the strategic control layer of the architecture.
 
-Instead of simply executing every scanner in sequence, the system can reason over the current state:
+The intended model is:
 
 Observe
   ↓
@@ -578,27 +511,23 @@ Update State
 Choose Next Action
   ↺
 
-The intended question is:
+Rather than blindly running every scanner against every endpoint, the long-term goal is to determine:
 
 «What is the highest-value security action to take next, given everything already discovered?»
 
-This is the foundation for more autonomous security assessment.
-
 ---
 
-14. Attack Surface Budget
+13. Attack Surface Budget
 
-Large targets may expose hundreds or thousands of endpoints and parameters.
+Large applications may contain hundreds or thousands of endpoints and parameters.
 
-Testing everything equally is inefficient.
-
-PHANTOM therefore introduces the concept of an Attack Surface Budget to prioritize testing according to factors such as:
+PHANTOM introduces an Attack Surface Budget to prioritize testing according to factors such as:
 
 - endpoint sensitivity
 - parameter importance
 - technology relevance
 - authentication boundaries
-- previous findings
+- existing findings
 - exploitability
 - potential impact
 - testing cost
@@ -607,11 +536,11 @@ The goal is to spend testing effort where it is most likely to produce meaningfu
 
 ---
 
-15. Learning & Adaptive Intelligence
+14. Learning & Adaptive Intelligence
 
-PHANTOM contains feedback mechanisms designed to improve future prioritization.
+PHANTOM contains feedback mechanisms intended to improve future prioritization.
 
-Learning signals can include:
+Potential learning signals include:
 
 - historical true/false-positive outcomes
 - bounty acceptance or rejection
@@ -620,15 +549,15 @@ Learning signals can include:
 - real-world incident patterns
 - payload performance
 
-The system can use these outcomes to adjust confidence and attack-chain probabilities over time.
+These outcomes can be used to adjust confidence and attack-chain probabilities.
 
 ---
 
-16. Safety Architecture
+15. Safety Architecture
 
 Autonomous security testing requires strict boundaries.
 
-PHANTOM uses multiple protection layers:
+PHANTOM uses multiple safety layers.
 
 Safety Levels
 
@@ -637,42 +566,42 @@ CAUTIOUS
 STANDARD
 AGGRESSIVE
 
-Safety Controls
+Controls
 
-- scope enforcement
-- request rate limiting
+- Scope enforcement
+- Rate limiting
 - HTTP safety controls
-- module-level safety restrictions
-- exploit policy enforcement
-- audit logging
-- destructive-action restrictions
+- Module-level safety restrictions
+- Exploit policy enforcement
+- Audit logging
+- Destructive-action restrictions
 
-The system is designed to distinguish between discovering a vulnerability and being authorized to perform a potentially impactful exploitation action.
+The architecture separates vulnerability discovery from potentially impactful exploitation.
 
 ---
 
-17. External Security Tools
+16. External Security Tools
 
-PHANTOM can integrate with established security tooling such as:
+PHANTOM can integrate with established security tooling including:
 
 - Nuclei
 - Nmap
 - Nikto
-- Gobuster / ffuf
+- Gobuster
+- ffuf
 - sqlmap
 - testssl
 - Subfinder
-- other environment-specific tools
 
-The architectural goal is not simply to execute these independently, but to use their results as additional security intelligence.
+The architectural objective is to use external tools as additional sources of security intelligence rather than isolated utilities.
 
 ---
 
-18. Reporting
+17. Reporting
 
-PHANTOM supports structured security reporting for different use cases.
+PHANTOM supports multiple reporting workflows.
 
-HackerOne-style reports
+HackerOne-style Reports
 
 - CWE
 - CVSS
@@ -682,19 +611,19 @@ HackerOne-style reports
 - impact
 - remediation
 
-Professional Pentest Reports
+Client / Pentest Reports
 
-- executive summaries
-- technical findings
-- PoCs
-- remediation guidance
-- compliance mappings
+- Executive summaries
+- Technical findings
+- Proof of concept
+- Remediation guidance
+- Compliance mappings
 
 SARIF
 
 Designed for integration with CI/CD and security tooling.
 
-Additional Formats
+Other Formats
 
 - JSON
 - HTML
@@ -703,36 +632,32 @@ Additional Formats
 
 ---
 
-19. Compliance & Data Protection
+18. GDPR / Data Protection
 
-PHANTOM also includes a GDPR/RGPD-oriented compliance layer covering areas such as:
+PHANTOM also includes a GDPR/RGPD-oriented compliance layer addressing:
 
-- data minimization
-- data retention
-- right of access
-- right to erasure
-- data portability
-- privacy by design
-- processing records
-- security of processing
+- Data minimization
+- Data retention
+- Right of access
+- Right to erasure
+- Data portability
+- Privacy by design
+- Processing records
+- Security of processing
 
-PII handling includes patterns for information such as:
+PII detection and anonymization can cover data such as:
 
-- emails
-- telephone numbers
-- payment card data
+- Email addresses
+- Telephone numbers
+- Payment card data
 - IP addresses
 - JWTs
-- credentials
+- Credentials
 - NIF and other sensitive identifiers
-
-Retention policies can be applied to scan data, logs, reports and compliance records.
 
 ---
 
-20. Project Metrics
-
-Current project scale:
+19. Project Metrics
 
 Metric| Value
 Security modules| 77+
@@ -742,14 +667,14 @@ Security modes| 4+
 Major engines| 10+
 Report formats| 5+
 Attack-chain patterns| 13+
-AI/analysis components| Multiple
+AI / analysis components| Multiple
 External security tools| Multiple
 
-These numbers describe the scope of the codebase, not a claim that every component is equally mature.
+These metrics represent the scope of the codebase, not a claim that every component has the same level of maturity.
 
 ---
 
-21. Project Structure
+20. Project Structure
 
 phantom/
 │
@@ -790,47 +715,45 @@ phantom/
 
 ---
 
-22. Project Status
+21. Project Status
 
 PHANTOM is currently paused.
 
-The project began as an automated pentesting framework and gradually expanded into:
+The project progressively evolved from an automated scanner into a much larger security platform combining:
 
 Reconnaissance
-     +
+      +
 Vulnerability Discovery
-     +
+      +
 Authentication Context
-     +
+      +
 Validation
-     +
+      +
 Evidence
-     +
+      +
 Exploitation Proof
-     +
+      +
 Attack-Chain Reasoning
-     +
+      +
 Attacker Intent
-     +
+      +
 Decision Making
-     +
+      +
 Safety Enforcement
-     +
-Enterprise Reporting
+      +
+Reporting
 
-At that point, the scope had effectively become a complete security platform.
+As a solo developer, I reached the point where completing and maintaining the entire platform to the standard I wanted was no longer realistic.
 
-As a solo developer, I decided that continuing to expand the system without a larger engineering and security team would not be the right approach.
-
-Rather than presenting an unfinished system as production-ready, I am publishing the codebase with its architecture, audits, limitations and development history available for inspection.
+Rather than presenting an unfinished system as production-ready, I decided to make the codebase public with its architecture, audits, capabilities and known limitations available for inspection.
 
 ---
 
-23. Known Limitations
+22. Known Limitations
 
 PHANTOM is an advanced engineering/research project, not a finished commercial security platform.
 
-Known areas for further work include:
+Known areas for further development include:
 
 - deeper integration between all external tools and modules
 - more complete autonomous attack-chain execution
@@ -844,13 +767,15 @@ Known areas for further work include:
 - coverage-guided fuzzing
 - source-code correlation
 - additional enterprise integrations
-- larger-scale validation and benchmarking
+- larger-scale testing and benchmarking
 
-The repository and accompanying audit documents should be treated as the source of truth for the current state of individual components.
+Individual components may therefore have different levels of maturity.
+
+See the audit and gap-analysis documents in this repository for further details.
 
 ---
 
-24. Security & Responsible Use
+23. Responsible Use
 
 PHANTOM is intended for authorized security testing only.
 
@@ -863,19 +788,19 @@ Do not use the framework to:
 - obtain unauthorized data
 - deploy malware
 - perform destructive actions
-- conduct unauthorized credential attacks
+- conduct unauthorized attacks
 
-Security researchers and contributors are expected to follow applicable laws, program rules and responsible disclosure practices.
+Users are responsible for complying with applicable laws, security-program rules and responsible disclosure requirements.
 
 ---
 
-25. Why This Repository Is Public
+24. Why This Repository Is Public
 
-I am publishing PHANTOM primarily because the engineering work itself is worth examining.
+The purpose of publishing PHANTOM is not to present it as a finished commercial product.
 
-The interesting part is not only the scanners.
+The project is being released because the engineering work and architectural experimentation are worth examining.
 
-It is the attempt to combine:
+The central idea was to combine:
 
 Attack Surface Mapping
         +
@@ -891,19 +816,17 @@ Attack Chains
         +
 Safety
 
-into a single system.
+into a single security assessment system.
 
-The project is open for technical criticism, experimentation, research and potential collaboration.
+The repository is open for:
 
-Especially valuable feedback would come from:
+- Technical review
+- Security research
+- Experimentation
+- Learning
+- Collaboration
 
-- penetration testers
-- red teamers
-- AppSec engineers
-- security researchers
-- security-tooling engineers
-- AI/agent engineers
-- software architects
+Especially useful feedback would come from penetration testers, red teamers, AppSec engineers, security researchers, security-tooling engineers, AI/agent engineers and software architects.
 
 Don't just tell me what works. Tell me what is wrong.
 
@@ -932,234 +855,8 @@ PHANTOM builds upon and integrates with the broader security tooling ecosystem, 
 
 Final Note
 
-PHANTOM is ultimately an exploration of a question:
+PHANTOM is an exploration of a simple question:
 
 «What would a security testing system look like if it could maintain a model of an application, reason over evidence, understand attack paths, and continuously decide what should be tested next?»
 
-This repository is one attempt at answering that question.│  └──────────┘ └──────────┘ └──────────┘ └──────────────┘   │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐   │
-│  │ Rate Limiter│ │State Manager│ │  Knowledge Base     │   │
-│  └─────────────┘ └─────────────┘ └─────────────────────┘   │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐   │
-│  │   Ollama    │ │   ChromaDB  │ │     SQLite DB       │   │
-│  └─────────────┘ └─────────────┘ └─────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- [Ollama](https://ollama.ai) for local LLM inference
-- External tools: Nuclei, Nmap, Subfinder (optional)
-
-### Installation
-
-```bash
-# Clone repository
-git clone https://github.com/yourusername/ai-pentest.git
-cd ai-pentest
-
-# Run setup script
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-
-# Or manual installation
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-### Install External Tools
-
-```bash
-chmod +x scripts/install_tools.sh
-./scripts/install_tools.sh
-```
-
-### Docker Setup
-
-```bash
-# Start all services
-docker-compose up -d
-
-# Run a scan
-docker-compose run pentest scan example.com
-```
-
-## Usage
-
-### Basic Scan
-
-```bash
-# Scan a domain
-pentest scan example.com
-
-# Scan with specific output format
-pentest scan example.com -f html
-
-# Scan without AI analysis
-pentest scan example.com --no-ai
-
-# Scan with additional scope
-pentest scan example.com -s api.example.com -s admin.example.com
-```
-
-### Check Scan Status
-
-```bash
-# Check status
-pentest status <scan-id>
-
-# List recent scans
-pentest list-scans
-```
-
-### View Configuration
-
-```bash
-pentest config
-```
-
-### Check Tools
-
-```bash
-pentest check-tools
-```
-
-## Configuration
-
-Configuration is managed via `config/settings.yaml`:
-
-```yaml
-ai:
-  provider: "ollama"
-  model_name: "mistral"
-  base_url: "http://localhost:11434"
-  temperature: 0.3
-
-rate_limits:
-  requests_per_second: 10
-  burst_limit: 20
-
-scanning:
-  nuclei_templates: "~/.nuclei-templates"
-  severity_threshold: "low"
-
-reporting:
-  default_format: "pdf"
-  company_name: "Your Company"
-```
-
-## Project Structure
-
-```
-petntesterai/
-├── cli/                    # CLI interface
-│   └── main.py            # Click commands
-├── core/                   # Core modules
-│   ├── config_manager.py  # Pydantic settings
-│   ├── orchestrator.py    # Main pipeline
-│   ├── auth_manager.py    # Target authorization
-│   └── state_manager.py   # Checkpoint/resume
-├── reconnaissance/         # Recon modules
-│   ├── subdomain_enum.py
-│   ├── port_scanner.py
-│   ├── tech_detection.py
-│   └── crawler.py
-├── scanning/              # Vulnerability scanning
-│   ├── vuln_scanner.py
-│   └── modules/
-│       ├── nuclei_runner.py
-│       ├── header_security.py
-│       ├── ssl_checker.py
-│       └── cors_checker.py
-├── ai_engine/             # AI components
-│   ├── model_manager.py   # Ollama client
-│   ├── analyzer.py        # Finding analysis
-│   ├── false_positive_filter.py
-│   ├── chain_detector.py
-│   └── knowledge_base.py  # ChromaDB RAG
-├── reporting/             # Report generation
-│   └── report_generator.py
-├── storage/               # Data persistence
-│   ├── database.py        # SQLAlchemy models
-│   └── encryption.py
-├── utils/                 # Utilities
-│   ├── logger.py          # Structlog setup
-│   ├── rate_limiter.py
-│   ├── validators.py
-│   └── cvss_calculator.py
-├── config/                # Configuration
-│   └── settings.yaml
-└── templates/             # Report templates
-    └── professional.j2
-```
-
-## AI Capabilities
-
-### False Positive Detection
-Uses pattern matching and LLM analysis to identify likely false positives:
-- Signature-based detection for common FP patterns
-- Context-aware AI analysis for ambiguous cases
-- Confidence scoring for findings
-
-### Exploit Chain Detection
-Identifies how multiple vulnerabilities can be combined:
-- Pattern matching for known chains (SQLi + File Upload → RCE)
-- AI-powered chain discovery
-- Impact assessment for combined attacks
-
-### Intelligent Prioritization
-AI-driven severity adjustment based on:
-- Business context and asset criticality
-- Exploitability factors
-- Real-world attack likelihood
-
-## Development
-
-### Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-### Code Quality
-
-```bash
-# Format
-black .
-isort .
-
-# Lint
-ruff check .
-
-# Type check
-mypy .
-```
-
-## Security Considerations
-
-⚠️ **Important**: Only use this tool against systems you have explicit permission to test.
-
-- Always obtain written authorization before scanning
-- The tool includes authorization checking (`pentest authorize`)
-- Findings may contain sensitive information - handle reports securely
-- Rate limiting is enabled by default to prevent service disruption
-
-## License
-
-MIT License - See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
-
-## Acknowledgments
-
-- [Nuclei](https://github.com/projectdiscovery/nuclei) - Vulnerability scanner
-- [Ollama](https://ollama.ai) - Local LLM inference
-- [ChromaDB](https://www.trychroma.com/) - Vector database
+This repository is one attempt at answering that question.
